@@ -1,2 +1,3 @@
-# local data files
-E338/ 
+# Do not commit
+E338/
+.DS_Store
