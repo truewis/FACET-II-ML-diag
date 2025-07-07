@@ -1,1 +1,1 @@
-Pre-processing SLAC FACET electron beam TCAV data for ML prediction of LPS and current profiles. 
+Pre-processing SLAC's FACET accelerator data for ML prediction of LPS and current profiles. Predicting TCAV measurements using an offline predictive model. Work is sponsored by SLAC National Laboratory operated by the U.S. Department of Energy (DOE)in collaboration with Stanford University. 
