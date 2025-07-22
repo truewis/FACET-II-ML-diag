@@ -1,6 +1,8 @@
-numpy
-scipy
-matplotlib
-h5py
-ipympl 
-re
+# pip install -r requirements.txt
+# Python -- version 3.11
+
+h5py==3.10.0
+numpy==1.26.0
+scipy==1.13.0
+matplotlib==3.9.0
+pandas 
