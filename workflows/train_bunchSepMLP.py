@@ -36,7 +36,7 @@ SYAG_cal = 64.4e9
 
 # Loads dataset
 ## stored in data/ but in future make accessible to facet-srv01
-dataloc = 'data/' + experiment + '/' + experiment + '_' + runname + '/' + experiment + '_'  +runname + '.mat'
+dataloc = 'data/raw/' + experiment + '/' + experiment + '_' + runname + '/' + experiment + '_'  +runname + '.mat'
 mat = loadmat(dataloc,struct_as_record=False, squeeze_me=True)
 data_struct = mat['data_struct']
 
@@ -65,7 +65,7 @@ for a in range(len(stepsAll)):
     if not match:
         raise ValueError(f"Path format invalid or not matched: {raw_path}")
 
-    DTOTR2datalocation = 'data/'+ experiment + '/' + match.group(0)
+    DTOTR2datalocation = 'data/raw/'+ experiment + '/' + match.group(0)
 
     with h5py.File(DTOTR2datalocation, 'r') as f:
         data_raw = f['entry']['data']['data'][:].astype(np.float64)  # shape: (N, H, W)
@@ -185,7 +185,7 @@ mean2 = np.array(mean2)
 amp2 = np.array(amp2 )
 
 # define good shots where clear bunch separation
-goodShots = np.where(amp2 != 0)[0]
+goodShots = np.where(amp2 > 0)[0]
 bunchSeparation_all_fit = (mean1[goodShots] - mean2[goodShots]) * xtcalibrationfactor * 1e6 * 3e8 # in microns 
 steps = data_struct.scalars.steps[DTOTR2commonind]
 
@@ -209,11 +209,26 @@ idx = np.argsort(absc)
 
 # N-best parameter fit (bsaScalar PVs + step number)
 N = 20 
-predictor = np.vstack((bsaScalarData[idx[-N:],:][:,all_idx[goodShots]],steps[all_idx[goodShots]])).T
+X = np.vstack((bsaScalarData[idx[-N:],:][:,all_idx[goodShots]],steps[all_idx[goodShots]])).T
 bunchSep = bunchSeparation_all_fit
 
-nsims=predictor.shape[0]
-X = predictor
+
+# save data to files 
+answer = input("Do you want to save preprocessed data? (y/n): ").strip().lower() 
+ 
+# Check the response 
+for _ in range(1):
+    if answer == 'y': 
+        print('Saving data...')
+        np.save('data/processed/predictors' + experiment + '_' + runname +'.npy', X)
+        np.save('data/processed/bunchSep' + experiment + '_' + runname + '.npy', bunchSep)
+    elif answer == 'n': 
+        print('Data will not be saved.')
+        break
+    else: 
+        print("Please answer with 'y' or 'n'.") 
+
+nsims=X.shape[0]
 
 # 80/20 train-test split
 ntrain = int(np.round(nsims*0.8))
@@ -223,14 +238,15 @@ idx = np.random.permutation(nsims)
 idxtrain = idx[0:ntrain]
 idxtest = idx[ntrain:ntrain+ntest]
 
-# scale data for improved model accuracy 
-bs_scaled = bunchSep/np.max(bunchSep)
-bs_train_scaled = bs_scaled[idxtrain]
-bs_test_scaled = bs_scaled[idxtest] 
+# scale feature data for improved model accuracy 
+bs = bunchSep
+bs_train = bs[idxtrain]
+bs_test = bs[idxtest] 
 
+# scale feature data for improved model accuracy
 from sklearn.preprocessing import MinMaxScaler
 scaler = MinMaxScaler()
-x_scaled = scaler.fit_transform(predictor)
+x_scaled = scaler.fit_transform(X)
 x_train_scaled = x_scaled[idxtrain]
 x_test_scaled = x_scaled[idxtest]
 
@@ -241,7 +257,7 @@ x_test_scaled = x_scaled[idxtest]
 import sklearn.neural_network as nn
 import time
 
-nn_model_curprof = nn.MLPRegressor(
+nn_model_bunchsep = nn.MLPRegressor(
     activation = 'relu',
     alpha = 1.0e-4,
     batch_size = 24,
@@ -264,17 +280,25 @@ nn_model_curprof = nn.MLPRegressor(
 )
 t0 = time.time()
 # Fit the nn model on the training set
-nn_model_curprof.fit(x_train_scaled,bs_train_scaled)
+nn_model_bunchsep.fit(x_train_scaled,bs_train)
 elapsed = time.time() - t0
 print("Elapsed time [mins] = {:.1f} ".format(elapsed/60))
 # Predict on training and validation set
-predict_Iz_train = nn_model_curprof.predict(x_train_scaled)
-predict_Iz_test = nn_model_curprof.predict(x_test_scaled)
+predict_bs_train = nn_model_bunchsep.predict(x_train_scaled)
+predict_bs_test = nn_model_bunchsep.predict(x_test_scaled)
 #%% Print results and plot score
-print("Score on training set = {0:.3f} ".format(nn_model_curprof.score(x_train_scaled,bs_train_scaled)*100),"%")
-print("Score on test set = {0:.3f}".format(nn_model_curprof.score(x_test_scaled,bs_test_scaled) * 100),"%")
+print("Score on training set = {0:.3f} ".format(nn_model_bunchsep.score(x_train_scaled,bs_train)*100),"%")
+print("Score on test set = {0:.3f}".format(nn_model_bunchsep.score(x_test_scaled,bs_test) * 100),"%")
 
 # save model 
-import joblib
-joblib_file = 'model/MLP_E338_12710_21param.pkl'  
-joblib.dump(nn_model_curprof, joblib_file)
+answer = input("Do you want to save model? (y/n): ").strip().lower() 
+ 
+# Check the response 
+if answer == 'y': 
+    import joblib
+    joblib_file = 'model/MLP_E338_12710_21param.pkl'  
+    joblib.dump(nn_model_bunchsep, joblib_file)
+elif answer == 'n': 
+    exit() 
+else: 
+    print("Please answer with 'y' or 'n'.") 
