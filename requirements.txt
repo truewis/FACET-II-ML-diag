@@ -6,3 +6,5 @@ numpy==1.26.0
 scipy==1.13.0
 matplotlib==3.9.0
 pandas 
+scikit-learn
+torch 
