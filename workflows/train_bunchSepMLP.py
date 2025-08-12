@@ -16,10 +16,25 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 sys.path.append('./Python_Functions')
 from Python_Functions.functions import cropProfmonImg, matstruct_to_dict, extractDAQBSAScalars, segment_centroids_and_com, plot2DbunchseparationVsCollimatorAndBLEN
 
-# Sets data location
-## make this an argument for the user to input
-experiment = 'E338'
-runname = '12710'
+# Select Experiment and runname
+while True:
+    answer = input("Please provide experiment and runname (ex: E338, 12710) ").strip()
+    if re.match('^E[0-9]+, [0-9]+', answer) is None:
+        print("Invalid response, please try again")
+        continue
+    else: 
+        experiment = re.match('^E[0-9]+', answer)[0]
+        runname = re.search('[0-9]+$', answer)[0]
+        try: 
+            dataloc = 'data/raw/' + experiment + '/' + experiment + '_' + runname + '/' + experiment + '_'  +runname + '.mat'
+            mat = loadmat(dataloc,struct_as_record=False, squeeze_me=True)
+            data_struct = mat['data_struct']
+            print('Experiment loaded successfully.')
+            break
+        except FileNotFoundError: 
+            print("Error: The specified data was not found in '/data/raw/'.")
+            continue
+
 
 # Define XTCAV calibration
 krf = 239.26
@@ -33,12 +48,6 @@ dnom = 59.8e-3
 
 # Sets the calibration value for SYAG in eV/m
 SYAG_cal = 64.4e9
-
-# Loads dataset
-## stored in data/ but in future make accessible to facet-srv01
-dataloc = 'data/raw/' + experiment + '/' + experiment + '_' + runname + '/' + experiment + '_'  +runname + '.mat'
-mat = loadmat(dataloc,struct_as_record=False, squeeze_me=True)
-data_struct = mat['data_struct']
 
 # Extracts number of steps
 stepsAll = data_struct.params.stepsAll
@@ -219,7 +228,7 @@ answer = input("Do you want to save preprocessed data? (y/n): ").strip().lower()
 # Check the response 
 for _ in range(1):
     if answer == 'y': 
-        print('Saving data...')
+        print("Saving data to '/data/processed/'....")
         np.save('data/processed/predictors' + experiment + '_' + runname +'.npy', X)
         np.save('data/processed/bunchSep' + experiment + '_' + runname + '.npy', bunchSep)
     elif answer == 'n': 
@@ -227,6 +236,8 @@ for _ in range(1):
         break
     else: 
         print("Please answer with 'y' or 'n'.") 
+
+print('Training model...')
 
 nsims=X.shape[0]
 
@@ -287,8 +298,8 @@ print("Elapsed time [mins] = {:.1f} ".format(elapsed/60))
 predict_bs_train = nn_model_bunchsep.predict(x_train_scaled)
 predict_bs_test = nn_model_bunchsep.predict(x_test_scaled)
 #%% Print results and plot score
-print("Score on training set = {0:.3f} ".format(nn_model_bunchsep.score(x_train_scaled,bs_train)*100),"%")
-print("Score on test set = {0:.3f}".format(nn_model_bunchsep.score(x_test_scaled,bs_test) * 100),"%")
+print("Train R²: {0:.2f} ".format(nn_model_bunchsep.score(x_train_scaled,bs_train)*100),"%")
+print("Test R²: {0:.2f}".format(nn_model_bunchsep.score(x_test_scaled,bs_test) * 100),"%")
 
 # save model 
 answer = input("Do you want to save model? (y/n): ").strip().lower() 
@@ -296,7 +307,7 @@ answer = input("Do you want to save model? (y/n): ").strip().lower()
 # Check the response 
 if answer == 'y': 
     import joblib
-    joblib_file = 'model/MLP_E338_12710_21param.pkl'  
+    joblib_file = 'model/MLP_bunchSep_'+experiment+'_'+runname+'.pkl'    
     joblib.dump(nn_model_bunchsep, joblib_file)
 elif answer == 'n': 
     exit() 

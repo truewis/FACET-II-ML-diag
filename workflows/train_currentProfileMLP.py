@@ -378,7 +378,7 @@ answer = input("Do you want to save model? (y/n): ").strip().lower()
 # Check the response 
 if answer == 'y': 
     import joblib
-    joblib_file = 'model/MLP_'+experiment+'_'+runname+'.pkl'  
+    joblib_file = 'model/MLP_currentProf_'+experiment+'_'+runname+'.pkl'  
     joblib.dump(model, joblib_file)
 elif answer == 'n': 
     exit() 
