@@ -381,19 +381,20 @@ print("Train R²: {:.2f} %".format(r2_score(Iz_train_true.ravel(), pred_train_fu
 print("Test R²: {:.2f} %".format(r2_score(Iz_test_true.ravel(), pred_test_full.ravel()) * 100))
 
 # save model 
-answer = input("Do you want to save model? (y/n): ").strip().lower() 
- 
-# Check the response 
-if answer == 'y': 
-    print('Saving model...')
-    import joblib
-    joblib_file = 'model/MLP_'+experiment+'_'+runname+'.pkl'  
-    joblib.dump(model, joblib_file)
-    joblib.dump(iz_scaler, 'model/scalers/' + experiment +'_'+runname+'_scaler.gz')
-elif answer == 'n': 
-    continue
-else: 
-    print("Please answer with 'y' or 'n'.") 
+
+while True: 
+    answer = input("Do you want to save model? (y/n): ").strip().lower() 
+    if answer == 'y': 
+        print('Saving model...')
+        import joblib
+        joblib_file = 'model/MLP_'+experiment+'_'+runname+'.pkl'  
+        joblib.dump(model, joblib_file)
+        joblib.dump(iz_scaler, 'model/scalers/' + experiment +'_'+runname+'_scaler.gz')
+        break
+    elif answer == 'n': 
+        break
+    else: 
+        print("Please answer with 'y' or 'n'.") 
 
 # save predictions 
 answer = input("Do you want to save model predictions? (y/n): ").strip().lower() 
@@ -401,9 +402,10 @@ answer = input("Do you want to save model predictions? (y/n): ").strip().lower()
 # Check the response 
 if answer == 'y': 
     print('Saving predictions...')
+    import joblib
     joblib_file = 'model/predictions/predCurrProf_'+experiment+'_'+runname+'.pkl'  
     x = np.vstack((bsaScalarData, steps)).T
-    x=torch.tensor(scaler.transform(x), dtype=torch.float32)
+    x=torch.tensor(x_scaler.transform(x), dtype=torch.float32)
     with torch.no_grad():
         x = iz_scaler.inverse_transform(model(x).numpy())
     joblib.dump(x, joblib_file)
