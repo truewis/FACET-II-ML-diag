@@ -8,3 +8,4 @@ matplotlib==3.9.0
 pandas 
 scikit-learn
 torch 
+pytorch-msssim
