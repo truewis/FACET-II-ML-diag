@@ -1,9 +1,6 @@
 # Do not commit
-data/raw/E338/
-data/raw/E340/
 
 .DS_Store
-MATLAB_Functions/
 
 *.venv
 inProgress/
