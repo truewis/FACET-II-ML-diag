@@ -33,7 +33,7 @@ while True:
             print('Experiment loaded successfully.')
             break
         except FileNotFoundError: 
-            print("Error: The specified data was not found in '/data/raw/'.")
+            print("Error: The specified data was not found in 'data/raw/'.")
             continue
 
 # Define XTCAV calibration
@@ -134,20 +134,28 @@ xtcavImages = xtcavImages[:,:,DTOTR2commonind]
 
 # extract scalars (predictors) 
 bsaScalarData, bsaVars = extractDAQBSAScalars(data_struct)
+try: 
+    ampl_idx = next(i for i, var in enumerate(bsaVars) if 'TCAV_LI20_2400_A' in var)
+    xtcavAmpl = bsaScalarData[ampl_idx, :]
 
-if len(bsaVars) != 130:
-    error = f"Error: Model requires 130 BSA parameters. Only {len(bsaVars)} parameters included in BSAVar List S20."
-    print(error)
-    exit()
+    phase_idx = next(i for i, var in enumerate(bsaVars) if 'TCAV_LI20_2400_P' in var)
+    xtcavPhase = bsaScalarData[phase_idx, :]
 
-ampl_idx = next(i for i, var in enumerate(bsaVars) if 'TCAV_LI20_2400_A' in var)
-xtcavAmpl = bsaScalarData[ampl_idx, :]
+    xtcavOffShots = xtcavAmpl<0.1
+    xtcavPhase[xtcavOffShots] = 0   
+except StopIteration:
+    xtcavPhase = matstruct_to_dict(data_struct)['scalars']['nonBSA_List_LINAC_KLYS']['TCAV_LI20_2400_S_PV'][DTOTR2commonind]
+    xtcavAmpl = matstruct_to_dict(data_struct)['scalars']['nonBSA_List_LINAC_KLYS']['TCAV_LI20_2400_S_AV'][DTOTR2commonind]
+    xtcavOffShots = xtcavAmpl<0.1
+    xtcavPhase[xtcavOffShots] = 0   
+    bsaScalarData = np.vstack((bsaScalarData, xtcavPhase, xtcavAmpl))
+    bsaVars.append('TCAV_LI20_2400P')
+    bsaVars.append('TCAV_LI20_2400A')
 
-phase_idx = next(i for i, var in enumerate(bsaVars) if 'TCAV_LI20_2400_P' in var)
-xtcavPhase = bsaScalarData[phase_idx, :]
-
-xtcavOffShots = xtcavAmpl<0.1
-xtcavPhase[xtcavOffShots] = 0 # Set this for ease of plotting
+# if len(bsaVars) != 130:
+#     error = f"Error: Model requires 130 BSA parameters. Only {len(bsaVars)} parameters included in BSAVar List S20."
+#     print(error)
+#     exit()
 
 # extract current profiles
 isChargePV = [bool(re.search(r'TORO_LI20_2452_TMIT', pv)) for pv in bsaVars]
@@ -295,7 +303,7 @@ class MLP(nn.Module):
         return self.model(x)
 
 model = MLP(X_train.shape[1], Y_train.shape[1])
-optimizer = optim.Adam(model.parameters(), lr=5e-4, betas=(0.5, 0.899))
+optimizer = optim.Adam(model.parameters(), lr=5e-4, betas=(0.9, 0.999))
 loss_fn = nn.MSELoss()
 
 # Define custom loss function 
@@ -377,9 +385,28 @@ answer = input("Do you want to save model? (y/n): ").strip().lower()
  
 # Check the response 
 if answer == 'y': 
+    print('Saving model...')
     import joblib
-    joblib_file = 'model/MLP_currentProf_'+experiment+'_'+runname+'.pkl'  
+    joblib_file = 'model/MLP_'+experiment+'_'+runname+'.pkl'  
     joblib.dump(model, joblib_file)
+    joblib.dump(iz_scaler, 'model/scalers/' + experiment +'_'+runname+'_scaler.gz')
+elif answer == 'n': 
+    continue
+else: 
+    print("Please answer with 'y' or 'n'.") 
+
+# save predictions 
+answer = input("Do you want to save model predictions? (y/n): ").strip().lower() 
+ 
+# Check the response 
+if answer == 'y': 
+    print('Saving predictions...')
+    joblib_file = 'model/predictions/predCurrProf_'+experiment+'_'+runname+'.pkl'  
+    x = np.vstack((bsaScalarData, steps)).T
+    x=torch.tensor(scaler.transform(x), dtype=torch.float32)
+    with torch.no_grad():
+        x = iz_scaler.inverse_transform(model(x).numpy())
+    joblib.dump(x, joblib_file)
 elif answer == 'n': 
     exit() 
 else: 
