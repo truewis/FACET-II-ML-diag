@@ -276,11 +276,11 @@ while True:
         print("Invalid response, please try again")
         continue
     else: 
-        experiment = re.match('^E[0-9]+', answer)[0]
-        runname = re.search('[0-9]+$', answer)[0]
+        experiment2 = re.match('^E[0-9]+', answer)[0]
+        runname2 = re.search('[0-9]+$', answer)[0]
         try: 
             import joblib
-            joblib_model = joblib.load('model/MLP_' + experiment + '_' + runname + '.pkl')
+            joblib_model = joblib.load('model/MLP_' + experiment2 + '_' + runname2 + '.pkl')
             print('Model loaded successfully.')
             break
         except FileNotFoundError: 
@@ -303,3 +303,4 @@ true = Iz.numpy().ravel()
 R_sq = r2_score(true, pred)
 
 print("R² Accuracy: {:.2f} %".format(R_sq * 100))
+
