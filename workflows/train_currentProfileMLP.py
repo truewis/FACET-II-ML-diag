@@ -19,7 +19,7 @@ from Python_Functions.functions import cropProfmonImg, matstruct_to_dict, extrac
 
 # Select Experiment and runname
 while True:
-    answer = input("Please provide experiment and runname (ex: E338, 12710) ").strip()
+    answer = input("Please provide experiment and runname (ex: E338, 12710): ").strip()
     if re.match('^E[0-9]+, [0-9]+', answer) is None:
         print("Invalid response, please try again")
         continue
@@ -387,7 +387,7 @@ while True:
     if answer == 'y': 
         print('Saving model...')
         import joblib
-        joblib_file = 'model/MLP_'+experiment+'_'+runname+'.pkl'  
+        joblib_file = 'model/MLP_currProf_'+experiment+'_'+runname+'.pkl'  
         joblib.dump(model, joblib_file)
         joblib.dump(iz_scaler, 'model/scalers/' + experiment +'_'+runname+'_scaler.gz')
         break
