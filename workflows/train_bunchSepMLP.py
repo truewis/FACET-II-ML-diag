@@ -217,9 +217,8 @@ absc = np.abs(c)
 idx = np.argsort(absc)
 
 # N-best parameter fit (bsaScalar PVs + step number)
-N = 20 
-X = np.vstack((bsaScalarData[idx[-N:],:][:,all_idx[goodShots]],steps[all_idx[goodShots]])).T
-bunchSep = bunchSeparation_all_fit
+predictor = np.vstack((bsaScalarData[:,all_idx[goodShots]],steps[all_idx[goodShots]])).T
+bs = bunchSeparation_all_fit
 
 
 # save data to files 
@@ -239,77 +238,153 @@ for _ in range(1):
 
 print('Training model...')
 
-nsims=X.shape[0]
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader, TensorDataset
+from sklearn.preprocessing import MinMaxScaler
+from sklearn.model_selection import train_test_split
+
+# Scale inputs and ouputs
+x_scaler = MinMaxScaler()
+x_scaled = x_scaler.fit_transform(predictor)
 
 # 80/20 train-test split
-ntrain = int(np.round(nsims*0.8))
-ntest = int(np.round(nsims*0.2))
+x_train_full, x_test_scaled, bs_train_full, bs_test = train_test_split(
+    x_scaled, bs, test_size=0.2)
 
-idx = np.random.permutation(nsims)
-idxtrain = idx[0:ntrain]
-idxtest = idx[ntrain:ntrain+ntest]
+# 20% validation split 
+x_train_scaled, X_val, bs_train, bs_val = train_test_split(
+    x_train_full, bs_train_full, test_size=0.2)
 
-# scale feature data for improved model accuracy 
-bs = bunchSep
-bs_train = bs[idxtrain]
-bs_test = bs[idxtest] 
+# Convert to PyTorch tensors
+X_train = torch.tensor(x_train_scaled, dtype=torch.float32)
+X_val = torch.tensor(X_val, dtype=torch.float32)
+X_test = torch.tensor(x_test_scaled, dtype=torch.float32)
+Y_train = torch.tensor(bs_train, dtype=torch.float32)
+Y_val = torch.tensor(bs_val, dtype=torch.float32)
+Y_test = torch.tensor(bs_test, dtype=torch.float32)
 
-# scale feature data for improved model accuracy
-from sklearn.preprocessing import MinMaxScaler
-scaler = MinMaxScaler()
-x_scaled = scaler.fit_transform(X)
-x_train_scaled = x_scaled[idxtrain]
-x_test_scaled = x_scaled[idxtest]
+train_ds = TensorDataset(X_train, Y_train)
+train_dl = DataLoader(train_ds, batch_size=24, shuffle=True)
 
 #################################################################################
 # MODEL TRAINING 
 #################################################################################
-
-import sklearn.neural_network as nn
 import time
 
-nn_model_bunchsep = nn.MLPRegressor(
-    activation = 'relu',
-    alpha = 1.0e-4,
-    batch_size = 24,
-    tol = 1e-4,# default 1e-4
-#    hidden_layer_sizes = (500,200,100),
-#    hidden_layer_sizes = (1000,500,500),
-    hidden_layer_sizes = (500, 200,100),#98% accuracy 5e-5 learning rate
-    solver = 'adam',
-    learning_rate = 'adaptive',# Only for sgd solver
-    learning_rate_init = 5.0e-5,
-    max_iter = 5000,
-    beta_1 = 0.9,beta_2=0.999,# Only for adam solver
-    shuffle = True,
-    early_stopping = True,
-    validation_fraction = 0.2,
-    verbose = False,
-    momentum = 0.7,# Only used for sgd solver
-    warm_start = False,
-    random_state = None
-)
+# Define MLP structure
+class MLP(nn.Module):
+    def __init__(self, in_dim, out_dim):
+        super().__init__()
+        self.model = nn.Sequential(
+            nn.Linear(in_dim, 500),
+            nn.ReLU(),
+            nn.Linear(500,200),
+            nn.ReLU(),
+            nn.Linear(200, 100),
+            nn.ReLU(),
+            nn.Linear(100, out_dim)
+        )
+    def forward(self, x):
+        return self.model(x)
+
+model = MLP(X_train.shape[1], Y_train.shape[1])
+optimizer = optim.Adam(model.parameters(), lr=5e-5, betas=(0.9, 0.999))
+loss_fn = nn.MSELoss()
+
+# Training loop 
+n_epochs = 200
+patience = 15
+best_val_loss = float('inf')
+early_stop_counter = 0
+
 t0 = time.time()
+
+
 # Fit the nn model on the training set
-nn_model_bunchsep.fit(x_train_scaled,bs_train)
+train_losses = []
+val_losses = []
+
+for epoch in range(n_epochs):
+    model.train()
+    train_loss = 0
+    for xb, yb in train_dl:
+        pred = model(xb)
+        loss = loss_fn(pred, yb)
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+        train_loss += loss.item()
+    avg_train_loss = train_loss / len(train_dl)
+    train_losses.append(avg_train_loss)
+
+    # Validation loss
+    model.eval()
+    with torch.no_grad():
+        val_pred = model(X_val)
+        val_loss = loss_fn(val_pred, Y_val).item()
+        val_losses.append(val_loss)
+
+    # Early stopping logic
+    if val_loss < best_val_loss:
+        best_val_loss = val_loss
+        best_model_state = model.state_dict()
+        early_stop_counter = 0
+    else:
+        early_stop_counter += 1
+        if early_stop_counter >= patience:
+            break
+    
+model.load_state_dict(best_model_state)
+    
+# Evaluate model
+model.eval()
+with torch.no_grad():
+    pred_train_full = model(X_train).numpy()
+    pred_test_full = model(X_test).numpy()
+
 elapsed = time.time() - t0
 print("Elapsed time [mins] = {:.1f} ".format(elapsed/60))
-# Predict on training and validation set
-predict_bs_train = nn_model_bunchsep.predict(x_train_scaled)
-predict_bs_test = nn_model_bunchsep.predict(x_test_scaled)
-#%% Print results and plot score
-print("Train R²: {0:.2f} ".format(nn_model_bunchsep.score(x_train_scaled,bs_train)*100),"%")
-print("Test R²: {0:.2f}".format(nn_model_bunchsep.score(x_test_scaled,bs_test) * 100),"%")
+
+# Compute R²
+def r2_score(true, pred):
+    RSS = np.sum((true - pred)**2)
+    TSS = np.sum((true - np.mean(true))**2)
+    return 1 - RSS / TSS if TSS != 0 else s0
+
+print("Train R²: {:.2f} %".format(r2_score(bs_train.ravel(), pred_train_full.ravel()) * 100))
+print("Test R²: {:.2f} %".format(r2_score(bs_test.ravel(), pred_test_full.ravel()) * 100))
 
 # save model 
-answer = input("Do you want to save model? (y/n): ").strip().lower() 
+
+while True: 
+    answer = input("Do you want to save model? (y/n): ").strip().lower() 
+    if answer == 'y': 
+        print('Saving model...')
+        import joblib
+        joblib_file = 'model/MLP_bunchSep_'+experiment+'_'+runname+'.pkl'  
+        joblib.dump(model, joblib_file)
+        break
+    elif answer == 'n': 
+        break
+    else: 
+        print("Please answer with 'y' or 'n'.") 
+
+# save predictions 
+answer = input("Do you want to save model predictions? (y/n): ").strip().lower() 
  
 # Check the response 
 if answer == 'y': 
+    print('Saving predictions...')
     import joblib
-    joblib_file = 'model/MLP_bunchSep_'+experiment+'_'+runname+'.pkl'    
-    joblib.dump(nn_model_bunchsep, joblib_file)
+    joblib_file = 'model/predictions/predbunchSep_'+experiment+'_'+runname+'.pkl'  
+    x = np.vstack((bsaScalarData, steps)).T
+    x=torch.tensor(x_scaler.transform(x), dtype=torch.float32)
+    with torch.no_grad():
+        x = model(x).numpy()
+    joblib.dump(x, joblib_file)
 elif answer == 'n': 
     exit() 
 else: 
-    print("Please answer with 'y' or 'n'.") 
+    print("Please answer with 'y' or 'n'.")  
