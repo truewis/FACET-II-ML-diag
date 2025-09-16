@@ -155,7 +155,7 @@ charge = bsaScalarData[pvidx, :] * 1.6e-19  # in C
 
 minus_90_idx = np.where((xtcavPhase >= -91) & (xtcavPhase <= -89))[0]
 plus_90_idx = np.where((xtcavPhase >= 89) & (xtcavPhase <= 91))[0]
-all_idx = np.append(minus_90_idx,plus_90_idx)
+all_idx = np.sort(np.append(minus_90_idx,plus_90_idx))
 
 currentProfile_all = [] 
 
@@ -271,7 +271,7 @@ class MLP(nn.Module):
 
 # Select model to test
 while True:
-    answer = input("Which pre-trained model would you like to test? Provide experiment and runname (ex: E338, 12710). ").strip()
+    answer = input("Which pre-trained model would you like to test? Provide experiment and runname (ex: E338, 12710): ").strip()
     if re.match('^E[0-9]+, [0-9]+', answer) is None:
         print("Invalid response, please try again")
         continue
@@ -280,11 +280,11 @@ while True:
         runname2 = re.search('[0-9]+$', answer)[0]
         try: 
             import joblib
-            joblib_model = joblib.load('model/MLP_' + experiment2 + '_' + runname2 + '.pkl')
+            joblib_model = joblib.load('model/CurrentProfile/MLP_currProf_' + experiment2 + '_' + runname2 + '.pkl')
             print('Model loaded successfully.')
             break
         except FileNotFoundError: 
-            print("Error: The specified model was not found in '/model'.")
+            print("Error: The specified model was not found in '/model/CurrentProfile'.")
             continue
 
 # Evaluate pre-trained model
