@@ -6,6 +6,7 @@ import re
 import matplotlib.pyplot as plt
 from types import SimpleNamespace
 import scipy
+from scipy.optimize import curve_fit
 import warnings
 from scipy.ndimage import median_filter, gaussian_filter
 import os
@@ -142,7 +143,7 @@ charge = bsaScalarData[pvidx, :] * 1.6e-19  # in C
 
 minus_90_idx = np.where((xtcavPhase >= -91) & (xtcavPhase <= -89))[0]
 plus_90_idx = np.where((xtcavPhase >= 89) & (xtcavPhase <= 91))[0]
-all_idx = np.append(minus_90_idx,plus_90_idx)
+all_idx = np.sort(np.append(minus_90_idx,plus_90_idx))
 
 currentProfile_all = [] 
 
@@ -161,6 +162,74 @@ for ij in range(len(all_idx)):
 currentProfile_all = np.array(currentProfile_all)
 
 separationCutoff = 0.05
+
+# Filter out "bad" shots with Bi-Gaussian fit 
+def bi_gaussian(x, A1, mu1, sigma1, A2, mu2, sigma2):
+    return (A1 * np.exp(-(x - mu1)**2 / (2 * sigma1**2)) +
+            A2 * np.exp(-(x - mu2)**2 / (2 * sigma2**2)))
+
+amp1 = []
+R_squared = []
+
+for ij in range(len(all_idx)):
+    y = currentProfile_all[ij, :]
+    x = np.arange(len(y))
+
+    # Initial guess: [A1, mu1, sigma1, A2, mu2, sigma2]
+    if xtcavPhase[all_idx][ij] < 0:
+        initial_guess = [np.max(y), 100, 4, np.max(y)*0.1, 60 + ij*0.15, 4]
+    elif xtcavPhase[all_idx][ij] > 0:
+        initial_guess = [np.max(y), 100, 4, np.max(y)*0.1, 60, 4]
+    
+    try:
+        popt, pcov = curve_fit(bi_gaussian, x, y, p0=initial_guess, maxfev=5000)
+    except RuntimeError:
+        amp1.append(np.nan)
+        R_squared.append(np.nan)
+        continue
+
+    # Extract parameters
+    A1, mu1_val, sig1, A2, mu2_val, sig2 = popt
+    amp1.append(A1)
+
+    # Evaluate fit
+    y_fit = bi_gaussian(x, *popt)
+    SST = np.sum((y - np.mean(y))**2)
+    SSR = np.sum((y - y_fit)**2)
+    R_squared.append(1 - SSR / SST)
+
+# Convert results to arrays
+amp1 = np.array(amp1)
+R_squared = np.array(R_squared)
+goodShots = np.where((R_squared > 0.5) & (amp1 < 50))[0] # set requirements for "good" shots
+
+from scipy.signal import find_peaks, peak_prominences
+
+bunchSeparation_all = []
+currentRatio_all = []
+
+separationCutoff = 0.05
+
+for ij in range(len(all_idx)):
+    profile = currentProfile_all[ij, :] 
+    peaks, _ = find_peaks(profile)
+    prominences = peak_prominences(profile, peaks)[0]
+    if len(prominences) < 2:
+        bunchSeparation_all.append(0)
+        continue
+    
+    top2_indices = np.argsort(prominences)[-2:]
+    pos = peaks[top2_indices]
+
+    peak_separation = abs(pos[0] - pos[1])
+
+    if abs(prominences[top2_indices[1]]) * separationCutoff > abs(prominences[top2_indices[0]]):
+        peak_separation = 0
+
+    bunchSeparation_all.append(peak_separation * xtcalibrationfactor)
+    currentRatio_all.append(profile[pos[1]] / profile[pos[0]])
+
+bunch_sep_um = np.array(bunchSeparation_all) * 3e8 * 1e6
 
 # calculate bunch separation using Gaussian Mixture Model (GMM)
 from sklearn.mixture import GaussianMixture
@@ -194,32 +263,47 @@ mean2 = np.array(mean2)
 amp2 = np.array(amp2 )
 
 # define good shots where clear bunch separation
-goodShots = np.where(amp2 > 0)[0]
-bunchSeparation_all_fit = (mean1[goodShots] - mean2[goodShots]) * xtcalibrationfactor * 1e6 * 3e8 # in microns 
+# bunchSeparation_all_fit = (mean1[goodShots] - mean2[goodShots]) * xtcalibrationfactor * 1e6 * 3e8 # in microns 
 steps = data_struct.scalars.steps[DTOTR2commonind]
 
 #################################################################################
 # MODEL PREPARATION 
 #################################################################################
-
-# order parameters by correlation 
-c = []
-
-for n in range(bsaScalarData.shape[0]):
-    X = np.array(bsaScalarData)[:,goodShots][n,:]
-    Y = bunchSeparation_all_fit
-    R = np.corrcoef(X, Y)
-    c.append(R[0, 1])
-
-c = np.array(c)
-c = c[~np.isnan(c)]
-absc = np.abs(c)
-idx = np.argsort(absc)
-
-# N-best parameter fit (bsaScalar PVs + step number)
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader, TensorDataset
+from sklearn.decomposition import PCA
+from sklearn.preprocessing import MinMaxScaler
+from sklearn.model_selection import train_test_split
+steps = data_struct.scalars.steps[DTOTR2commonind]
 predictor = np.vstack((bsaScalarData[:,all_idx[goodShots]],steps[all_idx[goodShots]])).T
-bs = bunchSeparation_all_fit
+bs = bunch_sep_um[goodShots].reshape(-1,1)
 
+# scale feature data for improved model accuracy
+x_scaler = MinMaxScaler()
+bs_scaler = MinMaxScaler()
+x_scaled = x_scaler.fit_transform(predictor)
+bs_scaled = bs_scaler.fit_transform(bs)
+
+# 80/20 train-test split
+x_train_full, x_test_scaled, bs_train_full, bs_test_scaled = train_test_split(
+    x_scaled, bs_scaled, test_size=0.2)
+
+# 20% validation split 
+x_train_scaled, X_val, bs_train_scaled, Y_val = train_test_split(
+    x_train_full, bs_train_full, test_size=0.2)
+
+# Convert to PyTorch tensors
+X_train = torch.tensor(x_train_scaled, dtype=torch.float32)
+X_val = torch.tensor(X_val, dtype=torch.float32)
+X_test = torch.tensor(x_test_scaled, dtype=torch.float32)
+Y_train = torch.tensor(bs_train_scaled, dtype=torch.float32)
+Y_val = torch.tensor(Y_val, dtype=torch.float32)
+Y_test = torch.tensor(bs_test_scaled, dtype=torch.float32)
+
+train_ds = TensorDataset(X_train, Y_train)
+train_dl = DataLoader(train_ds, batch_size=24, shuffle=True)
 
 # save data to files 
 answer = input("Do you want to save preprocessed data? (y/n): ").strip().lower() 
@@ -228,8 +312,8 @@ answer = input("Do you want to save preprocessed data? (y/n): ").strip().lower()
 for _ in range(1):
     if answer == 'y': 
         print("Saving data to '/data/processed/'....")
-        np.save('data/processed/predictors' + experiment + '_' + runname +'.npy', X)
-        np.save('data/processed/bunchSep' + experiment + '_' + runname + '.npy', bunchSep)
+        np.save('data/processed/predictors' + experiment + '_' + runname +'.npy', predictor)
+        np.save('data/processed/bunchSep' + experiment + '_' + runname + '.npy', bs)
     elif answer == 'n': 
         print('Data will not be saved.')
         break
@@ -238,42 +322,12 @@ for _ in range(1):
 
 print('Training model...')
 
-import torch
-import torch.nn as nn
-import torch.optim as optim
-from torch.utils.data import DataLoader, TensorDataset
-from sklearn.preprocessing import MinMaxScaler
-from sklearn.model_selection import train_test_split
-
-# Scale inputs and ouputs
-x_scaler = MinMaxScaler()
-x_scaled = x_scaler.fit_transform(predictor)
-
-# 80/20 train-test split
-x_train_full, x_test_scaled, bs_train_full, bs_test = train_test_split(
-    x_scaled, bs, test_size=0.2)
-
-# 20% validation split 
-x_train_scaled, X_val, bs_train, bs_val = train_test_split(
-    x_train_full, bs_train_full, test_size=0.2)
-
-# Convert to PyTorch tensors
-X_train = torch.tensor(x_train_scaled, dtype=torch.float32)
-X_val = torch.tensor(X_val, dtype=torch.float32)
-X_test = torch.tensor(x_test_scaled, dtype=torch.float32)
-Y_train = torch.tensor(bs_train, dtype=torch.float32)
-Y_val = torch.tensor(bs_val, dtype=torch.float32)
-Y_test = torch.tensor(bs_test, dtype=torch.float32)
-
-train_ds = TensorDataset(X_train, Y_train)
-train_dl = DataLoader(train_ds, batch_size=24, shuffle=True)
-
 #################################################################################
 # MODEL TRAINING 
 #################################################################################
+
 import time
 
-# Define MLP structure
 class MLP(nn.Module):
     def __init__(self, in_dim, out_dim):
         super().__init__()
@@ -290,8 +344,9 @@ class MLP(nn.Module):
         return self.model(x)
 
 model = MLP(X_train.shape[1], Y_train.shape[1])
-optimizer = optim.Adam(model.parameters(), lr=5e-5, betas=(0.9, 0.999))
+optimizer = optim.Adam(model.parameters(), lr=5e-4, betas=(0.9, 0.999))
 loss_fn = nn.MSELoss()
+
 
 # Training loop 
 n_epochs = 200
@@ -300,7 +355,6 @@ best_val_loss = float('inf')
 early_stop_counter = 0
 
 t0 = time.time()
-
 
 # Fit the nn model on the training set
 train_losses = []
@@ -341,9 +395,14 @@ model.load_state_dict(best_model_state)
 # Evaluate model
 model.eval()
 with torch.no_grad():
-    pred_train_full = model(X_train).numpy()
-    pred_test_full = model(X_test).numpy()
+    pred_train_scaled = model(X_train).numpy()
+    pred_test_scaled = model(X_test).numpy()
 
+# Inverse transform predictions
+pred_train_full = bs_scaler.inverse_transform(pred_train_scaled)
+pred_test_full = bs_scaler.inverse_transform(pred_test_scaled)
+bs_train_true = bs_scaler.inverse_transform(bs_train_scaled)
+bs_test_true = bs_scaler.inverse_transform(bs_test_scaled)
 elapsed = time.time() - t0
 print("Elapsed time [mins] = {:.1f} ".format(elapsed/60))
 
@@ -353,23 +412,21 @@ def r2_score(true, pred):
     TSS = np.sum((true - np.mean(true))**2)
     return 1 - RSS / TSS if TSS != 0 else s0
 
-print("Train R²: {:.2f} %".format(r2_score(bs_train.ravel(), pred_train_full.ravel()) * 100))
-print("Test R²: {:.2f} %".format(r2_score(bs_test.ravel(), pred_test_full.ravel()) * 100))
+print("Train R²: {:.2f} %".format(r2_score(bs_train_true.ravel(), pred_train_full.ravel()) * 100))
+print("Test R²: {:.2f} %".format(r2_score(bs_test_true.ravel(), pred_test_full.ravel()) * 100))
 
 # save model 
-
-while True: 
-    answer = input("Do you want to save model? (y/n): ").strip().lower() 
-    if answer == 'y': 
-        print('Saving model...')
-        import joblib
-        joblib_file = 'model/MLP_bunchSep_'+experiment+'_'+runname+'.pkl'  
-        joblib.dump(model, joblib_file)
-        break
-    elif answer == 'n': 
-        break
-    else: 
-        print("Please answer with 'y' or 'n'.") 
+answer = input("Do you want to save model? (y/n): ").strip().lower() 
+ 
+# Check the response 
+if answer == 'y': 
+    import joblib
+    joblib_file = 'model/BunchSep/MLP_bunchSep_'+experiment+'_'+runname+'.pkl'    
+    joblib.dump(nn_model_bunchsep, joblib_file)
+elif answer == 'n': 
+    exit() 
+else: 
+    print("Please answer with 'y' or 'n'.") 
 
 # save predictions 
 answer = input("Do you want to save model predictions? (y/n): ").strip().lower() 
@@ -378,13 +435,14 @@ answer = input("Do you want to save model predictions? (y/n): ").strip().lower()
 if answer == 'y': 
     print('Saving predictions...')
     import joblib
-    joblib_file = 'model/predictions/predbunchSep_'+experiment+'_'+runname+'.pkl'  
+    joblib_file = 'model/predictions/predBunchSep_'+experiment+'_'+runname+'.pkl'  
     x = np.vstack((bsaScalarData, steps)).T
     x=torch.tensor(x_scaler.transform(x), dtype=torch.float32)
     with torch.no_grad():
-        x = model(x).numpy()
-    joblib.dump(x, joblib_file)
+        pred = bs_scaler.inverse_transform(model(x).numpy())
+    joblib.dump(pred, joblib_file)
 elif answer == 'n': 
     exit() 
 else: 
-    print("Please answer with 'y' or 'n'.")  
+    print("Please answer with 'y' or 'n'.") 
+
