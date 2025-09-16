@@ -19,12 +19,12 @@ from Python_Functions.functions import cropProfmonImg, matstruct_to_dict, extrac
 
 # Select Experiment and runname
 while True:
-    answer = input("Please provide experiment and runname (ex: E338, 12710): ").strip()
+    answer = input("Please provide date, experiment, and runname (ex: E338, 12710): ").strip()
     if re.match('^E[0-9]+, [0-9]+', answer) is None:
         print("Invalid response, please try again")
         continue
     else: 
-        experiment = re.match('^E[0-9]+', answer)[0]
+        experiment = re.match('E[0-9]+', answer)[0]
         runname = re.search('[0-9]+$', answer)[0]
         try: 
             dataloc = 'data/raw/' + experiment + '/' + experiment + '_' + runname + '/' + experiment + '_'  +runname + '.mat'
@@ -164,7 +164,7 @@ charge = bsaScalarData[pvidx, :] * 1.6e-19  # in C
 
 minus_90_idx = np.where((xtcavPhase >= -91) & (xtcavPhase <= -89))[0]
 plus_90_idx = np.where((xtcavPhase >= 89) & (xtcavPhase <= 91))[0]
-all_idx = np.append(minus_90_idx,plus_90_idx)
+all_idx = np.sort(np.append(minus_90_idx,plus_90_idx))
 
 currentProfile_all = [] 
 
@@ -309,9 +309,8 @@ loss_fn = nn.MSELoss()
 # Define custom loss function 
 def custom_loss( y_pred,y_true):
     mse = (y_true - y_pred)**2
-    dev = abs(torch.maximum(y_true)-torch.maximum(y_pred))
-    # weights = (y_true < 2)*2
-    return torch.mean(mse) + dev
+    weights = 1+ 2*((y_true < 0.2)|(y_true > 0.8)).float()
+    return torch.mean(weights*mse) 
 
 # Training loop 
 n_epochs = 200
@@ -387,9 +386,9 @@ while True:
     if answer == 'y': 
         print('Saving model...')
         import joblib
-        joblib_file = 'model/MLP_currProf_'+experiment+'_'+runname+'.pkl'  
+        joblib_file = 'model/CurrentProfile/MLP_currProf_'+experiment+'_'+runname+'.pkl'  
         joblib.dump(model, joblib_file)
-        joblib.dump(iz_scaler, 'model/scalers/' + experiment +'_'+runname+'_scaler.gz')
+        joblib.dump(iz_scaler, 'model/CurrentProfile/' + experiment +'_'+runname+'_scaler.gz')
         break
     elif answer == 'n': 
         break
@@ -407,8 +406,8 @@ if answer == 'y':
     x = np.vstack((bsaScalarData, steps)).T
     x=torch.tensor(x_scaler.transform(x), dtype=torch.float32)
     with torch.no_grad():
-        x = iz_scaler.inverse_transform(model(x).numpy())
-    joblib.dump(x, joblib_file)
+        pred = iz_scaler.inverse_transform(model(x).numpy())
+    joblib.dump(pred, joblib_file)
 elif answer == 'n': 
     exit() 
 else: 
