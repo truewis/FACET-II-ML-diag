@@ -15,11 +15,25 @@ import processNoisyTCAVImage
 # 2. Path Sanitiation
 # Use a configuration dictionary for paths instead of hardcoding.
 # You'll need to update these paths for your actual environment.
+CONFIG_2 = {
+    # Base directory for DAQ data (e.g., '/nas/nas-li20-pm00/TEST')
+    "DAQ_BASE_PATH": "data/raw/",
+    # The specific DAQ folder suffix
+    "DAQ_PATH_SUFFIX": "TEST/2023/20230901/TEST_03748",
+    "INSTRUMENT": "PR10711",# The camera/instrument name in the DAQ data structure
+    
+    "X_CROP": slice(49,300),# The image crop slice in X (0-based indexing)
+    "Y_CROP": slice(0,491,10),# The image crop slice in Y (0-based indexing)
+}
 CONFIG = {
     # Base directory for DAQ data (e.g., '/nas/nas-li20-pm00/TEST')
     "DAQ_BASE_PATH": "data/raw/",
     # The specific DAQ folder suffix
-    "DAQ_PATH_SUFFIX": "TEST/2023/20230901/TEST_03748"
+    "DAQ_PATH_SUFFIX": "E300/E300_12427",
+    "INSTRUMENT": "DTOTR2",# The camera/instrument name in the DAQ data structure
+    
+    "X_CROP": slice(20,272),# The image crop slice in X (0-based indexing)
+    "Y_CROP": slice(0,821,20), # The image crop slice in Y (0-based indexing)
 }
 
 # 3. Colormap Placeholder (if you use matplotlib for plotting)
@@ -55,87 +69,61 @@ def truncate_path_from_substring(full_path: str, start_substring: str) -> str:
         return full_path
     
 #%% ======================================================================
-def initialize_and_allocate(data_struct, image_base_path, C_0based):
-    """
-    Initializes image processing by loading the first image (from .h5 or .tif),
-    determines the final processed dimensions, and pre-allocates an array for all images.
-    """
-    # MATLAB: imgLoc = ['/Users/cemma/',data_struct.images.PR10711.loc{1}];
-    # The 'loc' field holds a list of relative paths. loc{1} is the first shot.
-    # NOTE: The logic has been adapted to handle either a single H5 file path
-    # or a path to the first TIFF in a sequence.
-    first_img_relative_path = truncate_path_from_substring(data_struct['loc'][0], 'images/')
-    first_imgLoc_path = Path(image_base_path) / first_img_relative_path
 
-    # MATLAB: img = imgfull(1:10:491,50:300); downsample and crop
-    # Parameters for processing
-    HOT_PIX_THRESHOLD = 20
-    SIGMA = 1
-    THRESHOLD = 5
-    
-    imgfull_first = None
+def load_image_transparently(data_struct, image_base_path, common_index):
+    """
+    Loads a single image from either a .h5 stack or a sequence of .tif files.
 
-    # Read, Rotate, Downsample, and Crop the FIRST image to get the final flattened size
+    Args:
+        data_struct (dict): Dictionary containing 'loc' and optionally 'step' keys.
+        image_base_path (str): The base directory for the image data.
+        common_index (int): The 0-based index of the image to load from the overall sequence.
+
+    Returns:
+        np.ndarray: The loaded and rotated image as a NumPy array, or None on failure.
+    """
     try:
-        print(f"Attempting to load initial image from: {first_imgLoc_path}")
-        file_extension = first_imgLoc_path.suffix.lower()
+        # Determine file format from the first entry in 'loc'
+        first_loc_path = Path(data_struct.loc[0])
+        file_extension = first_loc_path.suffix.lower()
 
-        # Check for HDF5 format
+        # Handle HDF5 format
         if file_extension == '.h5':
-            print("Detected HDF5 format.")
             import h5py
-            with h5py.File(first_imgLoc_path, 'r') as f:
-                # Find the primary dataset (assuming the largest array is the image stack)
-                dataset_sizes = {name: d.size for name, d in f.items() if hasattr(d, 'shape')}
-                if not dataset_sizes:
-                    raise ValueError(f"No datasets found in H5 file: {first_imgLoc_path}")
-                dataset_key = max(dataset_sizes, key=dataset_sizes.get)
-                print(f"Reading from dataset: '{dataset_key}'")
-                
-                # Load the first image from the stack (index 0)
-                img_data = f[dataset_key][0]
-                # Rotate 180 degrees using numpy
-                imgfull_first = np.rot90(img_data, 2)
+            # Determine the correct H5 file using the 'step' array
+            target_file_num = data_struct.step[common_index] # e.g.,1-5
+            
+            h5_relative_path = truncate_path_from_substring(data_struct.loc[target_file_num-1], 'images/')
+            h5_full_path = Path(image_base_path) / h5_relative_path
 
-        # Handle standard image formats (default case)
+            # Compute the relative index of the image within its H5 file
+            steps_array = np.array(data_struct.step)
+            # Count how many shots with this file number occurred up to the common_index
+            relative_index = np.count_nonzero(steps_array[:common_index + 1] == target_file_num) - 1
+
+            print(f"Loading H5 image: file {target_file_num}, relative index {relative_index}")
+            with h5py.File(h5_full_path, 'r') as f:
+                
+                img_data = f['entry']['data']['data'][relative_index]
+                return np.rot90(img_data, 2)
+
+        # Handle standard image formats (e.g., TIFF)
         else:
-            print("Assuming standard image format (e.g., TIFF, PNG).")
-            from PIL import Image
-            # Load and rotate using Pillow
-            imgfull_first = np.array(Image.open(first_imgLoc_path).rotate(180))
+            img_relative_path = truncate_path_from_substring(data_struct.loc[common_index], 'images/')
+            img_full_path = Path(image_base_path) / img_relative_path
+            
+            print(f"Loading TIFF image from: {img_full_path}")
+            return np.array(Image.open(img_full_path).rotate(180))
 
     except FileNotFoundError:
-        print(f"Error: Initial image file not found at {first_imgLoc_path}")
-        return None, None
-    except (ImportError, ValueError, NotImplementedError, IOError) as e:
+        print(f"Error: Image file not found.")
+        return None
+    except (ImportError, ValueError, NotImplementedError, IOError, IndexError) as e:
         print(f"An error occurred while reading the image: {e}")
-        return None, None
+        return None
 
-    # --- The rest of the processing pipeline remains unchanged ---
-
-    # Downsample and crop (MATLAB 1:10:491, 50:300)
-    # Python slices are [start:stop:step] and [start:stop)
-    # 1:10:491  (1-based, inclusive end) -> [0:491:10] (0-based, exclusive end)
-    # 50:300 (1-based, inclusive end) -> [49:300] (0-based, exclusive end)
-    
-    print("Cropping and downsampling the first image.")
-    img_first_cropped = imgfull_first[0:491:10, 49:300]
-    
-    # Process the first image to get the size of the *processed* data
-    imgProc_first = processNoisyTCAVImage.processNoisyTCAVImage(img_first_cropped, HOT_PIX_THRESHOLD, SIGMA, THRESHOLD)
-    
-    # Calculate the size for pre-allocation
-    rows, cols = imgProc_first.shape
-    N_shots = len(C_0based)
-    N_pixels = rows * cols
-    
-    # Pre-allocate the final array
-    lpsFlattened = np.zeros((N_shots, N_pixels), dtype=np.float64)
-    print(f'Pre-allocating lpsFlattened: {N_shots} shots x {N_pixels} pixels ({lpsFlattened.nbytes / 1e6:.2f} MB)')
-
-    return lpsFlattened, N_pixels
-#%%
-def analyze_daq_images(daq_path_suffix: str, daq_base_path: str, opts=None):
+#%% ======================================================================
+def analyze_daq_images(daq_path_suffix: str, daq_base_path: str, instrument: str, x_crop: slice, y_crop: slice):
     """
     Loads DAQ data, extracts BSA scalars, processes images, and flattens them.
 
@@ -144,7 +132,6 @@ def analyze_daq_images(daq_path_suffix: str, daq_base_path: str, opts=None):
                                (e.g., '/TEST/2023/20230901/TEST_03748').
         daq_base_path (str): The root path where DAQ data is stored 
                              (e.g., '/Users/cemma/nas/nas-li20-pm00').
-        opts (dict, optional): Options struct, currently unused in Python equivalent.
 
     Returns:
         tuple: (lpsFlattened, data_struct, save_filename)
@@ -152,9 +139,6 @@ def analyze_daq_images(daq_path_suffix: str, daq_base_path: str, opts=None):
                - data_struct (dict): The loaded DAQ data.
                - save_filename (str): The suggested filename for saving.
     """
-    if opts is None:
-        # Default options mirror the MATLAB script
-        opts = {'usemethod': 2}
     
     # --- Step 1: Construct Paths and Load DAQ .mat file ---
     
@@ -187,10 +171,11 @@ def analyze_daq_images(daq_path_suffix: str, daq_base_path: str, opts=None):
     # We navigate to the PR10711 structure.
     try:
         # Accessing nested fields from the loaded MATLAB structure object (using ._content for consistency)
-        PR10711 = data_struct.images.DTOTR2 # Adjusted to match the actual field name in the MATLAB struct 
+        INSTRUMENT = data_struct.images.__getattribute__(instrument)
+         # Adjusted to match the actual field name in the MATLAB struct 
         
         # Find matching timestamps between the cameras
-        C = PR10711.common_index # C is the 1-based index from MATLAB
+        C = INSTRUMENT.common_index # C is the 1-based index from MATLAB
         C_0based = np.array(C) - 1 # Convert to 0-based Python indices
         
     except AttributeError:
@@ -219,8 +204,6 @@ def analyze_daq_images(daq_path_suffix: str, daq_base_path: str, opts=None):
     
     # MATLAB: imgLoc = ['/Users/cemma/',data_struct.images.PR10711.loc{1}];
     # The 'loc' field holds a list of relative paths. loc{1} is the first shot.
-    first_img_relative_path = truncate_path_from_substring(PR10711.loc[C_0based[0]], 'images/')
-    first_imgLoc_path = Path(image_base_path) / first_img_relative_path
 
     # MATLAB: img = imgfull(1:10:491,50:300); downsample and crop
     # Parameters for processing
@@ -228,40 +211,11 @@ def analyze_daq_images(daq_path_suffix: str, daq_base_path: str, opts=None):
     SIGMA = 1
     THRESHOLD = 5
     
-    # Read, Rotate, Downsample, and Crop the FIRST image to get the final flattened size
-    try:
-        print(f"Attempting to load initial image from: {first_imgLoc_path}")
-        file_extension = first_imgLoc_path.suffix.lower()
+    # Load the first image (index 0) using the new transparent loader function
+    imgfull_first = load_image_transparently(INSTRUMENT, image_base_path, 0)
 
-        # Check for HDF5 format
-        if file_extension == '.h5':
-            print("Detected HDF5 format.")
-            import h5py
-            with h5py.File(first_imgLoc_path, 'r') as f:
-                # Find the primary dataset (assuming the largest array is the image stack)
-                dataset_sizes = {name: d.size for name, d in f.items() if hasattr(d, 'shape')}
-                if not dataset_sizes:
-                    raise ValueError(f"No datasets found in H5 file: {first_imgLoc_path}")
-                dataset_key = max(dataset_sizes, key=dataset_sizes.get)
-                print(f"Reading from dataset: '{dataset_key}'")
-                
-                # Load the first image from the stack (index 0)
-                img_data = f[dataset_key][0]
-                # Rotate 180 degrees using numpy
-                imgfull_first = np.rot90(img_data, 2)
-
-        # Handle standard image formats (default case)
-        else:
-            print("Assuming standard image format (e.g., TIFF, PNG).")
-            from PIL import Image
-            # Load and rotate using Pillow
-            imgfull_first = np.array(Image.open(first_imgLoc_path).rotate(180))
-
-    except FileNotFoundError:
-        print(f"Error: Initial image file not found at {first_imgLoc_path}")
-        return None, None
-    except (ImportError, ValueError, NotImplementedError, IOError) as e:
-        print(f"An error occurred while reading the image: {e}")
+    if imgfull_first is None:
+        print("Halting initialization because the first image could not be loaded.")
         return None, None
 
     # Downsample and crop (MATLAB 1:10:491, 50:300)
@@ -269,7 +223,7 @@ def analyze_daq_images(daq_path_suffix: str, daq_base_path: str, opts=None):
     # 1:10:491  (1-based, inclusive end) -> [0:491:10] (0-based, exclusive end)
     # 50:300 (1-based, inclusive end) -> [49:300] (0-based, exclusive end)
     
-    img_first_cropped = imgfull_first[0:491:10, 49:300]
+    img_first_cropped = imgfull_first[x_crop, y_crop]
     
     # Process the first image to get the size of the *processed* data
     imgProc_first = processNoisyTCAVImage.processNoisyTCAVImage(img_first_cropped, HOT_PIX_THRESHOLD, SIGMA, THRESHOLD)
@@ -288,20 +242,18 @@ def analyze_daq_images(daq_path_suffix: str, daq_base_path: str, opts=None):
     for n in range(N_shots):
         # 1. Get image location for the nth shot (using the common index C)
         current_C_idx = C_0based[n]
-        img_relative_path = truncate_path_from_substring(PR10711.loc[current_C_idx], 'images/')
-        imgLoc_path = Path(image_base_path) / img_relative_path
 
         # 2. Read and Rotate the image
         # MATLAB: imrotate(imread(imgLoc),180)
         try:
-            imgfull = np.array(Image.open(imgLoc_path).rotate(180))
-        except FileNotFoundError:
-            print(f"Warning: Image file not found for shot {n} at {imgLoc_path}. Skipping.")
+            imgfull = load_image_transparently(INSTRUMENT, image_base_path, current_C_idx)
+        except Exception as e:
+            print(f"Warning: {e} for shot {n}. Skipping.")
             continue # Skip this shot and leave the row as zeros
 
         # 3. Downsample and Crop
         # MATLAB: img = imgfull(1:10:491,50:300); 
-        img = imgfull[0:491:10, 49:300]
+        img = imgfull[x_crop, y_crop]
 
         # 4. Process the image
         # MATLAB: imgProc = processNoisyTCAVImage(img,20,1,5);
@@ -331,10 +283,14 @@ def analyze_daq_images(daq_path_suffix: str, daq_base_path: str, opts=None):
 
 #If two arguments are provided, run the main function with those arguments
 import sys
-if len(sys.argv) == 3:
+if len(sys.argv) == 4:
     daq_base_path = sys.argv[1]
     daq_path_suffix = sys.argv[2]
-    lpsFlattened, data_struct, save_filename = analyze_daq_images(daq_path_suffix, daq_base_path)
+    instrument = sys.argv[3]
+    print(f"Running with provided arguments:\n Base Path: {daq_base_path}\n Path Suffix: {daq_path_suffix}\n Instrument: {instrument}")
+    #Warn that cropping parameters are set in the CONFIG dictionary
+    print("Note: Image cropping parameters (X_CROP, Y_CROP) are set in the CONFIG dictionary.")
+    lpsFlattened, data_struct, save_filename = analyze_daq_images(daq_path_suffix, daq_base_path, instrument, CONFIG["X_CROP"], CONFIG["Y_CROP"])
     if lpsFlattened is not None:
         print(f"Data processed successfully. Suggested save filename: {save_filename}")
         savemat(save_filename, {'lpsFlattened': lpsFlattened})
@@ -343,7 +299,10 @@ else:
     #Main Function using CONFIG paths
     lpsFlattened, data_struct, save_filename = analyze_daq_images(
             CONFIG["DAQ_PATH_SUFFIX"],
-            CONFIG["DAQ_BASE_PATH"]
+            CONFIG["DAQ_BASE_PATH"],
+            CONFIG["INSTRUMENT"],
+            CONFIG["X_CROP"],
+            CONFIG["Y_CROP"]
     )
     if lpsFlattened is not None:
         print(f"Data processed successfully. Suggested save filename: {save_filename}")
