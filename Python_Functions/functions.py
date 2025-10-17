@@ -60,6 +60,9 @@ def cropProfmonImg(img, xrange, yrange, plot_flag=False):
     """
     Crop a 2D image around the peak of horizontal and vertical projections,
     returning a region of shape (2*yrange, 2*xrange), with padding if needed.
+    Center of mass is always at the center of the cropped image.
+    Justification: For TCAV images, center of x represents zeta = 0, which can be arbitrarily chosen.
+    center of y represents E=10.0GeV, whose variation seems much smaller than the 'orbit' effect of quadropoles which causes unwanted image shifting in y.
 
     Args:
         img (2D np.ndarray): Input image.
@@ -74,15 +77,16 @@ def cropProfmonImg(img, xrange, yrange, plot_flag=False):
     img = img.astype(float)
     img_h, img_w = img.shape
 
-    # Use max projections to find "COM"
-    x_com = int(np.argmax(np.sum(img, axis=0)))
-    y_com = int(np.argmax(np.sum(img, axis=1)))
 
-    # Desired window size
-    x_start = x_com - xrange
-    x_end   = x_com + xrange
-    y_start = y_com - yrange
-    y_end   = y_com + yrange
+    # Use max projections to find ROI center
+    x_peak = int(np.argmax(np.sum(img, axis=0)))
+    y_peak = int(np.argmax(np.sum(img, axis=1)))
+
+    # Desired window size, larger to allow for centering later
+    x_start = x_peak - xrange*2
+    x_end   = x_peak + xrange*2
+    y_start = y_peak - yrange*2
+    y_end   = y_peak + yrange*2
 
     # Compute required padding if indices go out of bounds
     pad_left   = max(0, -x_start)
@@ -107,6 +111,21 @@ def cropProfmonImg(img, xrange, yrange, plot_flag=False):
 
     # Crop
     cropped_img = img[y_start:y_end, x_start:x_end]
+
+    # Calculate center of mass for cropped image
+    cropped_h, cropped_w = cropped_img.shape
+    x_com_cropped = int(np.round(np.sum(np.arange(cropped_w) * np.sum(cropped_img, axis=0)) / np.sum(cropped_img)))
+    y_com_cropped = int(np.round(np.sum(np.arange(cropped_h) * np.sum(cropped_img, axis=1)) / np.sum(cropped_img)))
+
+    # Shift cropped image to center the COM
+    shift_x = (cropped_w // 2) - x_com_cropped
+    shift_y = (cropped_h // 2) - y_com_cropped
+    cropped_img = np.roll(cropped_img, shift_x, axis=1)
+    cropped_img = np.roll(cropped_img, shift_y, axis=0)
+
+    # Crop again to ensure final size
+    cropped_img = cropped_img[(cropped_h//2 - yrange):(cropped_h//2 + yrange),
+                              (cropped_w//2 - xrange):(cropped_w//2 + xrange)]
 
     # Sanity check
     if cropped_img.shape != (2*yrange, 2*xrange):

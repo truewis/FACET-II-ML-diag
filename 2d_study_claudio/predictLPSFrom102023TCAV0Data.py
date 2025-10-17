@@ -8,7 +8,6 @@ Created on Thu Feb 14 11:05:04 2019
 # 1. Importing data from Lucretia sim
 import time
 import sys
-sys.path.insert(0,'/Users/cemma/Documents/Work/FACET-II/Lucretia_sims/ML_Two_bunch/')
 import numpy as np
 import scipy.io as sio
 import matplotlib.pyplot as plt
@@ -16,9 +15,12 @@ from plotting_functions_twobunch import plot_2bunch_prediction_vs_lucretia
 import sklearn.neural_network as nn
 from sklearn import preprocessing
 import extractDAQBSAScalars
-path = "data/raw/TEST/2023/20230901/TEST_03748/"
-bsaScalarData, bsaVars = extractDAQBSAScalars.extractDAQBSAScalars(sio.loadmat(path+'TEST_03748.mat', squeeze_me=True, struct_as_record=False)['data_struct'])
-lps = sio.loadmat(path+'lpsFlattened_TEST_03748.mat',squeeze_me=True)
+from pathlib import Path
+path = Path("data/raw/TEST/2023/20230901/TEST_03748") #Path("data/raw/E300/E300_12427") 
+matName = path.name + '.mat'
+lpsFlatName = 'lpsFlattened_' + path.name + '.mat'
+bsaScalarData, bsaVars = extractDAQBSAScalars.extractDAQBSAScalars(sio.loadmat(path/matName, squeeze_me=True, struct_as_record=False)['data_struct'])
+lps = sio.loadmat(path/lpsFlatName,squeeze_me=True)
 # Scandata is in the following columns [L1p,L2p,L1v,L2v,Qi,bc11pkI,bc14pkI,IPpkI,bc11.centroidx,bc14.centroidx]
 bsaScalarData = np.transpose(bsaScalarData)
 lps = lps['lpsFlattened']; 
@@ -126,12 +128,12 @@ print(np.mean(score[np.isfinite(score)]))
 import joblib
 dirr = 'PredictLPSWithHeaterOn/'
 # Save to file in the current working directory
-joblib_file = dirr+"nn_model_singleBunch_lps_E327_.pkl"  
+joblib_file = dirr+f"nn_model_singleBunch_lps_{path.name}.pkl"  
 joblib.dump(nn_model_curprof, joblib_file)
   # #Save stuff to matlab variables so I can put them into my figure of merit function
-sio.savemat(dirr+'lps_test_scaled.mat',mdict={'Iz_test_scaled': Iz_test_scaled*np.max(lps)})
-sio.savemat(dirr+'predict_lps_test_scaled.mat',mdict={'predict_Iz_test': predict_Iz_test*np.max(lps)})
-sio.savemat(dirr+'lps_test_shots.mat',mdict={'idxtest': idxtest})
+sio.savemat(dirr+f'lps_test_scaled_{path.name}.mat',mdict={'Iz_test_scaled': Iz_test_scaled*np.max(lps)})
+sio.savemat(dirr+f'predict_lps_test_scaled_{path.name}.mat',mdict={'predict_Iz_test': predict_Iz_test*np.max(lps)})
+sio.savemat(dirr+f'lps_test_shots_{path.name}.mat',mdict={'idxtest': idxtest})
 
 #%% Load nn model from file
 # joblib_model = joblib.load(joblib_file)
