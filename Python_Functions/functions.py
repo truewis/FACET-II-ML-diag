@@ -4,6 +4,9 @@ import matplotlib.pyplot as plt
 import scipy
 import warnings
 from scipy.io.matlab.mio5_params import mat_struct
+from scipy.ndimage import median_filter, gaussian_filter
+import re
+import h5py
 
 def matstruct_to_dict(obj):
     """
@@ -203,3 +206,266 @@ def plot2DbunchseparationVsCollimatorAndBLEN(bc14BLEN, step_vals, bunchSeparatio
     plt.ylabel('Notch Position')
     plt.title(title)
     plt.colorbar(im, label='Bunch Separation [μm]')
+
+def extract_processed_images(data_struct, experiment, xrange=100, yrange=100, hotPixThreshold=1e3, sigma=1, threshold=5):
+    """
+    Processes DTOTR2 images from HDF5 files, applying module-defined cropping, 
+    filtering, and calculating horizontal projections (current profiles).
+
+    Assumes the following are available in the current module's scope:
+    - cropProfmonImg, median_filter, gaussian_filter (functions)
+    - xrange, yrange, hotPixThreshold, sigma, threshold (constants)
+
+    Args:
+        data_struct (object): Structure containing image locations and backgrounds 
+                              (e.g., data_struct.images.DTOTR2.loc, data_struct.backgrounds.DTOTR2).
+        experiment (str): The name of the experiment, used in the file path pattern.
+        xrange (int): Half-width for cropping in x-direction.
+        yrange (int): Half-height for cropping in y-direction.
+        hotPixThreshold (float): Threshold for hot pixel masking.
+        sigma (float): Sigma for Gaussian smoothing.
+        threshold (float): Threshold below which pixel values are set to zero.
+
+    Returns:
+        tuple: A tuple containing the processed image arrays:
+               (xtcavImages, xtcavImages_raw, horz_proj, LPSImage)
+    """
+    xtcavImages_list = []
+    xtcavImages_list_raw = []
+    horz_proj_list = []
+    LPSImage = []
+    stepsAll = data_struct.params.stepsAll
+    if stepsAll is None or len(np.atleast_1d(stepsAll)) == 0:
+        stepsAll = [1]
+    for a in range(len(stepsAll)):
+        # --- Determine File Path ---
+        if len(stepsAll) == 1:
+            raw_path = data_struct.images.DTOTR2.loc
+        else:
+            raw_path = data_struct.images.DTOTR2.loc[a]
+        
+        # Search for the expected file name pattern
+        match = re.search(rf'({experiment}_\d+/images/DTOTR2/DTOTR2_data_step\d+\.h5)', raw_path)
+        if not match:
+            raise ValueError(f"Path format invalid or not matched: {raw_path}")
+
+        DTOTR2datalocation = '../../data/raw/' + experiment + '/' + match.group(0)
+
+        # --- Read and Prepare Data ---
+        with h5py.File(DTOTR2datalocation, 'r') as f:
+            data_raw = f['entry']['data']['data'][:].astype(np.float64) # shape: (N, H, W)
+        
+        # Transpose to shape: (H, W, N) - Height, Width, Shots
+        DTOTR2data_step = np.transpose(data_raw, (2, 1, 0))
+        # Subtract background (H, W) from all shots (H, W, N)
+        xtcavImages_step = DTOTR2data_step - data_struct.backgrounds.DTOTR2[:,:,np.newaxis].astype(np.float64)
+        
+        # --- Process Individual Shots ---
+        for idx in range(DTOTR2data_step.shape[2]):
+            if idx is None:
+                continue
+                
+            image = xtcavImages_step[:,:,idx] # Single shot (H, W)
+            
+            # Store Raw (background-subtracted) Image
+            xtcavImages_list_raw.append(image[:,:,np.newaxis])
+            
+            # Crop image
+            image_cropped, _ = cropProfmonImg(image, xrange, yrange, plot_flag=False)
+            
+            # Filter and mask hot pixels
+            img_filtered = median_filter(image_cropped, size=3)
+            hotPixels = img_filtered > hotPixThreshold
+            img_filtered = np.ma.masked_array(img_filtered, hotPixels)
+            
+            # Gaussian smoothing and thresholding
+            processed_image = gaussian_filter(img_filtered, sigma=sigma, radius = 6*sigma + 1)
+            processed_image[processed_image < threshold] = 0.0
+            
+            # Calculate current profiles (Horizontal Projection)
+            horz_proj_idx = np.sum(processed_image, axis=0)
+            horz_proj_idx = horz_proj_idx[:,np.newaxis]
+            
+            # Prepare for collection
+            processed_image = processed_image[:,:,np.newaxis]
+            image_ravel = processed_image.ravel()
+            
+            horz_proj_list.append(horz_proj_idx)
+            xtcavImages_list.append(processed_image)
+            LPSImage.append([image_ravel]) 
+
+    # --- Concatenate Results ---
+    xtcavImages = np.concatenate(xtcavImages_list, axis=2)
+    xtcavImages_raw = np.concatenate(xtcavImages_list_raw, axis=2)
+    horz_proj = np.concatenate(horz_proj_list, axis=1)
+    LPSImage = np.concatenate(LPSImage, axis = 0)
+
+    # --- Apply Common Indexing ---
+    # Convert from 1-based (assumed for common_index) to 0-based indexing
+    DTOTR2commonind = data_struct.images.DTOTR2.common_index - 1 
+    
+    horz_proj = horz_proj[:, DTOTR2commonind]
+    xtcavImages = xtcavImages[:, :, DTOTR2commonind]
+    xtcavImages_raw = xtcavImages_raw[:, :, DTOTR2commonind]
+
+    # Final Arrays
+    LPSImage = LPSImage[DTOTR2commonind,:] 
+
+    return xtcavImages, xtcavImages_raw, horz_proj, LPSImage
+
+def construct_centroid_function(images, off_idx, smoothing_window_size=5, max_degree=1):
+    """
+    Constructs a smoothed centroid function with localized quadratic extrapolation.
+
+    This function calculates the mean horizontal center of mass (COM) for each
+    row across a selection of images. It handles unreliable data with advanced logic:
+    1.  **Interpolation**: Fills gaps for rows with high COM variance using linear
+        interpolation between stable rows.
+    2.  **Smoothing**: Applies a moving average filter to the entire COM profile.
+    3.  **Local Extrapolation**: For rows far from any stable data, it performs
+        two separate polynomial fits:
+        -   **Top Extrapolation**: Fits a degree-2 polynomial to the top-most
+            stable rows (up to 7 points) to project the trend upwards.
+        -   **Bottom Extrapolation**: Fits a separate degree-2 polynomial to the
+            bottom-most stable rows to project the trend downwards.
+        This local approach correctly handles non-uniform trends (e.g., S-curves).
+
+    Args:
+        images (list or np.ndarray): A list or 3D NumPy array of 2D image arrays.
+                                     All images must have the same dimensions.
+        off_idx (list or np.ndarray): Indices of images to use for the calculation.
+        smoothing_window_size (int, optional): The size of the moving average window
+                                               for smoothing. Must be an odd number.
+                                               Defaults to 5.
+
+    Returns:
+        np.ndarray: A 1D array where each value is the integer horizontal shift
+                    required to center the content of that row.
+    """
+    if not isinstance(off_idx, (list, np.ndarray)):
+        raise ValueError("off_idx must be a non-empty list or array of indices.")
+    if smoothing_window_size % 2 != 1:
+        raise ValueError("smoothing_window_size must be a positive odd number.")
+
+    # 1. Select images and get dimensions
+    selected_images = np.array([images[:,:,i] for i in off_idx])
+    num_images, num_rows, num_cols = selected_images.shape
+    image_center = num_cols / 2.0
+
+    # 2. Calculate Center of Mass (COM) for each row
+    col_indices = np.arange(num_cols)
+    epsilon = 1e-9
+    row_sums = selected_images.sum(axis=2)
+    all_row_coms = np.sum(selected_images * col_indices, axis=2) / (row_sums + epsilon)
+    all_row_coms[row_sums == 0] = np.nan
+
+    # 3. Identify stable ("good") rows
+    mean_coms = np.nanmean(all_row_coms, axis=0)
+    std_dev_coms = np.nanstd(all_row_coms, axis=0)
+    variance_threshold = 0.15 * num_cols
+    good_rows_indices = np.where(std_dev_coms <= variance_threshold)[0]
+    all_row_indices = np.arange(num_rows)
+    
+    # Handle cases with insufficient good data
+    if len(good_rows_indices) < 2:
+        print("Warning: Fewer than 2 stable rows found. Cannot perform reliable analysis.")
+        return np.zeros(num_rows, dtype=int)
+        
+    # 4. Interpolate and Smooth
+    good_com_values = mean_coms[good_rows_indices]
+    interpolated_coms = np.interp(all_row_indices, good_rows_indices, good_com_values)
+    
+    if smoothing_window_size > 1:
+        kernel = np.ones(smoothing_window_size) / smoothing_window_size
+        smoothed_coms = np.convolve(interpolated_coms, kernel, mode='same')
+    else:
+        smoothed_coms = interpolated_coms
+        
+    # 5. Perform LOCAL EXTRAPOLATION
+    final_coms = np.copy(smoothed_coms) # Start with interpolated/smoothed data
+    min_good_idx, max_good_idx = good_rows_indices[0], good_rows_indices[-1]
+
+    # --- Top Extrapolation ---
+    top_extrap_indices = np.arange(0, min_good_idx)
+    if top_extrap_indices.size > 0:
+        # Select up to degree+5 (7) points from the top of the stable region
+        fit_indices = good_rows_indices[:max_degree + 5]
+        fit_values = good_com_values[:max_degree + 5]
+        
+        # Need at least degree+1 points to fit. We require 2 for linear, 3 for quadratic.
+        if len(fit_indices) >= 2:
+            degree = min(max_degree, len(fit_indices) - 1)
+            coeffs = np.polyfit(fit_indices, fit_values, degree)
+            poly_func = np.poly1d(coeffs)
+            final_coms[top_extrap_indices] = poly_func(top_extrap_indices)
+            
+    # --- Bottom Extrapolation ---
+    bottom_extrap_indices = np.arange(max_good_idx + 1, num_rows)
+    if bottom_extrap_indices.size > 0:
+        # Select up to degree+5 (7) points from the bottom of the stable region
+        fit_indices = good_rows_indices[-(max_degree + 5):]
+        fit_values = good_com_values[-(max_degree + 5):]
+
+        if len(fit_indices) >= 2:
+            degree = min(max_degree, len(fit_indices) - 1)
+            coeffs = np.polyfit(fit_indices, fit_values, degree)
+            poly_func = np.poly1d(coeffs)
+            final_coms[bottom_extrap_indices] = poly_func(bottom_extrap_indices)
+
+    # 6. Calculate the final correction shift
+    horizontal_correction = image_center - final_coms
+    return np.round(horizontal_correction).astype(int)
+
+def apply_centroid_correction(xtcavImages, off_idx):
+    """
+    Applies centroid correction to a set of XTCAV images based on a constructed centroid function.
+    Args:
+        xtcavImages (np.ndarray): 3D array of shape (H, W, N) containing XTCAV images.
+        off_idx (list or np.ndarray): Indices of images to use for constructing the centroid function.
+    Returns:
+        tuple: Corrected xtcavImages, horizontal projections (horz_proj), and flattened LPSImage, along with the centroid corrections applied.
+    """
+
+    # Get the number of shots (N)
+    N_shots = xtcavImages.shape[2]
+    Nrows = xtcavImages.shape[0]
+    centroid_corrections = construct_centroid_function(xtcavImages, off_idx)
+
+    # Prepare lists to collect results
+    horz_proj_list_new = []
+    xtcavImages_list_new = []
+    LPSImage_new = []
+    # Iterate over all shots in the concatenated array
+    for idx in range(N_shots):
+        # Get the processed image for the current shot
+        processed_image = xtcavImages[:, :, idx]
+
+        # --- Apply centroid correction ---
+        corrected_image = np.zeros_like(processed_image)
+        for row in range(Nrows):
+            # The centroid correction function should provide the 'shift' for each row
+            shift = centroid_corrections[row]
+            corrected_image[row, :] = np.roll(processed_image[row, :], shift)
+
+        # --- Calculate current profiles ---
+        # Sum along the horizontal (time) axis (axis=0) to get the vertical (energy) profile
+        horz_proj_idx = np.sum(corrected_image, axis=0)
+        horz_proj_idx = horz_proj_idx[:, np.newaxis] # Reshape to (W, 1)
+        
+        # Reshape corrected_image for concatenation
+        corrected_image = corrected_image[:, :, np.newaxis] # Reshape to (H, W, 1)
+
+        # --- Prepare LPS Image (flattened) ---
+        image_ravel = corrected_image.ravel()
+
+        # --- Combine results into lists ---
+        horz_proj_list_new.append(horz_proj_idx)
+        xtcavImages_list_new.append(corrected_image)
+        LPSImage_new.append([image_ravel])
+    print(N_shots)
+    # --- Concatenate all shots ---
+    # Recreate the final arrays
+    xtcavImages = np.concatenate(xtcavImages_list_new, axis=2)
+    horz_proj = np.concatenate(horz_proj_list_new, axis=1)
+    LPSImage = np.concatenate(LPSImage_new, axis=0)
+    return xtcavImages, horz_proj, LPSImage, centroid_corrections
