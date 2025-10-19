@@ -7,6 +7,7 @@ from scipy.io.matlab.mio5_params import mat_struct
 from scipy.ndimage import median_filter, gaussian_filter
 import re
 import h5py
+from tqdm import tqdm # Import tqdm
 
 def matstruct_to_dict(obj):
     """
@@ -25,12 +26,32 @@ def matstruct_to_dict(obj):
     else:
         return obj
 
+def commonIndexFromSteps(data_struct, steps_to_process=None):
+    """
+    Get common indices for DTOTR2 images based on specified steps to process.
+    Args:
+        data_struct: Data structure containing image and scalar information.
+        steps_to_process: List of steps to filter common indices. If None, all steps are used.
 
-def extractDAQBSAScalars(data_struct):
+        data_struct.scalars.steps is indexed by common index.
+
+    """
+    DTOTR2commonind_all = data_struct.images.DTOTR2.common_index - 1
+    if steps_to_process is not None:
+        DTOTR2commonind = [i for i in DTOTR2commonind_all if data_struct.scalars.steps[i] in steps_to_process]
+    else:
+        DTOTR2commonind = DTOTR2commonind_all
+    return DTOTR2commonind
+
+
+def extractDAQBSAScalars(data_struct, common_index=None):
     data_struct = matstruct_to_dict(data_struct)
     dataScalars = data_struct['scalars']
-    idx = dataScalars['common_index'].astype(int).flatten()
-
+    if common_index is not None:
+        idx = common_index
+    else:
+        idx = dataScalars['common_index'].astype(int).flatten()
+        
     fNames = list(dataScalars.keys())
     isBSA = [name for name in fNames if name.startswith('BSA_List_')]
 
@@ -207,7 +228,9 @@ def plot2DbunchseparationVsCollimatorAndBLEN(bc14BLEN, step_vals, bunchSeparatio
     plt.title(title)
     plt.colorbar(im, label='Bunch Separation [μm]')
 
-def extract_processed_images(data_struct, experiment, xrange=100, yrange=100, hotPixThreshold=1e3, sigma=1, threshold=5):
+def extract_processed_images(data_struct, experiment, xrange=100, yrange=100, hotPixThreshold=1e3, sigma=1, threshold=5, step_list=None,
+                             roi_xrange=None, roi_yrange=None
+                             ):
     """
     Processes DTOTR2 images from HDF5 files, applying module-defined cropping, 
     filtering, and calculating horizontal projections (current profiles).
@@ -225,6 +248,9 @@ def extract_processed_images(data_struct, experiment, xrange=100, yrange=100, ho
         hotPixThreshold (float): Threshold for hot pixel masking.
         sigma (float): Sigma for Gaussian smoothing.
         threshold (float): Threshold below which pixel values are set to zero.
+        step_list (list): List of steps to process. If None, process all steps.
+        roi_xrange (tuple): Optional custom cropping range in x-direction (min, max), applied before peak finding. Both roi_xrange and roi_yrange must be provided to apply.
+        roi_yrange (tuple): Optional custom cropping range in y-direction (min, max), applied before peak finding. Both roi_xrange and roi_yrange must be provided to apply.
 
     Returns:
         tuple: A tuple containing the processed image arrays:
@@ -237,9 +263,10 @@ def extract_processed_images(data_struct, experiment, xrange=100, yrange=100, ho
     stepsAll = data_struct.params.stepsAll
     if stepsAll is None or len(np.atleast_1d(stepsAll)) == 0:
         stepsAll = [1]
-    for a in range(len(stepsAll)):
+    steps_to_process = stepsAll if step_list is None else [s for s in stepsAll if s in step_list]
+    for a in range(len(steps_to_process)):
         # --- Determine File Path ---
-        if len(stepsAll) == 1:
+        if len(steps_to_process) == 1:
             raw_path = data_struct.images.DTOTR2.loc
         else:
             raw_path = data_struct.images.DTOTR2.loc[a]
@@ -261,7 +288,7 @@ def extract_processed_images(data_struct, experiment, xrange=100, yrange=100, ho
         xtcavImages_step = DTOTR2data_step - data_struct.backgrounds.DTOTR2[:,:,np.newaxis].astype(np.float64)
         
         # --- Process Individual Shots ---
-        for idx in range(DTOTR2data_step.shape[2]):
+        for idx in tqdm(range(DTOTR2data_step.shape[2]), desc="Processing Shots Step {}, {} samples".format(steps_to_process[a], DTOTR2data_step.shape[2])):
             if idx is None:
                 continue
                 
@@ -269,6 +296,13 @@ def extract_processed_images(data_struct, experiment, xrange=100, yrange=100, ho
             
             # Store Raw (background-subtracted) Image
             xtcavImages_list_raw.append(image[:,:,np.newaxis])
+
+            # Apply ROI cropping if specified
+
+            if roi_xrange is not None and roi_yrange is not None:
+                x_min, x_max = roi_xrange
+                y_min, y_max = roi_yrange
+                image = image[y_min:y_max, x_min:x_max]
             
             # Crop image
             image_cropped, _ = cropProfmonImg(image, xrange, yrange, plot_flag=False)
@@ -296,20 +330,28 @@ def extract_processed_images(data_struct, experiment, xrange=100, yrange=100, ho
 
     # --- Concatenate Results ---
     xtcavImages = np.concatenate(xtcavImages_list, axis=2)
+    del xtcavImages_list  # Free memory
     xtcavImages_raw = np.concatenate(xtcavImages_list_raw, axis=2)
+    del xtcavImages_list_raw  # Free memory
     horz_proj = np.concatenate(horz_proj_list, axis=1)
     LPSImage = np.concatenate(LPSImage, axis = 0)
 
-    # --- Apply Common Indexing ---
-    # Convert from 1-based (assumed for common_index) to 0-based indexing
-    DTOTR2commonind = data_struct.images.DTOTR2.common_index - 1 
-    
-    horz_proj = horz_proj[:, DTOTR2commonind]
-    xtcavImages = xtcavImages[:, :, DTOTR2commonind]
-    xtcavImages_raw = xtcavImages_raw[:, :, DTOTR2commonind]
+    print("Processed XTCAV Images shape:", xtcavImages.shape)
 
+    # --- Apply Common Indexing ---
+    print("StepsToProcess:"+str(steps_to_process))
+    DTOTR2commonind = commonIndexFromSteps(data_struct, steps_to_process)
+    print("Number of shots after applying common index and step range:", len(DTOTR2commonind))
+    # Example: If DTOTR2commonind = [0,1,4,6],  new index is [0,1,0,0,2,0,3,...]
+    new_index_list = np.full(np.max(DTOTR2commonind) + 1, -1, dtype=int)
+    new_index_list[DTOTR2commonind] = np.arange(len(DTOTR2commonind))
+    new_index_list[new_index_list == -1] = 0
+    horz_proj = horz_proj[:, new_index_list]
+    xtcavImages = xtcavImages[:, :, new_index_list]
+    xtcavImages_raw = xtcavImages_raw[:, :, new_index_list]
     # Final Arrays
-    LPSImage = LPSImage[DTOTR2commonind,:] 
+    LPSImage = LPSImage[new_index_list,:] 
+    # This way, xtcavImages[some_common_index] corresponds to the shot with that common index.
 
     return xtcavImages, xtcavImages_raw, horz_proj, LPSImage
 
