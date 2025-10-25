@@ -8,6 +8,23 @@ from scipy.ndimage import median_filter, gaussian_filter
 import re
 import h5py
 from tqdm import tqdm # Import tqdm
+import torch.nn as nn
+
+# Define MLP structure
+class MLP(nn.Module):
+    def __init__(self, in_dim, out_dim):
+        super().__init__()
+        self.model = nn.Sequential(
+            nn.Linear(in_dim, 1000),
+            nn.ReLU(),
+            nn.Linear(1000,500),
+            nn.ReLU(),
+            nn.Linear(500, 500),
+            nn.ReLU(),
+            nn.Linear(500, out_dim)
+        )
+    def forward(self, x):
+        return self.model(x)
 
 def matstruct_to_dict(obj):
     """
@@ -37,6 +54,16 @@ def commonIndexFromSteps(data_struct, steps_to_process=None):
 
     """
     DTOTR2commonind_all = data_struct.images.DTOTR2.common_index - 1
+    # If there are any same values in DTOTR2commonind_all, raise error
+    print("Min and Max of DTOTR2 common indices:", np.min(DTOTR2commonind_all), np.max(DTOTR2commonind_all))
+    if len(DTOTR2commonind_all) != len(set(DTOTR2commonind_all)):
+        raise ValueError("DTOTR2 common indices contain duplicates.")
+    print("Total number of DTOTR2 common indices:", len(DTOTR2commonind_all))
+    step_comp = data_struct.scalars.steps[DTOTR2commonind_all]
+    # print the number of 0, 1, 2, ... steps in step_comp
+    unique, counts = np.unique(step_comp, return_counts=True)
+    step_count_dict = dict(zip(unique, counts))
+    print("Step counts in DTOTR2 common indices:", step_count_dict)
     if steps_to_process is not None:
         DTOTR2commonind = [i for i in DTOTR2commonind_all if data_struct.scalars.steps[i] in steps_to_process]
     else:
@@ -44,11 +71,18 @@ def commonIndexFromSteps(data_struct, steps_to_process=None):
     return DTOTR2commonind
 
 
-def extractDAQBSAScalars(data_struct, common_index=None):
+def extractDAQBSAScalars(data_struct, step_list=None, filter_index= True):
+    """
+    Extracts BSA scalar data from the provided data structure, filtered with scalar common index, and also with step list if provided.
+    Args:
+        data_struct: Data structure containing scalar information.
+        common_index: Optional list of indices to filter the scalar data.
+    """
     data_struct = matstruct_to_dict(data_struct)
     dataScalars = data_struct['scalars']
-    if common_index is not None:
-        idx = common_index
+    if step_list is not None:
+        idx = [i for i in dataScalars['common_index'].astype(int).flatten()
+               if dataScalars['steps'][i] in step_list ]
     else:
         idx = dataScalars['common_index'].astype(int).flatten()
         
@@ -67,7 +101,8 @@ def extractDAQBSAScalars(data_struct, common_index=None):
             varData = np.array(bsaList[varName]).squeeze()
             if varData.size == 0:
                 continue
-            varData = varData[idx]  # apply common index
+            if filter_index:
+                varData = varData[idx]  # apply common index
             varData = np.nan_to_num(varData)  # replace NaN with 0
             bsaListData.append(varData)
 
@@ -78,6 +113,54 @@ def extractDAQBSAScalars(data_struct, common_index=None):
 
     bsaScalarData = np.array(bsaScalarData)
     return bsaScalarData, bsaVarPVs
+
+def apply_tcav_zeroing_filter(bsaScalarData, bsaVarPVs):
+    """
+    Modifies the bsaScalarData array in-place by zeroing out the 
+    TCAV_LI20_2400_P (phase) data points for any index where TCAV_LI20_2400_A (amplitude) is less than 1.
+
+    This enhances Principal Component Analysis if your dataset includes all of TCAV phase -90, 0, and 90 degrees images.
+    
+    The function assumes:
+    1. bsaScalarData has shape (N_variables, N_samples).
+    2. The variable order in bsaScalarData corresponds to bsaVarPVs.
+    3. Both TCAV_LI20_2400_P and TCAV_LI20_2400_A are present in bsaVarPVs.
+
+    Args:
+        bsaScalarData (np.ndarray): The 2D array of BSA scalar data (N_vars x N_samples).
+        bsaVarPVs (list): List of PV names corresponding to the rows of bsaScalarData.
+        
+    Returns:
+        np.ndarray: The modified bsaScalarData array.
+    """
+    
+    pv_p_name = 'TCAV_LI20_2400_P'
+    pv_a_name = 'TCAV_LI20_2400_A'
+    
+    # --- 1. Locate the indices of the required PVs ---
+    try:
+        # Find the row index corresponding to the Phase (P) and Amplitude (A) PVs
+        idx_p = bsaVarPVs.index(pv_p_name)
+        idx_a = bsaVarPVs.index(pv_a_name)
+    except ValueError as e:
+        print(f"Error: Required PV not found in bsaVarPVs. Missing: {e}")
+        # Return unmodified data if the required PVs are not available
+        return bsaScalarData
+
+    # --- 2. Extract the Amplitude data ---
+    # Since bsaScalarData is (N_vars, N_samples), we take the row corresponding to idx_a
+    tcav_a_data = bsaScalarData[idx_a, :]
+
+    # --- 3. Create the Boolean Mask ---
+    # Identify all column indices (samples) where the Amplitude is less than 1.0
+    zeroing_mask = tcav_a_data < 1.0
+
+    # --- 4. Apply the Zeroing Filter ---
+    # Use the mask to set the corresponding samples in the Phase (P) row to zero
+    print(f"Applying filter: Setting {np.sum(zeroing_mask)} samples of {pv_p_name} to 0 where {pv_a_name} < 1.0")
+    bsaScalarData[idx_p, zeroing_mask] = 0.0
+
+    return bsaScalarData
 
 
 def cropProfmonImg(img, xrange, yrange, plot_flag=False):
@@ -340,17 +423,12 @@ def extract_processed_images(data_struct, experiment, xrange=100, yrange=100, ho
 
     # --- Apply Common Indexing ---
     print("StepsToProcess:"+str(steps_to_process))
-    DTOTR2commonind = commonIndexFromSteps(data_struct, steps_to_process)
-    print("Number of shots after applying common index and step range:", len(DTOTR2commonind))
-    # Example: If DTOTR2commonind = [0,1,4,6],  new index is [0,1,0,0,2,0,3,...]
-    new_index_list = np.full(np.max(DTOTR2commonind) + 1, -1, dtype=int)
-    new_index_list[DTOTR2commonind] = np.arange(len(DTOTR2commonind))
-    new_index_list[new_index_list == -1] = 0
-    horz_proj = horz_proj[:, new_index_list]
-    xtcavImages = xtcavImages[:, :, new_index_list]
-    xtcavImages_raw = xtcavImages_raw[:, :, new_index_list]
+    image_common_index = [data_struct.images.DTOTR2.common_index[i] - 1 for i in range(len(data_struct.images.DTOTR2.common_index)) if data_struct.scalars.steps[data_struct.scalars.common_index[i]] in steps_to_process]
+    horz_proj = horz_proj[:, image_common_index]
+    xtcavImages = xtcavImages[:, :, image_common_index]
+    xtcavImages_raw = xtcavImages_raw[:, :, image_common_index]
     # Final Arrays
-    LPSImage = LPSImage[new_index_list,:] 
+    LPSImage = LPSImage[image_common_index,:] 
     # This way, xtcavImages[some_common_index] corresponds to the shot with that common index.
 
     return xtcavImages, xtcavImages_raw, horz_proj, LPSImage
