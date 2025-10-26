@@ -29,6 +29,7 @@ class MLP(nn.Module):
 import numpy as np
 import torch
 from scipy.optimize import curve_fit
+from scipy.signal import find_peaks
 from scipy.ndimage import find_objects
 from typing import Tuple, Dict
 
@@ -113,13 +114,6 @@ def image_to_bigaussian_params(target_image: np.ndarray) -> Dict:
 
     vertical_projection = target_density.max(axis=1) # Max across X-axis (200,)
 
-    p0 = [
-        80, 5, 4,
-        110, 5, 2]
-    # p0 = [
-    #     80, 10, 0.1,
-    #     110, 5, 0.01]
-    # y, sigma, amplitude for each Gaussian
     # TODO: Improve initial guess based on peak finding
     # Plot the whole image for debugging
     plt.figure()
@@ -130,27 +124,18 @@ def image_to_bigaussian_params(target_image: np.ndarray) -> Dict:
     plt.ylabel('Y Coordinate')
     plt.show()
     try:
-        # Fit 1D Bi-Gaussian to the vertical projection
-        # Set bounds so that first mu is less than 100, second mu greater than 100
-        bounds = (
-            [0, 0, 0.1, 100, 0, 0.1],  # Lower bounds
-            [100, 50, 10, 200, 50, 5]  # Upper bounds
-        )
-        popt_y, _ = curve_fit(bigaussian_1d, y_coords, vertical_projection, p0=p0, maxfev=5000, bounds=bounds)
+        peaks, properties = find_peaks(vertical_projection, distance=15, height=np.max(vertical_projection)*0.1, width = 5)
 
         # Extract fitted parameters
-        mu_y = np.array([popt_y[0], popt_y[3]])
-        pi_y_raw = np.array([popt_y[2], popt_y[5]])
-        sigma_y = np.array([np.abs(popt_y[1]), np.abs(popt_y[4])]) # Ensure positive stddev
-        
-        # Normalize pi to sum to 1
-        pi = pi_y_raw / pi_y_raw.sum()
+        mu_y = np.array([y_coords[peaks[0]], y_coords[peaks[1]]])
+        pi_y_raw = np.array([properties['peak_heights'][0], properties['peak_heights'][1]])
+        sigma_y = np.array([properties['widths'][0]/2, properties['widths'][1]/2]) # Ensure positive stddev
 
         
         print("Shape of vertical_projection:", vertical_projection.shape)
         plt.figure()
         plt.plot(y_coords, vertical_projection, label='Vertical Projection', color='blue')
-        plt.plot(y_coords, bigaussian_1d(y_coords, *popt_y), label='Fitted Bi-Gaussian', color='red')
+        plt.plot(y_coords, bigaussian_1d(y_coords, mu_y[0], sigma_y[0], pi_y_raw[0], mu_y[1], sigma_y[1], pi_y_raw[1]), label='Fitted Bi-Gaussian', color='red')
         plt.legend()
         plt.title('Vertical Projection and Fitted Bi-Gaussian')
         plt.xlabel('Y Coordinate')
@@ -238,6 +223,9 @@ def image_to_bigaussian_params(target_image: np.ndarray) -> Dict:
 
     # 2. Hard Assignment
     assigned_component = np.argmin(distances, axis=1) # (N,) indices 0 or 1
+    # If distances are greater than a threshold, we could assign to no component, which is -1.
+    dist_threshold = 4 # This threshold can be tuned based on expected spread
+    assigned_component[distances.min(axis=1) > dist_threshold] = -1
 
     # Plot the assignment for debugging
     plt.figure()
@@ -302,7 +290,7 @@ def image_to_bigaussian_params(target_image: np.ndarray) -> Dict:
     plt.show()
 
     return {
-        'pi': torch.tensor(pi, dtype=torch.float32), 
+        'pi': torch.tensor(pi_y_raw, dtype=torch.float32), 
         'mu': torch.tensor(np.stack(means), dtype=torch.float32), 
         'Sigma': torch.tensor(np.stack(sigmas), dtype=torch.float32)
     }
