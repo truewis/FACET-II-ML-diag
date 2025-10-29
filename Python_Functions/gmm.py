@@ -5,9 +5,11 @@ from scipy.optimize import curve_fit
 from scipy.signal import find_peaks
 import matplotlib.pyplot as plt
 
-def biGaussian_image_from_flattened_params(params):
+LOG_CONVERSION_FACTOR=1e3
+
+def biGaussian_image_from_flattened_params(params, total_charge = None):
     """
-    Generate a 2D image from flattened bi-Gaussian parameters.
+    Generate a 2D image from flattened bi-Gaussian parameters. Also applies inverse operation of whatever pre-processing applied in image_to_bigaussian_params.
     Args:
         params (np.ndarray): Flattened parameters array of shape (12,).
     Returns:
@@ -22,6 +24,10 @@ def biGaussian_image_from_flattened_params(params):
     Sigma = uf['Sigma'].numpy()
     generated_image = gaussian_2d_pdf(mu[0], Sigma[0]).reshape((2*yrange, 2*xrange)) * pi[0] + \
                       gaussian_2d_pdf(mu[1], Sigma[1]).reshape((2*yrange, 2*xrange)) * pi[1]
+    # WIP
+    if total_charge is not None:
+        generated_image = (np.exp(generated_image)-1)/LOG_CONVERSION_FACTOR
+        generated_image = generated_image / np.sum(generated_image) * total_charge
     return np.flip(generated_image.T, axis=0)
 
 def flatten_biGaussian_params(biGaussian_params):
@@ -99,7 +105,7 @@ def unflatten_biGaussian_params(flat_params, clip_sigma = False):
         Sigma[k,0,0] = flat_params[6 + k*3]
         Sigma[k,1,1] = flat_params[8 + k*3]
         if not clip_sigma:
-            clip_sigma = flat_params[7 + k*3]
+            Sigma[k,0,1] = flat_params[7 + k*3]
             Sigma[k,1,0] = flat_params[7 + k*3]  # Symmetric
         else:
             Sigma[k,0,0] = np.clip(Sigma[k,0,0], 10, 1e6)  # Prevent extreme values
@@ -164,7 +170,7 @@ def gaussian_2d_pdf(mu: np.ndarray, Sigma: np.ndarray,
 
 # ----------------- Main Conversion Function -----------------
 
-def image_to_bigaussian_params(target_image: np.ndarray, debug = True) -> Dict:
+def image_to_bigaussian_params(target_image: np.ndarray, do_current_profile = False, debug = True) -> Dict:
     # Constants for a 200x200 image normalized to a range of [-1, 1]
     IMG_SIZE = target_image.shape[0]  # Assuming square image
     K = 2 # Fixed number of components
@@ -187,7 +193,8 @@ def image_to_bigaussian_params(target_image: np.ndarray, debug = True) -> Dict:
         target_density /= total_mass
 
     # Convert target density logarithmically
-    target_density = np.log1p(target_density * 1e3)  # log(1 + density * scale)
+    # Applying MSE to log is equivalent to performing negative log loss function, which is useful for predicting images with peaks whose amplitudes differ by orders of magnitudes.
+    target_density = np.log1p(target_density * LOG_CONVERSION_FACTOR)  # log(1 + density * scale)
 
     y_coords = np.arange(IMG_SIZE)
     x_coords = np.arange(IMG_SIZE)
@@ -275,6 +282,45 @@ def image_to_bigaussian_params(target_image: np.ndarray, debug = True) -> Dict:
 
         means.append(np.array([mu_x_k, y_k]))
         sigma_x.append(sigma_x_k)
+    #In current profile mode, we are more interested in the fit of the zeta projection, rather than the 2D image itself.
+    if do_current_profile:
+        if K is not 2:
+            raise ValueError("In Current Profile Mode, K has to be 2.")
+        else:
+            try:
+
+                # Fit 1D Gaussian to the horizontal slice to find x_k
+                current_profile = np.log1p(np.sum(target_image, axis=0) / np.sum(target_image) * LOG_CONVERSION_FACTOR)
+                
+                p0_x = [means[0][0], sigma_x[0], current_profile[int(means[0][0])], means[1][0], sigma_x[1], current_profile[int(means[1][0])]]
+                if debug:
+                    print (f"Fitting Current Profile with initial guess {p0_x}")
+                popt_x, _ = curve_fit(bigaussian_1d, x_coords, current_profile, p0=p0_x, maxfev=5000)
+                mu_x_k = popt_x[0]
+                sigma_x_k = np.abs(popt_x[1])  # Not used further but could be stored if needed
+
+                # Check if two peaks are sufficiently separated
+                if np.abs(popt_x[0] - popt_x[3]) < 10:
+                    raise RuntimeError("Fitted peaks in current profile are too close to each other.")
+                # Overwrite the previously estimated means and sigma_x with the re-fitted values from the current profile
+                means[0][0] = popt_x[0]
+                means[1][0] = popt_x[3]
+                sigma_x[0] = np.abs(popt_x[1])
+                sigma_x[1] = np.abs(popt_x[4])
+                if debug:
+                    print("Fitted Current Profile Means (Mu):", [popt_x[0], popt_x[3]])
+                    plt.figure()
+                    plt.plot(x_coords, current_profile, label='Current Profile', color='blue')
+                    plt.plot(x_coords, bigaussian_1d(x_coords, *popt_x), label='Re-Fitted Bi-Gaussian', color='red')
+                    plt.legend()
+                    plt.title('Current Profile and Re-Fitted Bi-Gaussian')
+                    plt.xlabel('X Coordinate')
+                    plt.ylabel('Density')
+                    plt.show()
+            except RuntimeError:
+                # If fitting fails, retain the original estimates from the horizontal slices
+                print(f"Current profile fitting failed for component {k+1}.")
+
     if debug:
         print("Fitted Means (Mu):", means)
     # --- Step 4: Full 2D Parameter Estimation (Fixed Means & Weights) ---
