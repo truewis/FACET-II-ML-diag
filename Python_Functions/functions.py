@@ -9,7 +9,10 @@ import re
 import h5py
 from tqdm import tqdm # Import tqdm
 import torch.nn as nn
-
+import torch
+from scipy.signal import find_peaks
+import h5py
+import re
 # Define MLP structure
 class MLP(nn.Module):
     def __init__(self, in_dim, out_dim):
@@ -26,12 +29,462 @@ class MLP(nn.Module):
     def forward(self, x):
         return self.model(x)
 
-import numpy as np
-import torch
-from scipy.optimize import curve_fit
-from scipy.signal import find_peaks
-from scipy.ndimage import find_objects
-from typing import Tuple, Dict
+def analyze_eos_and_cher(data_struct, experiment='', runname='', 
+                         EOS2ymin=200, EOS2ymax=None,
+                         CHERymin=1000, CHERymax=None,
+                         xmin=700, SYAGxmax=964,
+                         tenGeVCHERpixel=380,
+                         mindels=40e-6, maxdels=85e-6,
+                         skipEOSanalysis=True,
+                         goosing=False,
+                         EOS_cal=17.94e-15):
+    """
+    Port of the Claudio Emma's MATLAB EOS/CHER analysis.
+    args:
+        data_struct: data structure containing images, backgrounds, params, scalars
+        experiment: string, experiment name for path construction
+        runname: string, run name for plot titles
+        EOS2ymin, EOS2ymax: vertical ROI for EOS2 analysis
+        CHERymin, CHERymax: vertical ROI for CHER analysis
+        SYAGxmin, SYAGxmax: horizontal ROI for SYAG analysis
+        tenGeVCHERpixel: pixel position corresponding to 10 GeV in CHER image
+        mindels, maxdels: min and max acceptable EOS separations (meters)
+        skipEOSanalysis: if True, skip EOS separation calculation (still compute projections)
+        goosing: if True, process every other shot for EOS analysis
+        EOS_cal: EOS calibration in seconds/pixel
+
+    Returns a dict with keys:
+      - dels: array of EOS separations (meters) (or zeros if skipped)
+      - bc14BLEN: array of BC14 BLEN values (shape: (nshots,))
+      - EOS2horzProj: 2D array (rows x shots) of vertical projections used for waterfall
+      - fig: matplotlib Figure (waterfall + separation/BLEN plot) or None if plotting suppressed
+      - sorted_idx: indices starting from 0 
+
+    Notes:
+      - The function expects data_struct to contain images.EOS2.loc (list or single path),
+        backgrounds.EOS2, and params.stepsAll. It will attempt to read HDF5 with h5py.
+      - Common index handling assumes MATLAB-style 1-based common_index values and converts to 0-based.
+    """
+    import matplotlib.pyplot as plt
+
+    c = 3e8
+
+    # defaults for ROI extents if not provided
+    if EOS2ymax is None:
+        EOS2ymax = EOS2ymin + 100
+    if CHERymax is None:
+        CHERymax = CHERymin + 1000
+
+    # --- Collect BC14 BLEN from BSA scalars ---
+    bsaScalarData, bsaVars = extractDAQBSAScalars(data_struct)
+    try:
+        pvidx = bsaVars.index('BLEN_LI14_888_BRAW')
+    except ValueError:
+        raise ValueError("BLEN_LI14_888_BRAW not found among BSA PVs.")
+    # bsaScalarData shape is (N_vars, N_samples)
+    bc14BLEN = bsaScalarData[pvidx, :].copy()
+
+    # --- Load/concatenate EOS2 HDF5 data across steps ---
+    stepsAll = data_struct.params.stepsAll
+    if stepsAll is None or len(np.atleast_1d(stepsAll)) == 0:
+        stepsAll = [1]
+
+    EOSdata = None
+    # Handle loc being list-like or single
+    locs = data_struct.images.EOS2.loc
+    # ensure iterable
+    if not isinstance(locs, (list, tuple, np.ndarray)):
+        locs = [locs]
+
+    for a in range(len(stepsAll)):
+        # pick appropriate location entry
+        try:
+            loc_entry = locs[a]
+        except Exception:
+            loc_entry = locs[0]
+        raw_path = loc_entry
+        # Search for the expected file name pattern
+        match = re.search(rf'({experiment}_\d+/images/EOS2/EOS2_data_step\d+\.h5)', raw_path)
+        if not match:
+            raise ValueError(f"Path format invalid or not matched: {raw_path}")
+
+        loc_entry = '../../data/raw/' + experiment + '/' + match.group(0)
+        # try to open directly, otherwise attempt fallback construction similar to other functions
+        print(f"Loading EOS2 data from {loc_entry} ...")
+        try:
+            with h5py.File(loc_entry, 'r') as f:
+                stepdata = f['entry']['data']['data'][:].astype(np.float64)
+                print(f"Loaded stepdata from {loc_entry}")
+                print(f"stepdata shape: {stepdata.shape}")
+        except Exception:
+            # fallback: attempt to extract a trailing path fragment containing experiment and build relative path
+            m = re.search(rf'({experiment}_\d+/images/EOS2/EOS2_data_step\d+\.h5)', str(loc_entry))
+            if m:
+                candidate = '../../data/raw/' + experiment + '/' + m.group(0)
+                with h5py.File(candidate, 'r') as f:
+                    stepdata = f['entry']['data']['data'][:].astype(np.float64)
+            else:
+                raise
+
+        # concatenate along 3rd axis (MATLAB's 3rd dim is shots)
+        if EOSdata is None:
+            EOSdata = stepdata.copy()
+        else:
+            # stepdata shape (H, W, Nstep); append along third axis
+            EOSdata = np.concatenate([EOSdata, stepdata], axis=2)
+
+    if EOSdata is None:
+        raise RuntimeError("No EOS data loaded.")
+
+    # --- Keep only shots with common index and subtract background ---
+    # common_index in data_struct likely 1-based
+    eos_common = data_struct.images.EOS2.common_index
+    eos_common_idx = [int(i) - 1 for i in eos_common]
+    EOSdata = EOSdata.transpose(2, 1, 0)[:, :, eos_common_idx]  # to (H, W, Shots)
+
+    # subtract background if available (convert to float)
+    try:
+        bg = np.array(data_struct.backgrounds.EOS2).astype(np.float64)
+        # MATLAB code used double and a - -background pattern; here subtract background
+        EOSdata = EOSdata - bg[:, :]
+    except Exception:
+        # if background missing, proceed without subtraction
+        pass
+    print(f"EOSdata shape after loading and bg subtraction: {EOSdata.shape}")
+
+    nshots = EOSdata.shape[2]
+    # prepare projection matrix (rows x shots)
+    EOS2horzProj = np.zeros((EOSdata.shape[0], nshots), dtype=float)
+
+    dels = np.zeros(nshots, dtype=float)
+    print("Starting EOS2 analysis...")
+    if not skipEOSanalysis:
+        if goosing:
+            rng = range(1, nshots, 2)
+        else:
+            rng = range(nshots)
+        for a in rng:
+            shot = EOSdata[:, :, a]
+            # take vertical ROI
+            shot_roi = shot[EOS2ymin:EOS2ymax, :]
+
+            # vertical projection (sum across columns)
+            proj = np.sum(shot_roi, axis=1)
+            # Plot projection for debugging
+            #plt.imshow(shot_roi , cmap='viridis', aspect='auto')
+            #plt.show()
+            EOS2horzProj[EOS2ymin:EOS2ymax, a] = proj
+            # find peaks on the projection
+            peaks, props = find_peaks(proj, height=10000, prominence=5000)
+            if peaks.size < 2:
+                dels[a] = 0.0
+                continue
+
+            # Plot projection and peaks for debugging
+            #plt.plot(proj)
+            #plt.plot(peaks, proj[peaks], "x")
+            #plt.show()
+            peak_vals = props['peak_heights']
+            # indices of two largest peaks (descending)
+            top2 = np.argsort(peak_vals)[-2:]
+            # map to actual peak positions
+            pos = peaks[top2]
+            # pick heights in descending order
+            heights_sorted = peak_vals[top2][np.argsort(peak_vals[top2])[::-1]]
+            # compute separation in pixels
+            peak_sep_pix = abs(int(pos[0]) - int(pos[1]))
+            # Transpose horizontal projection by peak position.
+            EOS2horzProj[:, a] = np.roll(EOS2horzProj[:, a], -int(pos[1]))
+            # reliability check: if largest*0.08 > second then unreliable
+            if heights_sorted[0] * 0.08 > heights_sorted[1]:
+                dels[a] = 0.0
+            # another reliability check: if tallest peak < 10000 counts, likely no signal
+            if heights_sorted[0] < 10000:
+                dels[a] = 0.0
+            else:
+                dels[a] = peak_sep_pix * EOS_cal * c
+        print("Done with EOS2 analysis!")
+    else:
+        # still compute vertical projections for plotting but leave dels zeros
+        for a in range(nshots):
+            shot = EOSdata[:, :, a]
+            shot_roi = shot[EOS2ymin:EOS2ymax, :]
+            EOS2horzProj[:, a] = np.sum(shot_roi, axis=1)
+
+    # --- Prepare plotting arrays ---
+    #sorted_idx = np.arange(nshots)
+    sorted_idx = np.argsort(bc14BLEN)
+
+    # From sorted_idx, remove entries where dels <50 or >200 microns
+    valid_indices = np.where((dels[sorted_idx] >= mindels) & (dels[sorted_idx] <= maxdels))[0]
+    sorted_idx = sorted_idx[valid_indices]
+    sorted_bc14BLEN = bc14BLEN[sorted_idx]
+    eos2sep_for_plot = dels[sorted_idx] * 1e6  # microns
+    eos2sep_for_plot[eos2sep_for_plot == 0] = np.nan
+    # --- Plot waterfall and separation vs BLEN ---
+    fig, axs = plt.subplots(2, 1, figsize=(8, 8))
+    axs[0].imshow(EOS2horzProj[:, sorted_idx], cmap='jet', aspect='auto', origin='lower')
+    axs[0].set(ylim=(0, 100))
+    axs[0].set_title(f"EOS2 waterfall. DAQ {experiment} {runname}")
+
+    ax2 = axs[1]
+    ax2.plot(eos2sep_for_plot, '-k', label='EOS separation [um]')
+    ax2.set_ylabel('EOS bunch separation [um]')
+    ax2_right = ax2.twinx()
+    ax2_right.plot(sorted_bc14BLEN, '-r', label='bc14 blen')
+    ax2_right.set_ylabel('bc14 blen')
+    ax2.set_title(f"EOS2 calibration = {1e6 * c * EOS_cal:.3g} um/pix")
+    axs[1].legend(loc='upper left')
+    ax2_right.legend(loc='upper right')
+    plt.tight_layout()
+
+    return {
+        'dels': dels,
+        'bc14BLEN': bc14BLEN,
+        'EOS2horzProj': EOS2horzProj,
+        'fig': fig,
+        'sorted_idx': sorted_idx
+    }
+def analyze_SYAG(data_struct, experiment='', runname='', 
+                         SYAGxmin=200, SYAGxmax=None,
+                         CHERymin=1000, CHERymax=None,
+                         tenGeVCHERpixel=380,
+                         mindels=40e-6, maxdels=85e-6,
+                         skipEOSanalysis=True,
+                         goosing=False,
+                         EOS_cal=17.94e-15,
+                         debug=False
+                         ):
+    """
+    Port of the Claudio Emma's MATLAB EOS/CHER analysis.
+    args:
+        data_struct: data structure containing images, backgrounds, params, scalars
+        experiment: string, experiment name for path construction
+        runname: string, run name for plot titles
+        SYAGymin, SYAGymax: vertical ROI for SYAG analysis
+        CHERymin, CHERymax: vertical ROI for CHER analysis
+        SYAGxmin, SYAGxmax: horizontal ROI for SYAG analysis
+        tenGeVCHERpixel: pixel position corresponding to 10 GeV in CHER image
+        mindels, maxdels: min and max acceptable EOS separations (meters)
+        skipEOSanalysis: if True, skip EOS separation calculation (still compute projections)
+        goosing: if True, process every other shot for EOS analysis
+        EOS_cal: EOS calibration in seconds/pixel
+
+    Returns a dict with keys:
+      - dels: array of EOS separations (meters) (or zeros if skipped)
+      - bc14BLEN: array of BC14 BLEN values (shape: (nshots,))
+      - SYAGhorzProj: 2D array (rows x shots) of vertical projections used for waterfall
+      - fig: matplotlib Figure (waterfall + separation/BLEN plot) or None if plotting suppressed
+      - sorted_idx: indices starting from 0 
+
+    Notes:
+      - The function expects data_struct to contain images.SYAG.loc (list or single path),
+        backgrounds.SYAG, and params.stepsAll. It will attempt to read HDF5 with h5py.
+      - Common index handling assumes MATLAB-style 1-based common_index values and converts to 0-based.
+    """
+    import matplotlib.pyplot as plt
+
+    c = 3e8
+
+    # defaults for ROI extents if not provided
+    if SYAGxmax is None:
+        SYAGxmax = SYAGxmin + 100
+    if CHERymax is None:
+        CHERymax = CHERymin + 1000
+
+    # --- Collect BC14 BLEN from BSA scalars ---
+    bsaScalarData, bsaVars = extractDAQBSAScalars(data_struct)
+    try:
+        pvidx = bsaVars.index('BLEN_LI14_888_BRAW')
+    except ValueError:
+        raise ValueError("BLEN_LI14_888_BRAW not found among BSA PVs.")
+    # bsaScalarData shape is (N_vars, N_samples)
+    bc14BLEN = bsaScalarData[pvidx, :].copy()
+
+    # --- Load/concatenate SYAG HDF5 data across steps ---
+    stepsAll = data_struct.params.stepsAll
+    if stepsAll is None or len(np.atleast_1d(stepsAll)) == 0:
+        stepsAll = [1]
+
+    SYAGdata = None
+    # Handle loc being list-like or single
+    locs = data_struct.images.SYAG.loc
+    # ensure iterable
+    if not isinstance(locs, (list, tuple, np.ndarray)):
+        locs = [locs]
+
+    for a in range(len(stepsAll)):
+        # pick appropriate location entry
+        try:
+            loc_entry = locs[a]
+        except Exception:
+            loc_entry = locs[0]
+        raw_path = loc_entry
+        # Search for the expected file name pattern
+        match = re.search(rf'({experiment}_\d+/images/SYAG/SYAG_data_step\d+\.h5)', raw_path)
+        if not match:
+            raise ValueError(f"Path format invalid or not matched: {raw_path}")
+
+        loc_entry = '../../data/raw/' + experiment + '/' + match.group(0)
+        # try to open directly, otherwise attempt fallback construction similar to other functions
+        print(f"Loading SYAG data from {loc_entry} ...")
+        try:
+            with h5py.File(loc_entry, 'r') as f:
+                stepdata = f['entry']['data']['data'][:].astype(np.int32)
+                print(f"Loaded stepdata from {loc_entry}")
+                print(f"stepdata shape: {stepdata.shape}")
+
+        except Exception:
+            # fallback: attempt to extract a trailing path fragment containing experiment and build relative path
+            m = re.search(rf'({experiment}_\d+/images/SYAG/SYAG_data_step\d+\.h5)', str(loc_entry))
+            if m:
+                candidate = '../../data/raw/' + experiment + '/' + m.group(0)
+                with h5py.File(candidate, 'r') as f:
+                    stepdata = f['entry']['data']['data'][:].astype(np.int32)
+            else:
+                raise
+
+        # concatenate along 3rd axis (MATLAB's 3rd dim is shots)
+        if SYAGdata is None:
+            SYAGdata = stepdata.copy()
+        else:
+            # stepdata shape (H, W, Nstep); append along third axis
+            SYAGdata = np.concatenate([SYAGdata, stepdata], axis=2)
+
+    if SYAGdata is None:
+        raise RuntimeError("No EOS data loaded.")
+
+    # --- Keep only shots with common index and subtract background ---
+    # common_index in data_struct likely 1-based
+    syag_common = data_struct.images.SYAG.common_index
+    syag_common_idx = [int(i) - 1 for i in syag_common]
+    SYAGdata = SYAGdata.transpose(2, 1, 0)[:, :, syag_common_idx]  # to (H, W, Shots)
+
+    # subtract background if available (convert to float)
+    try:
+        bg = np.array(data_struct.backgrounds.SYAG).astype(np.float64)
+        # MATLAB code used double and a - -background pattern; here subtract background
+        SYAGdata = SYAGdata - bg[:, :]
+    except Exception:
+        # if background missing, proceed without subtraction
+        pass
+    print(f"EOSdata shape after loading and bg subtraction: {SYAGdata.shape}")
+
+    nshots = SYAGdata.shape[2]
+    # prepare projection matrix (rows x shots)
+    SYAGhorzProj = np.zeros((SYAGdata.shape[0], nshots), dtype=float)
+
+    dels = np.zeros(nshots, dtype=float)
+    print("Starting SYAG analysis...")
+    if not skipEOSanalysis:
+        if goosing:
+            rng = range(1, nshots, 2)
+        else:
+            rng = range(nshots)
+        for a in rng:
+            shot = SYAGdata[:, :, a]
+            # take vertical ROI
+            shot_roi = shot[:, SYAGxmin:SYAGxmax]
+
+            # horizontal projection (sum across rows)
+            proj = np.sum(shot_roi, axis=1)
+            # Apply smoothing to projection
+            proj = gaussian_filter(proj, sigma=5)
+            # Plot projection for debugging
+            if debug and a % 20 == 1:
+                # Maximum color is twice the median of the shot ROI
+                plt.imshow(shot_roi , cmap='viridis', aspect='auto', vmax=2*np.median(shot_roi))
+                plt.show()
+            SYAGhorzProj[:,a] = proj
+            # find peaks on the projection
+            # Here we measure FWHM of the dip between two peaks, rather than the positions of the peaks themselves.
+            # This is because the dip width is more stable against local intensity fluctuations ardound the peaks.
+            peaks, props = find_peaks(-proj, prominence=2000)
+            # exclude any peaks too close to edges, along with the associated properties
+            valid_peaks_mask = (peaks > 20) & (peaks < len(proj) - 20)
+            peaks = peaks[valid_peaks_mask]
+            for key in props:
+                props[key] = props[key][valid_peaks_mask]
+            # Plot projection and peaks for debugging
+            if debug and a % 20 == 1:
+                plt.plot(proj)
+                plt.plot(peaks, proj[peaks], "x")
+                plt.show()
+            if peaks.size is not 1:
+                dels[a] = 0.0
+                continue
+            print(f"Shot {a}: Found dip at pixel {peaks[0]} with prominence {props['prominences'][0]}") 
+            # peak_sep_pix is full width half max of the dip.
+            # The 'height' of the dip is given by the prominence of the peak in -proj
+            peak_vals = props['prominences']
+            height = peak_vals[0]
+            # find left and right bases for FWHM
+            left_bases = props['left_bases']
+            right_bases = props['right_bases']
+            left_idx = left_bases[0]
+            right_idx = right_bases[0]
+            # tread the slope from left to right to find FWHM positions
+            half_height = height / 2.0
+            def find_fwhm_binary_search(func, start_idx, end_idx, half_height, search_left):
+                while start_idx < end_idx:
+                    mid_idx = (start_idx + end_idx) // 2
+                    if not search_left:
+                        if func[mid_idx] < half_height:
+                            end_idx = mid_idx
+                        else:
+                            start_idx = mid_idx + 1
+                    else:
+                        if func[mid_idx] < half_height:
+                            start_idx = mid_idx + 1
+                        else:
+                            end_idx = mid_idx
+                return start_idx
+            fwhm_left = find_fwhm_binary_search(-proj+proj[left_idx], left_idx, peaks[0] , half_height, search_left=True)
+            fwhm_right = find_fwhm_binary_search(-proj+proj[right_idx], peaks[0], right_idx , half_height, search_left=False)
+            # Transpose horizontal projection by dip position.
+            SYAGhorzProj[:, a] = np.roll(SYAGhorzProj[:, a], -int(peaks[0]))
+            peak_sep_pix = fwhm_right - fwhm_left
+            dels[a] = peak_sep_pix * EOS_cal * c
+        print("Done with SYAG analysis!")
+    else:
+        # still compute vertical projections for plotting but leave dels zeros
+        for a in range(nshots):
+            shot = SYAGdata[:, :, a]
+            shot_roi = shot[:, SYAGxmin:SYAGxmax]
+            SYAGhorzProj[:, a] = np.sum(shot_roi, axis=1)
+
+    # --- Prepare plotting arrays ---
+    #sorted_idx = np.arange(nshots)
+    sorted_idx = np.argsort(bc14BLEN)
+    # Only take indices where dels is not zero or nan
+    valid_indices = np.where((dels[sorted_idx] >= mindels) & (dels[sorted_idx] <= maxdels))[0]
+    sorted_idx = sorted_idx[valid_indices]
+    sorted_bc14BLEN = bc14BLEN[sorted_idx]
+    SYAGsep_for_plot = dels[sorted_idx] * 1e6  # microns
+    SYAGsep_for_plot[SYAGsep_for_plot == 0] = np.nan
+    # --- Plot waterfall and separation vs BLEN ---
+    fig, axs = plt.subplots(2, 1, figsize=(8, 8))
+    axs[0].imshow(SYAGhorzProj[:, sorted_idx], cmap='jet', aspect='auto', origin='lower')
+    axs[0].set_title(f"SYAG waterfall. DAQ {experiment} {runname}")
+
+    ax2 = axs[1]
+    ax2.plot(SYAGsep_for_plot, '-k', label='SYAG separation [um]')
+    ax2.set_ylabel('SYAG separation [um]')
+    ax2_right = ax2.twinx()
+    ax2_right.plot(sorted_bc14BLEN, '-r', label='bc14 blen')
+    ax2_right.set_ylabel('bc14 blen')
+    ax2.set_title(f"SYAG calibration = {1e6 * c * EOS_cal:.3g} um/pix")
+    axs[1].legend(loc='upper left')
+    ax2_right.legend(loc='upper right')
+    plt.tight_layout()
+
+    return {
+        'dels': dels,
+        'bc14BLEN': bc14BLEN,
+        'SYAGhorzProj': SYAGhorzProj,
+        'fig': fig,
+        'sorted_idx': sorted_idx
+    }
 
 def matstruct_to_dict(obj):
     """
@@ -83,16 +536,16 @@ def extractDAQBSAScalars(data_struct, step_list=None, filter_index= True):
     Extracts BSA scalar data from the provided data structure, filtered with scalar common index, and also with step list if provided.
     Args:
         data_struct: Data structure containing scalar information.
-        common_index: Optional list of indices to filter the scalar data.
+        step_list: List of steps to filter the data. If None, all steps are used. Starts from 1.
     """
     data_struct = matstruct_to_dict(data_struct)
     dataScalars = data_struct['scalars']
     if step_list is not None:
-        idx = [i for i in dataScalars['common_index'].astype(int).flatten()
+        idx = [i for i in dataScalars['common_index'].astype(int).flatten() - 1
                if dataScalars['steps'][i] in step_list ]
     else:
-        idx = dataScalars['common_index'].astype(int).flatten()
-        
+        idx = dataScalars['common_index'].astype(int).flatten() - 1
+
     fNames = list(dataScalars.keys())
     isBSA = [name for name in fNames if name.startswith('BSA_List_')]
 
@@ -120,7 +573,32 @@ def extractDAQBSAScalars(data_struct, step_list=None, filter_index= True):
 
     bsaScalarData = np.array(bsaScalarData)
     return bsaScalarData, bsaVarPVs
+def exclude_bsa_vars(bsaVars):
+    """
+    Identify indices of BSA variables to exclude based on predefined names and numeric patterns.
+    This removes dependence on variables that are affected by the XTCAV settings.
+    Args:
+        bsaVars: List of BSA variable names.
+    Returns:
+        excluded_var_idx: List of indices of variables to exclude."""
+        # List of BSA variable names to exclude
+    exclude_bsa_vars = [
+        'TCAV_LI20_2400_A',  # XTCAV Amplitude
+        'TCAV_LI20_2400_P',  # XTCAV Phase
+        
+    ]
+    # Search for variable names that contain four digit number larger than 3100, this is after the XTCAV.
+    for var in bsaVars:
+        match = re.search(r'(\d{4})', var)
+        if match:
+            number = int(match.group(1))
+            if number >= 3100:
+                exclude_bsa_vars.append(var)
 
+    print("Excluding BSA Variables:", exclude_bsa_vars)
+    excluded_var_idx = [i for i, var in enumerate(bsaVars) if var in exclude_bsa_vars]
+    print("Excluded variable indices:", excluded_var_idx)
+    return excluded_var_idx
 def apply_tcav_zeroing_filter(bsaScalarData, bsaVarPVs):
     """
     Modifies the bsaScalarData array in-place by zeroing out the 
@@ -319,7 +797,7 @@ def plot2DbunchseparationVsCollimatorAndBLEN(bc14BLEN, step_vals, bunchSeparatio
     plt.colorbar(im, label='Bunch Separation [μm]')
 
 def extract_processed_images(data_struct, experiment, xrange=100, yrange=100, hotPixThreshold=1e3, sigma=1, threshold=5, step_list=None,
-                             roi_xrange=None, roi_yrange=None
+                             roi_xrange=None, roi_yrange=None, do_load_raw = False
                              ):
     """
     Processes DTOTR2 images from HDF5 files, applying module-defined cropping, 
@@ -338,9 +816,10 @@ def extract_processed_images(data_struct, experiment, xrange=100, yrange=100, ho
         hotPixThreshold (float): Threshold for hot pixel masking.
         sigma (float): Sigma for Gaussian smoothing.
         threshold (float): Threshold below which pixel values are set to zero.
-        step_list (list): List of steps to process. If None, process all steps.
+        step_list (list): List of steps to process. If None, process all steps. Steps start from 1.
         roi_xrange (tuple): Optional custom cropping range in x-direction (min, max), applied before peak finding. Both roi_xrange and roi_yrange must be provided to apply.
         roi_yrange (tuple): Optional custom cropping range in y-direction (min, max), applied before peak finding. Both roi_xrange and roi_yrange must be provided to apply.
+        do_load_raw (bool): Load raw image for debugging. Uses a lot of memory.
 
     Returns:
         tuple: A tuple containing the processed image arrays:
@@ -348,97 +827,102 @@ def extract_processed_images(data_struct, experiment, xrange=100, yrange=100, ho
     """
     xtcavImages_list = []
     xtcavImages_list_raw = []
-    horz_proj_list = []
     LPSImage = []
     stepsAll = data_struct.params.stepsAll
+    step_size = None
+    raw_width = None
+    raw_height = None
     if stepsAll is None or len(np.atleast_1d(stepsAll)) == 0:
         stepsAll = [1]
     steps_to_process = stepsAll if step_list is None else [s for s in stepsAll if s in step_list]
-    for a in range(len(steps_to_process)):
+    for a in range(1, np.max(steps_to_process)+1):
         # --- Determine File Path ---
-        if len(steps_to_process) == 1:
-            raw_path = data_struct.images.DTOTR2.loc
-        else:
-            raw_path = data_struct.images.DTOTR2.loc[a]
-        
-        # Search for the expected file name pattern
-        match = re.search(rf'({experiment}_\d+/images/DTOTR2/DTOTR2_data_step\d+\.h5)', raw_path)
-        if not match:
-            raise ValueError(f"Path format invalid or not matched: {raw_path}")
+        if a in steps_to_process:
+            raw_path = data_struct.images.DTOTR2.loc[a-1]
+            # Search for the expected file name pattern
+            match = re.search(rf'({experiment}_\d+/images/DTOTR2/DTOTR2_data_step\d+\.h5)', raw_path)
+            if not match:
+                raise ValueError(f"Path format invalid or not matched: {raw_path}")
 
-        DTOTR2datalocation = '../../data/raw/' + experiment + '/' + match.group(0)
+            DTOTR2datalocation = '../../data/raw/' + experiment + '/' + match.group(0)
 
-        # --- Read and Prepare Data ---
-        with h5py.File(DTOTR2datalocation, 'r') as f:
-            data_raw = f['entry']['data']['data'][:].astype(np.float64) # shape: (N, H, W)
-        
-        # Transpose to shape: (H, W, N) - Height, Width, Shots
-        DTOTR2data_step = np.transpose(data_raw, (2, 1, 0))
-        # Subtract background (H, W) from all shots (H, W, N)
-        xtcavImages_step = DTOTR2data_step - data_struct.backgrounds.DTOTR2[:,:,np.newaxis].astype(np.float64)
-        
-        # --- Process Individual Shots ---
-        for idx in tqdm(range(DTOTR2data_step.shape[2]), desc="Processing Shots Step {}, {} samples".format(steps_to_process[a], DTOTR2data_step.shape[2])):
-            if idx is None:
-                continue
+            # --- Read and Prepare Data ---
+            with h5py.File(DTOTR2datalocation, 'r') as f:
+                data_raw = f['entry']['data']['data'][:].astype(np.float64) # shape: (N, H, W)
+            
+            # Transpose to shape: (H, W, N) - Height, Width, Shots
+            DTOTR2data_step = np.transpose(data_raw, (2, 1, 0))
+            # Subtract background (H, W) from all shots (H, W, N)
+            xtcavImages_step = DTOTR2data_step - data_struct.backgrounds.DTOTR2[:,:,np.newaxis].astype(np.float64)
+            step_size = DTOTR2data_step.shape[2]
+            # --- Process Individual Shots ---
+            for idx in tqdm(range(step_size), desc="Processing Shots Step {}, {} samples".format(a, step_size)):
+                if idx is None:
+                    continue
+                    
+                image = xtcavImages_step[:,:,idx] # Single shot (H, W)
+                raw_width = image.shape[1]
+                raw_height = image.shape[0]
+                if do_load_raw:
+                    # Store Raw (background-subtracted) Image
+                    xtcavImages_list_raw.append(image[:,:,np.newaxis])
+
+                # Apply ROI cropping if specified
+
+                if roi_xrange is not None and roi_yrange is not None:
+                    x_min, x_max = roi_xrange
+                    y_min, y_max = roi_yrange
+                    image = image[y_min:y_max, x_min:x_max]
                 
-            image = xtcavImages_step[:,:,idx] # Single shot (H, W)
-            
-            # Store Raw (background-subtracted) Image
-            xtcavImages_list_raw.append(image[:,:,np.newaxis])
-
-            # Apply ROI cropping if specified
-
-            if roi_xrange is not None and roi_yrange is not None:
-                x_min, x_max = roi_xrange
-                y_min, y_max = roi_yrange
-                image = image[y_min:y_max, x_min:x_max]
-            
-            # Crop image
-            image_cropped, _ = cropProfmonImg(image, xrange, yrange, plot_flag=False)
-            
-            # Filter and mask hot pixels
-            img_filtered = median_filter(image_cropped, size=3)
-            hotPixels = img_filtered > hotPixThreshold
-            img_filtered = np.ma.masked_array(img_filtered, hotPixels)
-            
-            # Gaussian smoothing and thresholding
-            processed_image = gaussian_filter(img_filtered, sigma=sigma, radius = 6*sigma + 1)
-            processed_image[processed_image < threshold] = 0.0
-            
-            # Calculate current profiles (Horizontal Projection)
-            horz_proj_idx = np.sum(processed_image, axis=0)
-            horz_proj_idx = horz_proj_idx[:,np.newaxis]
-            
-            # Prepare for collection
-            processed_image = processed_image[:,:,np.newaxis]
-            image_ravel = processed_image.ravel()
-            
-            horz_proj_list.append(horz_proj_idx)
-            xtcavImages_list.append(processed_image)
-            LPSImage.append([image_ravel]) 
+                # Crop image
+                image_cropped, _ = cropProfmonImg(image, xrange, yrange, plot_flag=False)
+                
+                # Filter and mask hot pixels
+                img_filtered = median_filter(image_cropped, size=3)
+                hotPixels = img_filtered > hotPixThreshold
+                img_filtered = np.ma.masked_array(img_filtered, hotPixels)
+                
+                # Gaussian smoothing and thresholding
+                processed_image = gaussian_filter(img_filtered, sigma=sigma, radius = 6*sigma + 1)
+                processed_image[processed_image < threshold] = 0.0
+                
+                # Calculate current profiles (Horizontal Projection)
+                
+                # Prepare for collection
+                processed_image = processed_image[:,:,np.newaxis]
+                image_ravel = processed_image.ravel()
+                xtcavImages_list.append(processed_image)
+                LPSImage.append([image_ravel]) 
+        else:
+            print(f"Skipping step {a} as it's not in steps_to_process.")
 
     # --- Concatenate Results ---
     xtcavImages = np.concatenate(xtcavImages_list, axis=2)
     del xtcavImages_list  # Free memory
-    xtcavImages_raw = np.concatenate(xtcavImages_list_raw, axis=2)
-    del xtcavImages_list_raw  # Free memory
-    horz_proj = np.concatenate(horz_proj_list, axis=1)
+    if do_load_raw:
+        xtcavImages_raw = np.concatenate(xtcavImages_list_raw, axis=2)
+        del xtcavImages_list_raw  # Free memory
     LPSImage = np.concatenate(LPSImage, axis = 0)
 
     print("Processed XTCAV Images shape:", xtcavImages.shape)
 
     # --- Apply Common Indexing ---
     print("StepsToProcess:"+str(steps_to_process))
-    image_common_index = [data_struct.images.DTOTR2.common_index[i] - 1 for i in range(len(data_struct.images.DTOTR2.common_index)) if data_struct.scalars.steps[data_struct.scalars.common_index[i]] in steps_to_process]
-    horz_proj = horz_proj[:, image_common_index]
+    def steps_skipped_before(i):
+        current_step = data_struct.scalars.steps[data_struct.scalars.common_index[i]]
+        # Count how many steps less than current_step are not in steps_to_process
+        return sum(1 for s in stepsAll if s < current_step and s not in steps_to_process)
+    image_common_index = [data_struct.images.DTOTR2.common_index[i] - 1 - steps_skipped_before(i) * step_size for i in range(len(data_struct.images.DTOTR2.common_index)) if data_struct.scalars.steps[data_struct.scalars.common_index[i]] in steps_to_process]
     xtcavImages = xtcavImages[:, :, image_common_index]
-    xtcavImages_raw = xtcavImages_raw[:, :, image_common_index]
+    if do_load_raw:
+        xtcavImages_raw = xtcavImages_raw[:, :, image_common_index]
     # Final Arrays
     LPSImage = LPSImage[image_common_index,:] 
     # This way, xtcavImages[some_common_index] corresponds to the shot with that common index.
-
-    return xtcavImages, xtcavImages_raw, horz_proj, LPSImage
+    if do_load_raw:
+        return xtcavImages, xtcavImages_raw, None, LPSImage
+    else:
+        return xtcavImages, None, None, LPSImage
 
 def construct_centroid_function(images, off_idx, smoothing_window_size=5, max_degree=1):
     """
@@ -559,7 +1043,6 @@ def apply_centroid_correction(xtcavImages, off_idx):
     centroid_corrections = construct_centroid_function(xtcavImages, off_idx)
 
     # Prepare lists to collect results
-    horz_proj_list_new = []
     xtcavImages_list_new = []
     LPSImage_new = []
     # Iterate over all shots in the concatenated array
@@ -575,9 +1058,6 @@ def apply_centroid_correction(xtcavImages, off_idx):
             corrected_image[row, :] = np.roll(processed_image[row, :], shift)
 
         # --- Calculate current profiles ---
-        # Sum along the horizontal (time) axis (axis=0) to get the vertical (energy) profile
-        horz_proj_idx = np.sum(corrected_image, axis=0)
-        horz_proj_idx = horz_proj_idx[:, np.newaxis] # Reshape to (W, 1)
         
         # Reshape corrected_image for concatenation
         corrected_image = corrected_image[:, :, np.newaxis] # Reshape to (H, W, 1)
@@ -586,13 +1066,11 @@ def apply_centroid_correction(xtcavImages, off_idx):
         image_ravel = corrected_image.ravel()
 
         # --- Combine results into lists ---
-        horz_proj_list_new.append(horz_proj_idx)
         xtcavImages_list_new.append(corrected_image)
         LPSImage_new.append([image_ravel])
-    print(N_shots)
+    print("Corrected N_shots:", N_shots)
     # --- Concatenate all shots ---
     # Recreate the final arrays
-    xtcavImages = np.concatenate(xtcavImages_list_new, axis=2)
-    horz_proj = np.concatenate(horz_proj_list_new, axis=1)
+    xtcavImages_ret = np.concatenate(xtcavImages_list_new, axis=2)
     LPSImage = np.concatenate(LPSImage_new, axis=0)
-    return xtcavImages, horz_proj, LPSImage, centroid_corrections
+    return xtcavImages_ret, None, LPSImage, centroid_corrections

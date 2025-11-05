@@ -6,8 +6,44 @@ from scipy.signal import find_peaks
 import matplotlib.pyplot as plt
 
 LOG_CONVERSION_FACTOR=1e3
+class GeometricScaler():
+    """
+    Scales geometric parameters (means and covariances) by a given range.
+    Used for normalizing parameters for ML model training.
+    """
+    SPREAD_FACTOR = 20.0  # Factor to spread out the covariance values during normalization
+    DISTANCE_FACTOR = 1.0 # Factor to scale the means during normalization
 
-def biGaussian_image_from_flattened_params(params, total_charge = None):
+    def __init__(self, xrange, yrange):
+        self.xrange = xrange
+        self.yrange = yrange
+    def fit_transform(self, flat_params):
+        pi = flat_params[:,:2]
+        mu = flat_params[:,2:4]
+        Sigma = flat_params[:,4:]
+        pi_normalized = pi - 0.5
+        # Below slices are to keep the dimensions correct for concatenation
+        mu_normalized = np.concatenate([mu[:, 0:1] / self.xrange, mu[:, 1:2] / self.yrange], axis=1) * self.DISTANCE_FACTOR
+        Sigma_normalized = np.concatenate([Sigma[:, 0:1] / (self.xrange **2), 
+                                          Sigma[:, 1:2] / (self.xrange * self.yrange),
+                                          Sigma[:, 2:3] / (self.yrange **2),
+                                          Sigma[:, 3:4] / (self.xrange **2),
+                                          Sigma[:, 4:5] / (self.xrange * self.yrange),
+                                          Sigma[:, 5:6] / (self.yrange **2)], axis=1) * self.SPREAD_FACTOR
+        return np.concatenate([pi_normalized, mu_normalized, Sigma_normalized], axis=1)
+    def inverse_transform(self, flat_params):
+        pi = flat_params[:,:2]
+        # Below slices are to keep the dimensions correct for concatenation
+        mu = np.concatenate([flat_params[:,2:3] * self.xrange, flat_params[:,3:4] * self.yrange], axis=1) / self.DISTANCE_FACTOR
+        Sigma = np.concatenate([flat_params[:,4:5] / self.SPREAD_FACTOR * (self.xrange **2), 
+                                flat_params[:,5:6] / self.SPREAD_FACTOR * (self.xrange * self.yrange),
+                                flat_params[:,6:7] / self.SPREAD_FACTOR * (self.yrange **2),
+                                flat_params[:,7:8] / self.SPREAD_FACTOR * (self.xrange **2),
+                                flat_params[:,8:9] / self.SPREAD_FACTOR * (self.xrange * self.yrange),
+                                flat_params[:,9:10] / self.SPREAD_FACTOR * (self.yrange **2)], axis=1)
+        return np.concatenate([pi + 0.5, mu, Sigma], axis=1)
+    
+def biGaussian_image_from_flattened_params(params, total_charge = None, xrange = 100, yrange = 100):
     """
     Generate a 2D image from flattened bi-Gaussian parameters. Also applies inverse operation of whatever pre-processing applied in image_to_bigaussian_params.
     Args:
@@ -15,20 +51,19 @@ def biGaussian_image_from_flattened_params(params, total_charge = None):
     Returns:
         np.ndarray: Generated 2D image of shape (200, 200).
     """
-    xrange = 100
-    yrange = 100
     # Unflatten parameters, ensuring Sigma off-diagonal elements are clipped because plotting hyperbolic contours is not useful
     uf = unflatten_biGaussian_params(params, clip_sigma=True)
     pi = uf['pi'].numpy()
-    mu = uf['mu'].numpy()
+    mu = uf['mu'].numpy().reshape(2,2)
     Sigma = uf['Sigma'].numpy()
-    generated_image = gaussian_2d_pdf(mu[0], Sigma[0]).reshape((2*yrange, 2*xrange)) * pi[0] + \
-                      gaussian_2d_pdf(mu[1], Sigma[1]).reshape((2*yrange, 2*xrange)) * pi[1]
+    # Center of first Gaussian is at (xrange, yrange)
+    generated_image = gaussian_2d_pdf(np.array([xrange,yrange]), Sigma[0], xrange, yrange) * pi[0] + \
+                      gaussian_2d_pdf(np.array([xrange,yrange])+mu[1]-mu[0], Sigma[1], xrange, yrange) * pi[1]
     # WIP
     if total_charge is not None:
         generated_image = (np.exp(generated_image)-1)/LOG_CONVERSION_FACTOR
         generated_image = generated_image / np.sum(generated_image) * total_charge
-    return np.flip(generated_image.T, axis=0)
+    return generated_image.T
 
 def flatten_biGaussian_params(biGaussian_params):
     """Flatten bi-Gaussian parameters into a 1D array.
@@ -39,22 +74,23 @@ def flatten_biGaussian_params(biGaussian_params):
     Returns:
         np.ndarray: Flattened parameters array of shape (12,).
     """
-    pi = biGaussian_params['pi'].numpy().flatten()
-    mu = biGaussian_params['mu'].numpy().flatten()
+    pi = biGaussian_params['pi'].numpy()
+    mu = biGaussian_params['mu'].numpy().reshape(2,2)
+    mu_diff = mu[1] - mu[0]  # Store difference of means
     Sigma = biGaussian_params['Sigma'].numpy()
     # Extract unique elements of Sigma (since it's symmetric)
     Sigma_flat = []
     for k in range(Sigma.shape[0]):
         Sigma_flat.extend([Sigma[k,0,0], Sigma[k,0,1], Sigma[k,1,1]])  # Omit Sigma[k,1,0] as it's equal to Sigma[k,0,1]
     Sigma_flat = np.array(Sigma_flat)
-    return np.concatenate([pi, mu, Sigma_flat])
+    return np.concatenate([pi, mu_diff, Sigma_flat])
 
-def is_valid_biGaussian_params(flat_params)-> bool:
+def is_valid_biGaussian_params(flat_params, do_current_profile = False, xrange = 100, yrange = 100)-> bool:
     """
     Check if the flattened bi-Gaussian parameters are valid. Check includes:
     - No NaN values.
     - Mixture weights (pi) are non-negative.
-    - Means (mu) are within [0, 200].
+    - Means (mu) are within [-2*xrange, 2*xrange].
     - Covariance matrices (Sigma) are positive definite and have positive diagonal elements.
     Args:
         flat_params (np.ndarray): Flattened parameters array of shape (12,).
@@ -75,9 +111,20 @@ def is_valid_biGaussian_params(flat_params)-> bool:
         if np.any(pi < 0):
             return False
         
-        # Check means
-        if np.any(mu < 0) or np.any(mu > 200):
+        # Check first weight is larger than second (to avoid label switching)
+        if pi[0] < pi[1]:
             return False
+        
+        # Check means
+        if np.any(mu[:, 0] < -2*xrange) or np.any(mu[:, 0] > 2*xrange):
+            return False
+        if np.any(mu[:, 1] < -2*yrange) or np.any(mu[:, 1] > 2*yrange):
+            return False
+
+        if do_current_profile:
+            # In current profile mode, ensure that the x means are sufficiently separated
+            if abs(mu[1][0]) < 10:
+                return False
         
         # Check covariance matrices
         for k in range(Sigma.shape[0]):
@@ -85,6 +132,9 @@ def is_valid_biGaussian_params(flat_params)-> bool:
                 return False
             # Check positive definiteness
             if np.linalg.det(Sigma[k]) <= 0:
+                return False
+            # Trace must be at least ( 5 px ) ** 2. This prevents extremely small covariances which mean the Gaussian captured a noise spike.
+            if np.trace(Sigma[k]) < 25:
                 return False
         
         return True
@@ -95,23 +145,25 @@ def is_valid_biGaussian_params(flat_params)-> bool:
 def unflatten_biGaussian_params(flat_params, clip_sigma = False):
     """Convert a flattened 1D array back into bi-Gaussian parameters.
     Args:
-        flat_params (np.ndarray): Flattened parameters array of shape (12,).
+        flat_params (np.ndarray): Flattened parameters array of shape (10,).
         clip_sigma (bool): If True, Clip the off-diagonal Sigmas to be less than or equal to the geometric mean of the diagonal Sigmas
     """
     pi = flat_params[:2]
-    mu = flat_params[2:6].reshape(2,2)
+
+    # When flattened, we only store K-1 means (the first mean is fixed at [0,0]).
+    mu = np.array([[0,0], flat_params[2:4]])
     Sigma = np.zeros((2,2,2))
     for k in range(2):
-        Sigma[k,0,0] = flat_params[6 + k*3]
-        Sigma[k,1,1] = flat_params[8 + k*3]
+        Sigma[k,0,0] = flat_params[4 + k*3]
+        Sigma[k,1,1] = flat_params[6 + k*3]
         if not clip_sigma:
-            Sigma[k,0,1] = flat_params[7 + k*3]
-            Sigma[k,1,0] = flat_params[7 + k*3]  # Symmetric
+            Sigma[k,0,1] = flat_params[5 + k*3]
+            Sigma[k,1,0] = flat_params[5 + k*3]  # Symmetric
         else:
             Sigma[k,0,0] = np.clip(Sigma[k,0,0], 10, 1e6)  # Prevent extreme values
             Sigma[k,1,1] = np.clip(Sigma[k,1,1], 10, 1e6)  # Prevent extreme values
             geometric_mean = np.sqrt(Sigma[k,0,0] * Sigma[k,1,1]) # Stddev of x times stddev of y. This is the max allowed off-diagonal value for positive-definite Sigma
-            Sigma[k,0,1] = np.clip(flat_params[7 + k*3], -geometric_mean, geometric_mean)
+            Sigma[k,0,1] = np.clip(flat_params[5 + k*3], -geometric_mean*0.9, geometric_mean*0.9)  # Clip to be less than geometric mean
             Sigma[k,1,0] = Sigma[k,0,1]  # Symmetric
     return {
         'pi': torch.tensor(pi, dtype=torch.float32),
@@ -143,15 +195,10 @@ def gaussian_2d_pdf(mu: np.ndarray, Sigma: np.ndarray,
         xrange (int): Range for x-coordinates (image width / 2).
         yrange (int): Range for y-coordinates (image height / 2).
     """
-    
-    # Check for singularity (shouldn't happen with robust fitting but for safety)
-    try:
-        Sigma_inv = np.linalg.inv(Sigma)
-    except np.linalg.LinAlgError:
-        return np.zeros((2*yrange, 2*xrange))
+    Sigma_inv = np.linalg.inv(Sigma)
 
     # Coordinates centered relative to mu
-    xy_coords = np.array(np.meshgrid(np.arange(0, 2* xrange), np.arange(0, 2*yrange))).T.reshape(-1, 2)  # (N, 2)
+    xy_coords = np.array(np.meshgrid(np.arange(0, 2* xrange), np.arange(0, 2* yrange))).T.reshape(-1, 2)  # (N, 2)
     centered_coords = (xy_coords - mu)
     
    
@@ -166,13 +213,14 @@ def gaussian_2d_pdf(mu: np.ndarray, Sigma: np.ndarray,
     # D=2 for 2D
     numerator = np.exp(-0.5 * quad_form)
 
-    return numerator
+    return numerator.reshape((2*xrange, 2*yrange)).T
 
 # ----------------- Main Conversion Function -----------------
 
 def image_to_bigaussian_params(target_image: np.ndarray, do_current_profile = False, debug = True) -> Dict:
-    # Constants for a 200x200 image normalized to a range of [-1, 1]
-    IMG_SIZE = target_image.shape[0]  # Assuming square image
+    # Constants for a HxW image normalized to a range of [-1, 1]
+    IMG_SIZE_X = target_image.shape[1]  # Assuming square image
+    IMG_SIZE_Y = target_image.shape[0]  # Assuming square image
     K = 2 # Fixed number of components
 
     
@@ -196,8 +244,8 @@ def image_to_bigaussian_params(target_image: np.ndarray, do_current_profile = Fa
     # Applying MSE to log is equivalent to performing negative log loss function, which is useful for predicting images with peaks whose amplitudes differ by orders of magnitudes.
     target_density = np.log1p(target_density * LOG_CONVERSION_FACTOR)  # log(1 + density * scale)
 
-    y_coords = np.arange(IMG_SIZE)
-    x_coords = np.arange(IMG_SIZE)
+    y_coords = np.arange(IMG_SIZE_Y)
+    x_coords = np.arange(IMG_SIZE_X)
 
     # --- Step 1: Vertical Projection and Y-Mean/Weight Estimation ---
 
@@ -226,6 +274,14 @@ def image_to_bigaussian_params(target_image: np.ndarray, do_current_profile = Fa
             plt.ylabel('Density')
             plt.show()
 
+        if len(peaks) < 2:
+            raise RuntimeError("Less than 2 peaks found in vertical projection.")
+        
+        # If there are more than 2 peaks, the second peak must be at least twice the height of the third peak
+        if len(peaks) > 2:
+            sorted_peak_heights = np.sort(properties['peak_heights'])[::-1]
+            if sorted_peak_heights[1] < 2 * sorted_peak_heights[2]:
+                raise RuntimeError("Second peak is not sufficiently prominent compared to third peak.")
         # Extract fitted parameters
         mu_y = np.array([y_coords[peaks[0]], y_coords[peaks[1]]])
         pi_y_raw = np.array([properties['peak_heights'][0], properties['peak_heights'][1]])
@@ -282,44 +338,6 @@ def image_to_bigaussian_params(target_image: np.ndarray, do_current_profile = Fa
 
         means.append(np.array([mu_x_k, y_k]))
         sigma_x.append(sigma_x_k)
-    #In current profile mode, we are more interested in the fit of the zeta projection, rather than the 2D image itself.
-    if do_current_profile:
-        if K is not 2:
-            raise ValueError("In Current Profile Mode, K has to be 2.")
-        else:
-            try:
-
-                # Fit 1D Gaussian to the horizontal slice to find x_k
-                current_profile = np.log1p(np.sum(target_image, axis=0) / np.sum(target_image) * LOG_CONVERSION_FACTOR)
-                
-                p0_x = [means[0][0], sigma_x[0], current_profile[int(means[0][0])], means[1][0], sigma_x[1], current_profile[int(means[1][0])]]
-                if debug:
-                    print (f"Fitting Current Profile with initial guess {p0_x}")
-                popt_x, _ = curve_fit(bigaussian_1d, x_coords, current_profile, p0=p0_x, maxfev=5000)
-                mu_x_k = popt_x[0]
-                sigma_x_k = np.abs(popt_x[1])  # Not used further but could be stored if needed
-
-                # Check if two peaks are sufficiently separated
-                if np.abs(popt_x[0] - popt_x[3]) < 10:
-                    raise RuntimeError("Fitted peaks in current profile are too close to each other.")
-                # Overwrite the previously estimated means and sigma_x with the re-fitted values from the current profile
-                means[0][0] = popt_x[0]
-                means[1][0] = popt_x[3]
-                sigma_x[0] = np.abs(popt_x[1])
-                sigma_x[1] = np.abs(popt_x[4])
-                if debug:
-                    print("Fitted Current Profile Means (Mu):", [popt_x[0], popt_x[3]])
-                    plt.figure()
-                    plt.plot(x_coords, current_profile, label='Current Profile', color='blue')
-                    plt.plot(x_coords, bigaussian_1d(x_coords, *popt_x), label='Re-Fitted Bi-Gaussian', color='red')
-                    plt.legend()
-                    plt.title('Current Profile and Re-Fitted Bi-Gaussian')
-                    plt.xlabel('X Coordinate')
-                    plt.ylabel('Density')
-                    plt.show()
-            except RuntimeError:
-                # If fitting fails, retain the original estimates from the horizontal slices
-                print(f"Current profile fitting failed for component {k+1}.")
 
     if debug:
         print("Fitted Means (Mu):", means)
@@ -370,13 +388,66 @@ def image_to_bigaussian_params(target_image: np.ndarray, do_current_profile = Fa
         # Plot the assignment for debugging
         plt.figure()
         # Overlay original density as background
-        plt.imshow(target_density, cmap='gray', alpha=0.3, extent=(0, IMG_SIZE, 0, IMG_SIZE), origin='lower')
+        plt.imshow(target_density, cmap='gray', alpha=0.3, extent=(0, IMG_SIZE_X, 0, IMG_SIZE_Y), origin='lower')
         plt.scatter(coordinates[:, 0], coordinates[:, 1], c=assigned_component, s=1, cmap='jet', alpha=0.2)
         plt.title('Pixel Assignment to GMM Components')
         plt.xlabel('X Coordinate')
         plt.ylabel('Y Coordinate')
         plt.colorbar(label='Assigned Component')
         plt.show()
+
+    #In current profile mode, we are more interested in the fit of the zeta projection, rather than the 2D image itself.
+    #Nudge the x means based on the current profile (horizontal projection of the entire image)
+    if do_current_profile:
+        if K is not 2:
+            raise ValueError("In Current Profile Mode, K has to be 2.")
+        else:
+            try:
+                mu_k_list = []
+                sigma_k_list = []
+                amp_k_list = []
+                for k in range(K):
+                    # Refit the current profile (horizontal projection of the component)
+                    k_component_mask = (assigned_component == k)
+                    current_profile = np.zeros(IMG_SIZE_X)
+                    for idx in range(coordinates.shape[0]):
+                        if k_component_mask[idx]:
+                            x_idx = int(coordinates[idx, 0])
+                            current_profile[x_idx] += flat_density[idx]
+                    # Initial guess based on previous estimates
+                    p0_x = [means[0][0], sigma_x[0], current_profile[int(means[0][0])]]
+                    if debug:
+                        print (f"Fitting Current Profile with initial guess {p0_x}")
+                    popt_x, _ = curve_fit(gaussian_1d, x_coords, current_profile, p0=p0_x, maxfev=5000)
+                    mu_x_k = popt_x[0]
+                    sigma_x_k = np.abs(popt_x[1])  # Not used further but could be stored if needed
+                    mu_k_list.append(mu_x_k)
+                    sigma_k_list.append(sigma_x_k)
+                    amp_k_list.append(popt_x[2])
+
+                # Check if two peaks are sufficiently separated
+                if np.abs(mu_k_list[0] - mu_k_list[1]) < 10:
+                    raise RuntimeError("Fitted peaks in current profile are too close to each other.")
+                # Overwrite the previously estimated means and sigma_x with the re-fitted values from the current profile
+                means[0][0] = mu_k_list[0]
+                means[1][0] = mu_k_list[1]
+                sigma_x[0] = sigma_k_list[0]
+                sigma_x[1] = sigma_k_list[1]
+                new_popt_x = [mu_k_list[0], sigma_k_list[0], amp_k_list[0], mu_k_list[1], sigma_k_list[1], amp_k_list[1]]
+                if debug:
+                    print("Fitted Current Profile Means (Mu):", [mu_k_list[0], mu_k_list[1]])
+                    plt.figure()
+                    plt.plot(x_coords, current_profile, label='Current Profile', color='blue')
+                    plt.plot(x_coords, bigaussian_1d(x_coords, *new_popt_x), label='Re-Fitted Bi-Gaussian', color='red')
+                    plt.legend()
+                    plt.title('Current Profile and Re-Fitted Bi-Gaussian')
+                    plt.xlabel('X Coordinate')
+                    plt.ylabel('Density')
+                    plt.show()
+            except RuntimeError:
+                # If fitting fails, retain the original estimates from the horizontal slices
+                print(f"Current profile fitting failed for component {k+1}. Retaining original estimates.")
+    
     # 3. Calculate Sigma via Weighted Scatter Matrix
     for k in range(K):
         mu_k = means[k]
@@ -433,7 +504,7 @@ def image_to_bigaussian_params(target_image: np.ndarray, do_current_profile = Fa
         plt.show()
 
     return {
-        'pi': torch.tensor(pi_y_raw, dtype=torch.float32), 
+        'pi': torch.tensor(pi_y_raw / np.sum(pi_y_raw), dtype=torch.float32), 
         'mu': torch.tensor(np.stack(means), dtype=torch.float32), 
         'Sigma': torch.tensor(np.stack(sigmas), dtype=torch.float32)
     }
