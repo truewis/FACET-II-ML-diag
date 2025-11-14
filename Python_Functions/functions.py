@@ -5,6 +5,7 @@ import scipy
 import warnings
 from scipy.io.matlab.mio5_params import mat_struct
 from scipy.ndimage import median_filter, gaussian_filter
+from scipy.optimize import curve_fit
 import re
 import h5py
 from tqdm import tqdm # Import tqdm
@@ -13,6 +14,7 @@ import torch
 from scipy.signal import find_peaks
 import h5py
 import re
+from Python_Functions.gmm import bigaussian_1d
 # Define MLP structure
 class MLP(nn.Module):
     def __init__(self, in_dim, out_dim):
@@ -37,6 +39,7 @@ def analyze_eos_and_cher(data_struct, experiment='', runname='',
                          mindels=40e-6, maxdels=85e-6,
                          skipEOSanalysis=True,
                          goosing=False,
+                         debug = True,
                          EOS_cal=17.94e-15):
     """
     Port of the Claudio Emma's MATLAB EOS/CHER analysis.
@@ -155,9 +158,11 @@ def analyze_eos_and_cher(data_struct, experiment='', runname='',
     nshots = EOSdata.shape[2]
     # prepare projection matrix (rows x shots)
     EOS2horzProj = np.zeros((EOSdata.shape[0], nshots), dtype=float)
+    shotROIs = np.zeros((EOSdata.shape[0], EOSdata.shape[1], nshots), dtype=float)
 
     dels = np.zeros(nshots, dtype=float)
     print("Starting EOS2 analysis...")
+    plot_frequency = 20 if not goosing else 21
     if not skipEOSanalysis:
         if goosing:
             rng = range(1, nshots, 2)
@@ -167,42 +172,62 @@ def analyze_eos_and_cher(data_struct, experiment='', runname='',
             shot = EOSdata[:, :, a]
             # take vertical ROI
             shot_roi = shot[EOS2ymin:EOS2ymax, :]
-
+            shotROIs[EOS2ymin:EOS2ymax, :, a] = shot_roi
             # vertical projection (sum across columns)
             proj = np.sum(shot_roi, axis=1)
             # Plot projection for debugging
-            #plt.imshow(shot_roi , cmap='viridis', aspect='auto')
-            #plt.show()
+            if debug and a % plot_frequency == 1:
+                plt.imshow(shot_roi , cmap='viridis', aspect='auto')
+                plt.show()
             EOS2horzProj[EOS2ymin:EOS2ymax, a] = proj
             # find peaks on the projection
-            peaks, props = find_peaks(proj, height=10000, prominence=5000)
+            # height and prominence thresholds may need adjustment based on signal levels
+            log_proj = np.log(1+proj)
+            peaks, props = find_peaks(gaussian_filter(log_proj, sigma=0.8), height=9.2, prominence=0.05)
             if peaks.size < 2:
                 dels[a] = 0.0
                 continue
 
+            #%% ######################################################################################
+            # Option: Extra bigaussian fit to refine peak positions
+            try:
+                x_coords = np.arange(len(proj))
+                # Initial guess for bigaussian fit: [amp1, sigma1, mean1, amp2, sigma2, mean2]
+                # Sigma is chosen as 10 pixels arbitrarily. Amplitudes are peak heights.
+                p0_x = [x_coords[peaks[0]], 10 ,log_proj[peaks[0]], x_coords[peaks[1]], 10 ,log_proj[peaks[1]]]
+                popt_x, _ = curve_fit(bigaussian_1d, x_coords, log_proj, p0=p0_x, maxfev=5000)
+                peak_sep_pix = popt_x[3] - popt_x[0]
+            except Exception as e:
+                peak_sep_pix = abs(peaks[0] - peaks[1])
+
+
             # Plot projection and peaks for debugging
-            #plt.plot(proj)
-            #plt.plot(peaks, proj[peaks], "x")
-            #plt.show()
+            if debug and a % plot_frequency == 1:
+                plt.plot(log_proj)
+                plt.plot(peaks, log_proj[peaks], "x")
+                plt.show()
             peak_vals = props['peak_heights']
-            # indices of two largest peaks (descending)
+            #%% ######################################################################################
+            # Option: Just take the top 2 peaks by height
             top2 = np.argsort(peak_vals)[-2:]
             # map to actual peak positions
             pos = peaks[top2]
             # pick heights in descending order
             heights_sorted = peak_vals[top2][np.argsort(peak_vals[top2])[::-1]]
             # compute separation in pixels
-            peak_sep_pix = abs(int(pos[0]) - int(pos[1]))
+            #peak_sep_pix = abs(int(pos[0]) - int(pos[1]))
+            #%% ######################################################################################
             # Transpose horizontal projection by peak position.
-            EOS2horzProj[:, a] = np.roll(EOS2horzProj[:, a], -int(pos[1]))
+            # EOS2horzProj[:, a] = np.roll(EOS2horzProj[:, a], -int(pos[1]))
             # reliability check: if largest*0.08 > second then unreliable
-            if heights_sorted[0] * 0.08 > heights_sorted[1]:
-                dels[a] = 0.0
+            # if heights_sorted[0] * 0.08 > heights_sorted[1]:
+            #     dels[a] = 0.0
             # another reliability check: if tallest peak < 10000 counts, likely no signal
-            if heights_sorted[0] < 10000:
-                dels[a] = 0.0
-            else:
-                dels[a] = peak_sep_pix * EOS_cal * c
+            # if heights_sorted[0] < 10000:
+            #     dels[a] = 0.0
+            # else:
+            #%%
+            dels[a] = peak_sep_pix * EOS_cal * c
         print("Done with EOS2 analysis!")
     else:
         # still compute vertical projections for plotting but leave dels zeros
@@ -210,6 +235,7 @@ def analyze_eos_and_cher(data_struct, experiment='', runname='',
             shot = EOSdata[:, :, a]
             shot_roi = shot[EOS2ymin:EOS2ymax, :]
             EOS2horzProj[:, a] = np.sum(shot_roi, axis=1)
+            shotROIs.append(None)
 
     # --- Prepare plotting arrays ---
     #sorted_idx = np.arange(nshots)
@@ -243,6 +269,7 @@ def analyze_eos_and_cher(data_struct, experiment='', runname='',
         'bc14BLEN': bc14BLEN,
         'EOS2horzProj': EOS2horzProj,
         'fig': fig,
+        'shotROI': shotROIs,
         'sorted_idx': sorted_idx
     }
 def analyze_SYAG(data_struct, experiment='', runname='', 
@@ -253,7 +280,9 @@ def analyze_SYAG(data_struct, experiment='', runname='',
                          skipEOSanalysis=True,
                          goosing=False,
                          EOS_cal=17.94e-15,
-                         debug=False
+                         debug=False,
+                         step_selector=None,
+                         min_prom = 2000
                          ):
     """
     Port of the Claudio Emma's MATLAB EOS/CHER analysis.
@@ -269,6 +298,9 @@ def analyze_SYAG(data_struct, experiment='', runname='',
         skipEOSanalysis: if True, skip EOS separation calculation (still compute projections)
         goosing: if True, process every other shot for EOS analysis
         EOS_cal: EOS calibration in seconds/pixel
+        debug: if True, show debug plots during analysis
+        step_selector: list of steps to include in analysis (if None, include all)
+        min_prom: minimum prominence for peak detection in SYAG analysis
 
     Returns a dict with keys:
       - dels: array of EOS separations (meters) (or zeros if skipped)
@@ -305,6 +337,10 @@ def analyze_SYAG(data_struct, experiment='', runname='',
     stepsAll = data_struct.params.stepsAll
     if stepsAll is None or len(np.atleast_1d(stepsAll)) == 0:
         stepsAll = [1]
+    
+    # If step_selector is provided, filter stepsAll accordingly
+    if step_selector is not None:
+        stepsAll = [step for step in stepsAll if step in step_selector]
 
     SYAGdata = None
     # Handle loc being list-like or single
@@ -330,7 +366,7 @@ def analyze_SYAG(data_struct, experiment='', runname='',
         print(f"Loading SYAG data from {loc_entry} ...")
         try:
             with h5py.File(loc_entry, 'r') as f:
-                stepdata = f['entry']['data']['data'][:].astype(np.int32)
+                stepdata = f['entry']['data']['data'][:].astype(np.int16)
                 print(f"Loaded stepdata from {loc_entry}")
                 print(f"stepdata shape: {stepdata.shape}")
 
@@ -340,7 +376,7 @@ def analyze_SYAG(data_struct, experiment='', runname='',
             if m:
                 candidate = '../../data/raw/' + experiment + '/' + m.group(0)
                 with h5py.File(candidate, 'r') as f:
-                    stepdata = f['entry']['data']['data'][:].astype(np.int32)
+                    stepdata = f['entry']['data']['data'][:].astype(np.int16)
             else:
                 raise
 
@@ -348,16 +384,18 @@ def analyze_SYAG(data_struct, experiment='', runname='',
         if SYAGdata is None:
             SYAGdata = stepdata.copy()
         else:
-            # stepdata shape (H, W, Nstep); append along third axis
-            SYAGdata = np.concatenate([SYAGdata, stepdata], axis=2)
+            # stepdata shape (Nstep, W, H); append along third axis
+            SYAGdata = np.concatenate([SYAGdata, stepdata], axis=0)
 
     if SYAGdata is None:
-        raise RuntimeError("No EOS data loaded.")
+        raise RuntimeError("No SYAG data loaded.")
 
     # --- Keep only shots with common index and subtract background ---
     # common_index in data_struct likely 1-based
-    syag_common = data_struct.images.SYAG.common_index
-    syag_common_idx = [int(i) - 1 for i in syag_common]
+    syag_common_idx = data_struct.images.SYAG.common_index - 1
+    # If step_selector is provided, filter syag_common_idx accordingly
+    if step_selector is not None:
+        syag_common_idx = [syag_common_idx[idx] for idx in range(len(syag_common_idx)) if data_struct.scalars.steps[idx] in step_selector]
     SYAGdata = SYAGdata.transpose(2, 1, 0)[:, :, syag_common_idx]  # to (H, W, Shots)
 
     # subtract background if available (convert to float)
@@ -376,6 +414,7 @@ def analyze_SYAG(data_struct, experiment='', runname='',
 
     dels = np.zeros(nshots, dtype=float)
     print("Starting SYAG analysis...")
+    plot_frequency = 80 if not goosing else 81
     if not skipEOSanalysis:
         if goosing:
             rng = range(1, nshots, 2)
@@ -391,60 +430,79 @@ def analyze_SYAG(data_struct, experiment='', runname='',
             # Apply smoothing to projection
             proj = gaussian_filter(proj, sigma=5)
             # Plot projection for debugging
-            if debug and a % 20 == 1:
+            if debug and a % plot_frequency == 1:
                 # Maximum color is twice the median of the shot ROI
                 plt.imshow(shot_roi , cmap='viridis', aspect='auto', vmax=2*np.median(shot_roi))
                 plt.show()
             SYAGhorzProj[:,a] = proj
             # find peaks on the projection
-            # Here we measure FWHM of the dip between two peaks, rather than the positions of the peaks themselves.
-            # This is because the dip width is more stable against local intensity fluctuations ardound the peaks.
-            peaks, props = find_peaks(-proj, prominence=2000)
+            # Here we measure the distance between centroid of each two peak, rather than the positions of the peaks themselves.
+            # This is because the distance width is more stable against local intensity fluctuations around the peaks.
+            peaks, props = find_peaks(proj, prominence=min_prom)
             # exclude any peaks too close to edges, along with the associated properties
             valid_peaks_mask = (peaks > 20) & (peaks < len(proj) - 20)
             peaks = peaks[valid_peaks_mask]
             for key in props:
                 props[key] = props[key][valid_peaks_mask]
             # Plot projection and peaks for debugging
-            if debug and a % 20 == 1:
+            if debug and a % plot_frequency == 1:
                 plt.plot(proj)
                 plt.plot(peaks, proj[peaks], "x")
                 plt.show()
-            if peaks.size is not 1:
+            if peaks.size is not 2:
                 dels[a] = 0.0
                 continue
-            print(f"Shot {a}: Found dip at pixel {peaks[0]} with prominence {props['prominences'][0]}") 
-            # peak_sep_pix is full width half max of the dip.
-            # The 'height' of the dip is given by the prominence of the peak in -proj
-            peak_vals = props['prominences']
-            height = peak_vals[0]
-            # find left and right bases for FWHM
-            left_bases = props['left_bases']
-            right_bases = props['right_bases']
-            left_idx = left_bases[0]
-            right_idx = right_bases[0]
-            # tread the slope from left to right to find FWHM positions
-            half_height = height / 2.0
-            def find_fwhm_binary_search(func, start_idx, end_idx, half_height, search_left):
-                while start_idx < end_idx:
-                    mid_idx = (start_idx + end_idx) // 2
-                    if not search_left:
-                        if func[mid_idx] < half_height:
-                            end_idx = mid_idx
-                        else:
-                            start_idx = mid_idx + 1
-                    else:
-                        if func[mid_idx] < half_height:
-                            start_idx = mid_idx + 1
-                        else:
-                            end_idx = mid_idx
-                return start_idx
-            fwhm_left = find_fwhm_binary_search(-proj+proj[left_idx], left_idx, peaks[0] , half_height, search_left=True)
-            fwhm_right = find_fwhm_binary_search(-proj+proj[right_idx], peaks[0], right_idx , half_height, search_left=False)
-            # Transpose horizontal projection by dip position.
-            SYAGhorzProj[:, a] = np.roll(SYAGhorzProj[:, a], -int(peaks[0]))
-            peak_sep_pix = fwhm_right - fwhm_left
-            dels[a] = peak_sep_pix * EOS_cal * c
+            # Centroid analysis is optional.
+            # dip_index = np.argmin(proj[peaks[0]:peaks[1]]) + peaks[0]
+            # #print(f"Shot {a}: Found dip at pixel {peaks[0]} with prominence {props['prominences'][0]}") 
+            # # peak_sep_pix is full width half max of the dip.
+            # # The 'height' of the dip is given by the prominence of the peak in -proj
+            # prom = props['prominences']
+            # # find left and right bases for FWHM
+            # left_bases = props['left_bases']
+            # right_bases = props['right_bases']
+            # # tread the slope from left to right to find FWHM positions
+            # def find_fwhm_binary_search(func, start_idx, end_idx, half_height, search_left):
+            #     while start_idx < end_idx:
+            #         mid_idx = (start_idx + end_idx) // 2
+            #         if not search_left:
+            #             if func[mid_idx] < half_height:
+            #                 end_idx = mid_idx
+            #             else:
+            #                 start_idx = mid_idx + 1
+            #         else:
+            #             if func[mid_idx] < half_height:
+            #                 start_idx = mid_idx + 1
+            #             else:
+            #                 end_idx = mid_idx
+            #     return start_idx
+            # fwhm_left_0 = find_fwhm_binary_search(proj-proj[left_bases[0]], left_bases[0], peaks[0] , prom[0]/2, search_left=True)
+            # fwhm_right_0 = find_fwhm_binary_search(proj-proj[dip_index], peaks[0], dip_index , prom[0]/2, search_left=False)
+
+            # #Flip the projection and tread the slope from right to left to find FWHM positions.
+            # #This works but is a bit hacky.
+            # fwhm_left_1 = find_fwhm_binary_search(proj-proj[dip_index], dip_index, peaks[1] , prom[1]/2, search_left=True)
+            # fwhm_right_1 = find_fwhm_binary_search(proj-proj[right_bases[1]], peaks[1], right_bases[1] , prom[1]/2, search_left=False)
+            # # Plot projection and cliffs for debugging
+            # if debug and a % plot_frequency == 1:
+            #     plt.plot(proj)
+            #     plt.axvline(fwhm_left_0, color='r')
+            #     plt.axvline(fwhm_right_0, color='r')
+            #     plt.axvline(fwhm_left_1, color='g')
+            #     plt.axvline(fwhm_right_1, color='g')
+            #     # dip position
+            #     plt.axvline(dip_index, color='k')
+            #     plt.show()
+            # # Transpose horizontal projection by first cliff position.
+            # SYAGhorzProj[:, a] = np.roll(SYAGhorzProj[:, a], -int(fwhm_left_0))
+            # # centroids are center of mass of each peak FWHM region
+            # centroid_0 = np.sum(np.arange(fwhm_left_0, fwhm_right_0) * proj[fwhm_left_0:fwhm_right_0]) / np.sum(proj[fwhm_left_0:fwhm_right_0])
+            # centroid_1 = np.sum(np.arange(fwhm_left_1, fwhm_right_1) * proj[fwhm_left_1:fwhm_right_1]) / np.sum(proj[fwhm_left_1:fwhm_right_1])
+            # print(f"Shot {a}: Centroid positions {centroid_0}, {centroid_1}")
+            # centroid_sep_pix = np.abs(centroid_0 - centroid_1)
+            # Alternative: simply use peak positions
+            centroid_sep_pix = abs(int(peaks[0]) - int(peaks[1]))
+            dels[a] = centroid_sep_pix
         print("Done with SYAG analysis!")
     else:
         # still compute vertical projections for plotting but leave dels zeros
@@ -537,6 +595,7 @@ def extractDAQBSAScalars(data_struct, step_list=None, filter_index= True):
     Args:
         data_struct: Data structure containing scalar information.
         step_list: List of steps to filter the data. If None, all steps are used. Starts from 1.
+        filter_index: If True, apply common index filtering.
     """
     data_struct = matstruct_to_dict(data_struct)
     dataScalars = data_struct['scalars']
