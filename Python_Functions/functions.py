@@ -14,6 +14,8 @@ import torch
 from scipy.signal import find_peaks
 import h5py
 import re
+import os
+from pathlib import Path
 from Python_Functions.gmm import bigaussian_1d
 # Define MLP structure
 class MLP(nn.Module):
@@ -30,6 +32,54 @@ class MLP(nn.Module):
         )
     def forward(self, x):
         return self.model(x)
+        
+def find_experiment_file(experiment: str, runname: str, base_nas_path: str = '/nas/nas-li20-pm00') -> Path | None:
+    """
+    Finds the full path to a specific experiment file, searching recursively
+    under the base NAS directory structure.
+
+    The expected file structure is:
+    /nas/nas-li20-pm00/{experiment}/{year}/{date}/{experiment}_{runname}/{experiment}_{runname}.mat
+
+    Args:
+        experiment: The name of the experiment (e.g., 'E300').
+        runname: The unique run identifier (e.g., '12431').
+        base_nas_path: The root directory for the NAS storage.
+
+    Returns:
+        A pathlib.Path object of the found file, or None if the file is not found.
+    """
+    # 1. Define the part of the filename that is constant
+    target_filename = f"{experiment}_{runname}.mat"
+    
+    # 2. Start the search from the experiment directory within the base NAS path
+    search_root = Path(base_nas_path) / experiment
+    print(f"Searching in: {search_root.resolve()}")
+
+    if not search_root.exists():
+        print(f"Error: The base experiment directory '{search_root}' does not exist.")
+        return None
+
+    # 3. Use rglob (recursive glob) to find the file anywhere under the search_root.
+    # The glob pattern '**/' means 'any directory or sub-directory'.
+    # We are looking for the specific filename.
+    try:
+        # Note: rglob returns a generator, so we convert it to a list and take the first item.
+        # Since you stated there should only be one match, this is safe.
+        found_files = list(search_root.rglob(target_filename))
+
+        if found_files:
+            return found_files[0]
+        else:
+            print(f"File not found: {target_filename} for experiment '{experiment}' and runname '{runname}'.")
+            return None
+
+    except PermissionError:
+        print(f"Error: Permission denied while accessing files in {search_root}")
+        return None
+    except Exception as e:
+        print(f"An unexpected error occurred during search: {e}")
+        return None
 
 def analyze_eos_and_cher(data_struct, experiment='', runname='', 
                          EOS2ymin=200, EOS2ymax=None,
@@ -762,11 +812,18 @@ def cropProfmonImg(img, xrange, yrange, plot_flag=False):
 
     # Crop
     cropped_img = img[y_start:y_end, x_start:x_end]
-
+    # --- Modification: Replace NaN values with zero ---
+    cropped_img = np.nan_to_num(cropped_img, nan=0.0)
     # Calculate center of mass for cropped image
     cropped_h, cropped_w = cropped_img.shape
-    x_com_cropped = int(np.round(np.sum(np.arange(cropped_w) * np.sum(cropped_img, axis=0)) / np.sum(cropped_img)))
-    y_com_cropped = int(np.round(np.sum(np.arange(cropped_h) * np.sum(cropped_img, axis=1)) / np.sum(cropped_img)))
+    # If sum is zero, set to center
+    if (np.sum(cropped_img) == 0):
+        x_com_cropped = (x_start+x_end)//2
+        y_com_cropped = (y_start+y_end)//2
+    else:
+        x_com_cropped = int(np.round(np.sum(np.arange(cropped_w) * np.sum(cropped_img, axis=0)) / np.sum(cropped_img)))
+        y_com_cropped = int(np.round(np.sum(np.arange(cropped_h) * np.sum(cropped_img, axis=1)) / np.sum(cropped_img)))
+        
 
     # Shift cropped image to center the COM
     shift_x = (cropped_w // 2) - x_com_cropped
@@ -856,7 +913,7 @@ def plot2DbunchseparationVsCollimatorAndBLEN(bc14BLEN, step_vals, bunchSeparatio
     plt.colorbar(im, label='Bunch Separation [μm]')
 
 def extract_processed_images(data_struct, experiment, xrange=100, yrange=100, hotPixThreshold=1e3, sigma=1, threshold=5, step_list=None,
-                             roi_xrange=None, roi_yrange=None, do_load_raw = False
+                             roi_xrange=None, roi_yrange=None, do_load_raw = False, directory_path = '/nas/nas-li20-pm00/'
                              ):
     """
     Processes DTOTR2 images from HDF5 files, applying module-defined cropping, 
@@ -899,11 +956,11 @@ def extract_processed_images(data_struct, experiment, xrange=100, yrange=100, ho
         if a in steps_to_process:
             raw_path = data_struct.images.DTOTR2.loc[a-1]
             # Search for the expected file name pattern
-            match = re.search(rf'({experiment}_\d+/images/DTOTR2/DTOTR2_data_step\d+\.h5)', raw_path)
+            match = re.search(rf'(images/DTOTR2/DTOTR2_data_step\d+\.h5)', raw_path)
             if not match:
                 raise ValueError(f"Path format invalid or not matched: {raw_path}")
 
-            DTOTR2datalocation = '../../data/raw/' + experiment + '/' + match.group(0)
+            DTOTR2datalocation = str(directory_path) + '/' + match.group(0)
 
             # --- Read and Prepare Data ---
             with h5py.File(DTOTR2datalocation, 'r') as f:
@@ -912,7 +969,11 @@ def extract_processed_images(data_struct, experiment, xrange=100, yrange=100, ho
             # Transpose to shape: (H, W, N) - Height, Width, Shots
             DTOTR2data_step = np.transpose(data_raw, (2, 1, 0))
             # Subtract background (H, W) from all shots (H, W, N)
-            xtcavImages_step = DTOTR2data_step - data_struct.backgrounds.DTOTR2[:,:,np.newaxis].astype(np.float64)
+            try:
+                # If there is background data
+                xtcavImages_step = DTOTR2data_step - data_struct.backgrounds.DTOTR2[:,:,np.newaxis].astype(np.float64)
+            except:
+                xtcavImages_step = DTOTR2data_step
             step_size = DTOTR2data_step.shape[2]
             # --- Process Individual Shots ---
             for idx in tqdm(range(step_size), desc="Processing Shots Step {}, {} samples".format(a, step_size)):
