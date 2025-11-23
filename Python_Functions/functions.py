@@ -812,11 +812,18 @@ def cropProfmonImg(img, xrange, yrange, plot_flag=False):
 
     # Crop
     cropped_img = img[y_start:y_end, x_start:x_end]
-
+    # --- Modification: Replace NaN values with zero ---
+    cropped_img = np.nan_to_num(cropped_img, nan=0.0)
     # Calculate center of mass for cropped image
     cropped_h, cropped_w = cropped_img.shape
-    x_com_cropped = int(np.round(np.sum(np.arange(cropped_w) * np.sum(cropped_img, axis=0)) / np.sum(cropped_img)))
-    y_com_cropped = int(np.round(np.sum(np.arange(cropped_h) * np.sum(cropped_img, axis=1)) / np.sum(cropped_img)))
+    # If sum is zero, set to center
+    if (np.sum(cropped_img) == 0):
+        x_com_cropped = (x_start+x_end)//2
+        y_com_cropped = (y_start+y_end)//2
+    else:
+        x_com_cropped = int(np.round(np.sum(np.arange(cropped_w) * np.sum(cropped_img, axis=0)) / np.sum(cropped_img)))
+        y_com_cropped = int(np.round(np.sum(np.arange(cropped_h) * np.sum(cropped_img, axis=1)) / np.sum(cropped_img)))
+        
 
     # Shift cropped image to center the COM
     shift_x = (cropped_w // 2) - x_com_cropped
@@ -962,7 +969,11 @@ def extract_processed_images(data_struct, experiment, xrange=100, yrange=100, ho
             # Transpose to shape: (H, W, N) - Height, Width, Shots
             DTOTR2data_step = np.transpose(data_raw, (2, 1, 0))
             # Subtract background (H, W) from all shots (H, W, N)
-            xtcavImages_step = DTOTR2data_step - data_struct.backgrounds.DTOTR2[:,:,np.newaxis].astype(np.float64)
+            try:
+                # If there is background data
+                xtcavImages_step = DTOTR2data_step - data_struct.backgrounds.DTOTR2[:,:,np.newaxis].astype(np.float64)
+            except:
+                xtcavImages_step = DTOTR2data_step
             step_size = DTOTR2data_step.shape[2]
             # --- Process Individual Shots ---
             for idx in tqdm(range(step_size), desc="Processing Shots Step {}, {} samples".format(a, step_size)):
