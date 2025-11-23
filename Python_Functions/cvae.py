@@ -6,8 +6,6 @@ import numpy.fft as fft  # Added for FFT calculation
 import matplotlib.pyplot as plt # Added for plotting
 
 # --- Configuration ---
-IMG_SIZE = 200
-LATENT_DIM = 12
 INPUT_CHANNELS = 1 # Assuming LPSimg is grayscale/single-channel data
 
 class CVAE(nn.Module):
@@ -15,7 +13,7 @@ class CVAE(nn.Module):
     Convolutional Variational Autoencoder for 200x200 single-channel images.
     Encodes the input image into a 12-dimensional latent space.
     """
-    def __init__(self, latent_dim=LATENT_DIM):
+    def __init__(self, latent_dim):
         super(CVAE, self).__init__()
         self.latent_dim = latent_dim
         
@@ -152,6 +150,35 @@ def vae_loss(reconstruction, x, mu, logvar):
     # Total loss is the sum of these two components
     return BCE + KL_Divergence
 
+def proj_vae_loss(reconstruction, x, mu, logvar, strength = 0.5):
+    """
+    Linear combination of VAE loss and projection loss.
+    Projection loss is the Binary Cross-Entropy between the X-projections of the original and reconstructed images.
+    """
+    # 1. VAE Loss
+    vae_loss_value = vae_loss(reconstruction, x, mu, logvar)
+    
+    # 2. Projection Loss
+    # Calculate X-projections by summing along axis=2 (height dimension)
+    proj_orig = torch.sum(x, dim=2)  # Shape: (N, C, W)
+    proj_recon = torch.sum(reconstruction, dim=2)  # Shape: (N, C, W)
+    
+    # Normalize proj_orig logarithmically so that each value is between 0 and 1
+    proj_orig = torch.log(proj_orig + 1e-8)  # Add small epsilon to avoid log(0)
+    proj_orig = (proj_orig - proj_orig.min(dim=2, keepdim=True)[0]) / (proj_orig.max(dim=2, keepdim=True)[0] - proj_orig.min(dim=2, keepdim=True)[0] + 1e-8)
+
+    # Similarly normalize proj_recon
+    proj_recon = torch.log(proj_recon + 1e-8)
+    proj_recon = (proj_recon - proj_recon.min(dim=2, keepdim=True)[0]) / (proj_recon.max(dim=2, keepdim=True)[0] - proj_recon.min(dim=2, keepdim=True)[0] + 1e-8)
+
+    # Use Binary Cross-Entropy for projection loss
+    proj_loss = F.binary_cross_entropy_with_logits(proj_recon, proj_orig, reduction='sum')
+    
+    # Total loss is a weighted sum of VAE loss and projection loss
+    total_loss = (1 - strength) * vae_loss_value + strength * proj_loss
+    
+    return total_loss
+
 def apply_fft_and_plot(LPSimg_np):
     """
     Applies 2D FFT to a random sample from the LPSimg numpy array,
@@ -209,14 +236,13 @@ def apply_fft_and_plot(LPSimg_np):
 # --- Example Usage and Dummy Training Loop ---
 
 if __name__ == '__main__':
-    print(f"Initializing VAE with Image Size: {IMG_SIZE}x{IMG_SIZE}, Latent Dim: {LATENT_DIM}")
 
     # 1. Setup Device
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
     # 2. Initialize Model and Optimizer
-    model = CVAE(latent_dim=LATENT_DIM).to(device)
+    model = CVAE(latent_dim=12).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
     
     # 3. Simulate Data (LPSimg)
@@ -226,7 +252,7 @@ if __name__ == '__main__':
     
     # Create dummy data: N_SAMPLES images (200x200) with random values between 0 and 1
     # We simulate data that is already normalized.
-    LPSimg_np = np.random.rand(N_SAMPLES, IMG_SIZE, IMG_SIZE).astype(np.float32)
+    LPSimg_np = np.random.rand(N_SAMPLES, 2*100, 2*100).astype(np.float32)
     
     # --- NEW: Perform FFT Analysis on a Random Sample ---
     # Call the new function before converting to tensor for training
@@ -278,7 +304,7 @@ if __name__ == '__main__':
         z_sample = model.reparameterize(mu_test, logvar_test)
 
     print(f"\nExample Input Data Shape: {sample_data.shape}")
-    print(f"Generated Latent Vector (mu) Shape: {mu_test.shape} (Confirmed {LATENT_DIM} components)")
+    print(f"Generated Latent Vector (mu) Shape: {mu_test.shape} (Confirmed {12} components)")
     print(f"Generated Latent Vector (z_sample):\n{z_sample.cpu().numpy().round(3)}")
 
     # 6. Test Reconstruction
@@ -292,3 +318,48 @@ if __name__ == '__main__':
     # Note: The model is now trained and ready to be used for dimensionality reduction
     # or generation tasks.
     
+def smooth_cvae_output(cvae_output, kernel_size=3, total_charge=None):
+    """
+    Apply a simple smoothing filter to the CVAE output images.
+    
+    Args:
+        cvae_output (torch.Tensor): The output from the CVAE of shape (N, C, H, W).
+        kernel_size (int): The size of the smoothing kernel. Must be odd.
+        total_charge (torch.Tensor, optional): If provided, can be used to normalize the output. Shape (N,).
+        
+    Returns:
+        torch.Tensor: The smoothed CVAE output.
+    """
+
+    # First, using the characteristic of the dataset, remove all values below a certain threshold, which is twice the median of the output
+    threshold = 2 * torch.median(cvae_output)
+    cvae_output = torch.where(cvae_output < threshold, torch.zeros_like(cvae_output), cvae_output)
+
+    padding = kernel_size // 2
+    smoothed_output = F.avg_pool2d(cvae_output, kernel_size=kernel_size, stride=1, padding=padding)
+    if total_charge is not None:
+        N, C, H, W = cvae_output.shape
+        # --- Handle total_charge type: Convert float/int scalar to a batch tensor ---
+        if isinstance(total_charge, (float, int)):
+            # Convert scalar float/int to a 4D tensor (N, 1, 1, 1) to apply the same charge to all batches (N)
+            target_charge = torch.full((N, 1, 1, 1), float(total_charge))
+        elif isinstance(total_charge, torch.Tensor):
+            # If tensor, ensure it has the correct shape for broadcasting (N, 1, 1, 1) or (N, C, 1, 1)
+            if total_charge.dim() == 1:
+                target_charge = total_charge.view(-1, 1, 1, 1)
+            elif total_charge.dim() == 2 and total_charge.shape[1] == 1:
+                target_charge = total_charge.view(-1, 1, 1, 1)
+            else:
+                 # Assume (N, C) or another appropriate shape for charge per channel/batch
+                 target_charge = total_charge.view(N, C, 1, 1) 
+        else:
+            raise TypeError("total_charge must be a float, int, or torch.Tensor.")
+            
+        # Calculate the current total charge of the smoothed output for normalization: (N, C, H, W) -> (N, C, 1, 1)
+        current_total_charge = smoothed_output.sum(dim=[2, 3], keepdim=True) 
+        
+        # Normalize: Multiply by (Target Total Charge / Current Total Charge)
+        # This scales the output such that its sum equals the target_charge.
+        small_epsilon = 1e-6
+        smoothed_output = smoothed_output * (target_charge / (current_total_charge + small_epsilon))
+    return smoothed_output
