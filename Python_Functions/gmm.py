@@ -6,6 +6,15 @@ from scipy.signal import find_peaks
 import matplotlib.pyplot as plt
 
 LOG_CONVERSION_FACTOR=1e3
+"""
+Wrapper class for GMM conversion functions. This provides a consistent interface for converting between images and z parameters across different models.
+"""
+class GMM():
+    def __init__(self, xrange, yrange):
+        self.xrange = xrange
+        self.yrange = yrange
+    def params_to_image(self, params, total_charge):
+        return biGaussian_image_from_flattened_params(params, total_charge, self.xrange, self.yrange)
 class GeometricScaler():
     """
     Scales geometric parameters (means and covariances) by a given range.

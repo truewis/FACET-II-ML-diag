@@ -133,6 +133,15 @@ class CVAE(nn.Module):
         decoded_reshaped = decoded_flat.view(-1, 512, 6, 6)
         reconstruction = self.decoder(decoded_reshaped)
         return reconstruction
+    
+    def params_to_image(self, params, total_charge):
+        """
+        This is a convenience function for directly converting latent vectors to images.
+        Other models have the same interface, so this allows us to use the same code for generating images from latent vectors across different models.
+        """
+        pred_im = self.decode_latent_mu(torch.tensor(params, dtype=torch.float32).to(device))
+        # xrange and yrange are fixed to 100 for the CVAE, since it has convolutional layers that expect a fixed input size of 200x200.
+        return smooth_cvae_output(pred_im, total_charge=total_charge).cpu().detach().numpy().reshape(200, 200)
 
 def vae_loss(reconstruction, x, mu, logvar):
     """

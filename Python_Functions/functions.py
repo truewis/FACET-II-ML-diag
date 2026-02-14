@@ -333,8 +333,10 @@ def analyze_SYAG(data_struct, experiment='', runname='',
                          goosing=False,
                          EOS_cal=17.94e-15,
                          debug=False,
+                         debug_plot_frequency=8,
                          step_selector=None,
-                         min_prom = 2000
+                         min_prom = 2000,
+                         find_FWHM = False
                          ):
     """
     Port of the Claudio Emma's MATLAB EOS/CHER analysis.
@@ -465,8 +467,10 @@ def analyze_SYAG(data_struct, experiment='', runname='',
     SYAGhorzProj = np.zeros((SYAGdata.shape[0], nshots), dtype=float)
 
     dels = np.zeros(nshots, dtype=float)
+    # For analyses without two peaks, store first peak positions for diagnostics
+    first_peaks = np.zeros(nshots, dtype=float)
+    first_peak_fwhms = np.zeros(nshots, dtype=float)
     print("Starting SYAG analysis...")
-    plot_frequency = 80 if not goosing else 81
     if not skipEOSanalysis:
         if goosing:
             rng = range(1, nshots, 2)
@@ -482,7 +486,7 @@ def analyze_SYAG(data_struct, experiment='', runname='',
             # Apply smoothing to projection
             proj = gaussian_filter(proj, sigma=5)
             # Plot projection for debugging
-            if debug and a % plot_frequency == 1:
+            if debug and a % debug_plot_frequency == 1:
                 # Maximum color is twice the median of the shot ROI
                 plt.imshow(shot_roi , cmap='viridis', aspect='auto', vmax=2*np.median(shot_roi))
                 plt.show()
@@ -497,10 +501,29 @@ def analyze_SYAG(data_struct, experiment='', runname='',
             for key in props:
                 props[key] = props[key][valid_peaks_mask]
             # Plot projection and peaks for debugging
-            if debug and a % plot_frequency == 1:
+            if debug and a % debug_plot_frequency == 1:
                 plt.plot(proj)
                 plt.plot(peaks, proj[peaks], "x")
                 plt.show()
+            # The convention of x axis orientation of SYAG screen
+            first_peaks[a] = len(proj) - peaks[0]
+            if find_FWHM:
+                # Find FWHM positions for first peak only for now.
+                peak_height = props['prominences'][0]
+                half_height = peak_height / 2
+                # Smooth the projection for more reliable FWHM finding
+                proj_smoothed = gaussian_filter(proj, sigma=2)
+                # Find left FWHM
+                left_idx = peaks[0]
+                while left_idx > 0 and proj_smoothed[left_idx] > half_height:
+                    left_idx -= 1
+                fwhm_left = left_idx
+                # Find right FWHM
+                right_idx = peaks[0]
+                while right_idx < len(proj) - 1 and proj_smoothed[right_idx] > half_height:
+                    right_idx += 1
+                fwhm_right = right_idx
+                first_peak_fwhms[a] = fwhm_right - fwhm_left
             if peaks.size is not 2:
                 dels[a] = 0.0
                 continue
@@ -589,6 +612,8 @@ def analyze_SYAG(data_struct, experiment='', runname='',
     plt.tight_layout()
 
     return {
+        'first_peak_fwhsm': first_peak_fwhms,
+        'first_peaks': first_peaks,
         'dels': dels,
         'bc14BLEN': bc14BLEN,
         'SYAGhorzProj': SYAGhorzProj,
@@ -661,7 +686,7 @@ def extractDAQBSAScalars(data_struct, step_list=None, filter_index= True):
     isBSA = [name for name in fNames if name.startswith('BSA_List_')]
 
     bsaScalarData = []
-    bsaVarPVs = []
+    bsaVarPVNames = []
 
     for bsaName in isBSA:
         bsaList = dataScalars[bsaName]
@@ -675,15 +700,78 @@ def extractDAQBSAScalars(data_struct, step_list=None, filter_index= True):
             if filter_index:
                 varData = varData[idx]  # apply common index
             varData = np.nan_to_num(varData)  # replace NaN with 0
+            # Dither by a small random value to avoid overfitting.
+            # Suppose by 0.1% of the average value of the variable.
+            avg_val = np.mean(varData)
+            if avg_val != 0:
+                dither_amplitude = 0.001 * abs(avg_val)
+                varData = varData + np.random.uniform(-dither_amplitude, dither_amplitude, size=varData.shape)
             bsaListData.append(varData)
 
         # Add to output arrays
-        bsaVarPVs.extend([vn for vn in varNames if bsaList[vn].size != 0])
+        bsaVarPVNames.extend([vn for vn in varNames if bsaList[vn].size != 0])
         if bsaListData:
             bsaScalarData.extend(bsaListData)
 
     bsaScalarData = np.array(bsaScalarData)
-    return bsaScalarData, bsaVarPVs
+    return bsaScalarData, bsaVarPVNames
+
+def extractDAQNonBSAScalars(data_struct, step_list=None, filter_index= True, debug=False, s20 = True):
+    """
+    Extracts nonBSA scalar data from the provided data structure, filtered with scalar common index, and also with step list if provided.
+    Args:
+        data_struct: Data structure containing scalar information.
+        step_list: List of steps to filter the data. If None, all steps are used. Starts from 1.
+        filter_index: If True, apply common index filtering.
+    """
+    data_struct = matstruct_to_dict(data_struct)
+    dataScalars = data_struct['scalars']
+    if step_list is not None:
+        idx = [i for i in dataScalars['common_index'].astype(int).flatten() - 1
+               if dataScalars['steps'][i] in step_list ]
+    else:
+        idx = dataScalars['common_index'].astype(int).flatten() - 1
+
+    fNames = list(dataScalars.keys())
+    if s20:
+        isBSA = [name for name in fNames if name.startswith('nonBSA_List_S20')]
+    else:
+        isBSA = [name for name in fNames if name.startswith('nonBSA_List_')]
+
+    nonBsaScalarData = []
+    nonBsaVarPVNames = []
+
+    for nonbsaListName in isBSA:
+        bsaList = dataScalars[nonbsaListName]
+        varNames = list(bsaList.keys())
+        bsaListData = []
+
+        for varName in varNames:
+            varData = np.array(bsaList[varName]).squeeze()
+            if varData.size == 0:
+                continue
+            if filter_index:
+                varData = varData[idx]  # apply common index
+            varData = np.nan_to_num(varData)  # replace NaN with 0
+            bsaListData.append(varData)
+
+        # Add to output arrays
+        nonBsaVarPVNames.extend([vn for vn in varNames if bsaList[vn].size != 0])
+        if bsaListData:
+            nonBsaScalarData.extend(bsaListData)
+    # nonBsaScalarData shape must be (N_vars, N_samples), but it could be inhomogeneous if some lists are empty.
+    # print the shape of each variable data for debugging
+    if debug:
+        for i, varData in enumerate(nonBsaScalarData):
+            print(f"NonBSA variable {nonBsaVarPVNames[i]} has shape {varData.shape}")
+            if varData.ndim != 1:
+                print(f"Warning: NonBSA variable {nonBsaVarPVNames[i]} is not 1D.")
+        # print the total number of variables and samples
+        print(f"Total NonBSA variables: {len(nonBsaVarPVNames)}")
+        print(nonBsaScalarData)
+    nonBsaScalarData = np.array(nonBsaScalarData)
+    return nonBsaScalarData, nonBsaVarPVNames
+
 def exclude_bsa_vars(bsaVars):
     """
     Identify indices of BSA variables to exclude based on predefined names and numeric patterns.
@@ -705,6 +793,10 @@ def exclude_bsa_vars(bsaVars):
             number = int(match.group(1))
             if number >= 3100:
                 exclude_bsa_vars.append(var)
+        
+        # skip variables starting with 'SIOC', as they are unphysical
+        if var.startswith('SIOC'):
+            exclude_bsa_vars.append(var)
 
     print("Excluding BSA Variables:", exclude_bsa_vars)
     excluded_var_idx = [i for i, var in enumerate(bsaVars) if var in exclude_bsa_vars]
@@ -945,8 +1037,6 @@ def extract_processed_images(data_struct, experiment, xrange=100, yrange=100, ho
         tuple: A tuple containing the processed image arrays:
                (xtcavImages, xtcavImages_raw, horz_proj, LPSImage)
     """
-    xtcavImages_list = []
-    xtcavImages_list_raw = []
     LPSImage = []
     stepsAll = data_struct.params.stepsAll
     step_size = None
@@ -955,7 +1045,12 @@ def extract_processed_images(data_struct, experiment, xrange=100, yrange=100, ho
     if stepsAll is None or len(np.atleast_1d(stepsAll)) == 0:
         stepsAll = [1]
     steps_to_process = stepsAll if step_list is None else [s for s in stepsAll if s in step_list]
+    images_each_step = []
+    images_raw_each_step = []
+    pid_list_each_step = []
     for a in range(1, np.max(steps_to_process)+1):
+        xtcavImages_list = []
+        xtcavImages_list_raw = []
         # --- Determine File Path ---
         if a in steps_to_process:
             raw_path = data_struct.images.DTOTR2.loc[a-1]
@@ -969,6 +1064,7 @@ def extract_processed_images(data_struct, experiment, xrange=100, yrange=100, ho
             # --- Read and Prepare Data ---
             with h5py.File(DTOTR2datalocation, 'r') as f:
                 data_raw = f['entry']['data']['data'][:].astype(np.float64) # shape: (N, H, W)
+                pid_list = f["entry/instrument/NDAttributes/NDArrayUniqueId"][:].astype(np.int64)  # shape: (N,)
             
             # Transpose to shape: (H, W, N) - Height, Width, Shots
             DTOTR2data_step = np.transpose(data_raw, (2, 1, 0))
@@ -1017,39 +1113,40 @@ def extract_processed_images(data_struct, experiment, xrange=100, yrange=100, ho
                 image_ravel = processed_image.ravel()
                 xtcavImages_list.append(processed_image)
                 LPSImage.append([image_ravel]) 
+            images_each_step.append(xtcavImages_list)
+            pid_list_each_step.append(pid_list)
+            if do_load_raw:
+                images_raw_each_step.append(xtcavImages_list_raw)
         else:
             print(f"Skipping step {a} as it's not in steps_to_process.")
-
-    # --- Concatenate Results ---
-    xtcavImages = np.concatenate(xtcavImages_list, axis=2)
-    del xtcavImages_list  # Free memory
-    if do_load_raw:
-        xtcavImages_raw = np.concatenate(xtcavImages_list_raw, axis=2)
-        del xtcavImages_list_raw  # Free memory
-    LPSImage = np.concatenate(LPSImage, axis = 0)
-
-    print("Processed XTCAV Images shape:", xtcavImages.shape)
-
+            images_each_step.append([])
+            pid_list_each_step.append([])
+            if do_load_raw:
+                images_raw_each_step.append([])
     # --- Apply Common Indexing ---
     print("StepsToProcess:"+str(steps_to_process))
-    def steps_skipped_before(i):
-        current_step = data_struct.scalars.steps[data_struct.scalars.common_index[i]]
-        # Count how many steps less than current_step are not in steps_to_process
-        return sum(1 for s in stepsAll if s < current_step and s not in steps_to_process)
-    for i in range(len(data_struct.images.DTOTR2.common_index)):
-        if data_struct.scalars.steps[data_struct.scalars.common_index[i]] in steps_to_process:
-            print("Including common index {} where i is {}, step {}, steps skipped before: {}".format(data_struct.images.DTOTR2.common_index[i], i, data_struct.scalars.steps[data_struct.scalars.common_index[i]], steps_skipped_before(i)))
-    image_common_index = [data_struct.images.DTOTR2.common_index[i] - 1 - steps_skipped_before(i) * step_size for i in range(len(data_struct.images.DTOTR2.common_index)) if data_struct.scalars.steps[data_struct.scalars.common_index[i]] in steps_to_process]
-    xtcavImages = xtcavImages[:, :, image_common_index]
+    xtcavImages = []
+    xtcavImages_raw = []
+    for step in steps_to_process:
+        #Find data_struct.scalars.steps row numbers that correspond to this step
+        row_indices = [i for i, ci in enumerate(data_struct.scalars.common_index) if data_struct.scalars.steps[ci-1] == step]
+        # Now find the image common indices that correspond to these row indices
+        print(row_indices)
+        img_common_indices = data_struct.images.DTOTR2.common_index[row_indices] - 1  # Convert to zero-based
+        img_hdf5_pids = data_struct.images.DTOTR2.pid[img_common_indices]
+        print(img_hdf5_pids)
+        # reconstruct hdf5 indices by matching pids
+        print(pid_list_each_step[step-1])
+        img_hdf5_indices = [np.where(pid_list_each_step[step-1] == pid)[0][0] for pid in img_hdf5_pids]
+        print(img_hdf5_indices)
+        for i in img_hdf5_indices:
+            xtcavImages.append(images_each_step[step-1][i])
+            if do_load_raw:
+                xtcavImages_raw.append(images_raw_each_step[step-1][i])
     if do_load_raw:
-        xtcavImages_raw = xtcavImages_raw[:, :, image_common_index]
-    # Final Arrays
-    LPSImage = LPSImage[image_common_index,:] 
-    # This way, xtcavImages[some_common_index] corresponds to the shot with that common index.
-    if do_load_raw:
-        return xtcavImages, xtcavImages_raw, None, LPSImage
+        return np.array(xtcavImages)[:,:,:,0].transpose(1,2,0), np.array(xtcavImages_raw)[:,:,:,0].transpose(1,2,0), None, None
     else:
-        return xtcavImages, None, None, LPSImage
+        return np.array(xtcavImages)[:,:,:,0].transpose(1,2,0), None, None, None
 
 def construct_centroid_function(images, off_idx, smoothing_window_size=5, max_degree=1):
     """
