@@ -26,6 +26,11 @@ class GeometricScaler():
     def __init__(self, xrange, yrange):
         self.xrange = xrange
         self.yrange = yrange
+        
+    # Wrapper function because GeometricScaler does not fit anything.    
+    def transform(self, flat_params):
+        return self.fit_transform(flat_params)
+        
     def fit_transform(self, flat_params):
         pi = flat_params[:,:2]
         mu = flat_params[:,2:4]
