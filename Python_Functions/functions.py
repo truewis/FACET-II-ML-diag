@@ -528,53 +528,6 @@ def analyze_SYAG(data_struct, experiment='', runname='',
                 dels[a] = 0.0
                 continue
             # Centroid analysis is optional.
-            # dip_index = np.argmin(proj[peaks[0]:peaks[1]]) + peaks[0]
-            # #print(f"Shot {a}: Found dip at pixel {peaks[0]} with prominence {props['prominences'][0]}") 
-            # # peak_sep_pix is full width half max of the dip.
-            # # The 'height' of the dip is given by the prominence of the peak in -proj
-            # prom = props['prominences']
-            # # find left and right bases for FWHM
-            # left_bases = props['left_bases']
-            # right_bases = props['right_bases']
-            # # tread the slope from left to right to find FWHM positions
-            # def find_fwhm_binary_search(func, start_idx, end_idx, half_height, search_left):
-            #     while start_idx < end_idx:
-            #         mid_idx = (start_idx + end_idx) // 2
-            #         if not search_left:
-            #             if func[mid_idx] < half_height:
-            #                 end_idx = mid_idx
-            #             else:
-            #                 start_idx = mid_idx + 1
-            #         else:
-            #             if func[mid_idx] < half_height:
-            #                 start_idx = mid_idx + 1
-            #             else:
-            #                 end_idx = mid_idx
-            #     return start_idx
-            # fwhm_left_0 = find_fwhm_binary_search(proj-proj[left_bases[0]], left_bases[0], peaks[0] , prom[0]/2, search_left=True)
-            # fwhm_right_0 = find_fwhm_binary_search(proj-proj[dip_index], peaks[0], dip_index , prom[0]/2, search_left=False)
-
-            # #Flip the projection and tread the slope from right to left to find FWHM positions.
-            # #This works but is a bit hacky.
-            # fwhm_left_1 = find_fwhm_binary_search(proj-proj[dip_index], dip_index, peaks[1] , prom[1]/2, search_left=True)
-            # fwhm_right_1 = find_fwhm_binary_search(proj-proj[right_bases[1]], peaks[1], right_bases[1] , prom[1]/2, search_left=False)
-            # # Plot projection and cliffs for debugging
-            # if debug and a % plot_frequency == 1:
-            #     plt.plot(proj)
-            #     plt.axvline(fwhm_left_0, color='r')
-            #     plt.axvline(fwhm_right_0, color='r')
-            #     plt.axvline(fwhm_left_1, color='g')
-            #     plt.axvline(fwhm_right_1, color='g')
-            #     # dip position
-            #     plt.axvline(dip_index, color='k')
-            #     plt.show()
-            # # Transpose horizontal projection by first cliff position.
-            # SYAGhorzProj[:, a] = np.roll(SYAGhorzProj[:, a], -int(fwhm_left_0))
-            # # centroids are center of mass of each peak FWHM region
-            # centroid_0 = np.sum(np.arange(fwhm_left_0, fwhm_right_0) * proj[fwhm_left_0:fwhm_right_0]) / np.sum(proj[fwhm_left_0:fwhm_right_0])
-            # centroid_1 = np.sum(np.arange(fwhm_left_1, fwhm_right_1) * proj[fwhm_left_1:fwhm_right_1]) / np.sum(proj[fwhm_left_1:fwhm_right_1])
-            # print(f"Shot {a}: Centroid positions {centroid_0}, {centroid_1}")
-            # centroid_sep_pix = np.abs(centroid_0 - centroid_1)
             # Alternative: simply use peak positions
             centroid_sep_pix = abs(int(peaks[0]) - int(peaks[1]))
             dels[a] = centroid_sep_pix
@@ -1295,10 +1248,20 @@ def get_image_angle_from_line_fit(image):
     # We'll rotate by -angle_deg.
     return angle_deg
 def apply_centroid_correction(xtcavImages, off_idx, steps_if_stepwise=None, do_rotate=False):
+    
     """
     Applies centroid correction or rigid rotation to a set of XTCAV images.
-    
-    (Docstring truncated for brevity)
+
+    Args:
+        xtcavImages (np.ndarray): 3D array of shape (H, W, N) containing XTCAV images.
+        off_idx (list or np.ndarray): Indices of images to use for correction/rotation.
+        steps_if_stepwise (list or np.ndarray, optional): Step number of each image for stepwise correction. Defaults to None.
+                                                          When None, the same correction, inferred from all 'off_idx' images, is applied to all images regardless of step.
+        do_rotate (bool): If True, performs **rigid rotation** instead of centroid correction.
+                          It calculates the average rotation angle from 'off_idx' images and applies it to all images.
+
+    Returns:
+        tuple: Corrected/Rotated xtcavImages, None (horz_proj), flattened LPSImage, and the corrections applied (shift array or rotation angle).
     """
     N_shots = xtcavImages.shape[2]
     Nrows = xtcavImages.shape[0]
@@ -1406,8 +1369,12 @@ def apply_centroid_correction(xtcavImages, off_idx, steps_if_stepwise=None, do_r
                 corrected_image = np.zeros_like(processed_image)
                 for row in range(Nrows):
                     shift = int(centroid_corrections[row]) # Ensure shift is integer for np.roll
+                    # Instead of rolling, fill
                     corrected_image[row, :] = np.roll(processed_image[row, :], shift)
-
+                    if shift > 0:
+                        corrected_image[row, :shift] = 0  # Fill the beginning with zeros
+                    elif shift < 0:
+                        corrected_image[row, shift:] = 0  # Fill the end with zeros
                 corrected_image = corrected_image[:, :, np.newaxis]
                 image_ravel = corrected_image.ravel()
 
@@ -1495,181 +1462,4 @@ def apply_centroid_correction(xtcavImages, off_idx, steps_if_stepwise=None, do_r
         xtcavImages_ret = xtcavImages
         LPSImage = None # Need actual flattened LPS
         
-    return xtcavImages_ret, None, LPSImage, correction_return_value
-    """
-    Applies centroid correction or rigid rotation to a set of XTCAV images.
-
-    Args:
-        xtcavImages (np.ndarray): 3D array of shape (H, W, N) containing XTCAV images.
-        off_idx (list or np.ndarray): Indices of images to use for correction/rotation.
-        steps_if_stepwise (list or np.ndarray, optional): Step number of each image for stepwise correction. Defaults to None.
-                                                          When None, the same correction, inferred from all 'off_idx' images, is applied to all images regardless of step.
-        do_rotate (bool): If True, performs **rigid rotation** instead of centroid correction.
-                          It calculates the average rotation angle from 'off_idx' images and applies it to all images.
-
-    Returns:
-        tuple: Corrected/Rotated xtcavImages, None (horz_proj), flattened LPSImage, and the corrections applied (shift array or rotation angle).
-    """
-
-    N_shots = xtcavImages.shape[2]
-    Nrows = xtcavImages.shape[0]
-    xtcavImages_list_new = []
-    LPSImage_new = []
-    
-    # --- 1. ROTATION MODE ---
-    if do_rotate:
-        print("--- Entering Rigid Rotation Mode ---")
-        rotation_angles = []
-
-        # 1a. Calculate the rotation angle for each OFF image
-        for idx in off_idx:
-            # Fit a line to the feature in the OFF image and get its angle
-            angle = get_image_angle_from_line_fit(xtcavImages[:, :, idx])
-            rotation_angles.append(angle)
-
-        # 1b. Calculate the average rotation angle
-        if not rotation_angles:
-            print("Warning: No valid off_idx images found for rotation angle calculation. Using 0 degrees.")
-            avg_angle = 0.0
-        else:
-            avg_angle = np.mean(rotation_angles)
-        
-        # The angle to rotate by is the negative of the feature's angle to make it vertical
-        correction_angle = -avg_angle
-        print(f"Calculated average rotation angle from OFF images: {avg_angle:.2f} deg.")
-        print(f"Applying correction rotation of: {correction_angle:.2f} deg.")
-        
-        # Store the correction angle for the return value
-        correction_return_value = np.array([correction_angle]) # A single value for all shots
-
-        # 1c. Apply the rotation to ALL images (on and off)
-        for idx in range(N_shots):
-            processed_image = xtcavImages[:, :, idx]
-
-            # Use scipy.ndimage.rotate for rotation with interpolation
-            # order=3 is cubic interpolation, reshape=False preserves the shape
-            rotated_image = rotate(
-                processed_image,
-                angle=correction_angle,
-                reshape=False,
-                order=3, # Cubic interpolation
-                mode='constant',
-                cval=0.0
-            )
-
-            # Reshape rotated_image for concatenation
-            rotated_image = rotated_image[:, :, np.newaxis] # Reshape to (H, W, 1)
-
-            # --- Prepare LPS Image (flattened) ---
-            image_ravel = rotated_image.ravel()
-
-            # --- Combine results into lists ---
-            xtcavImages_list_new.append(rotated_image)
-            LPSImage_new.append([image_ravel])
-            
-        print("Completed rigid rotation for all images.")
-
-    # --- 2. CENTROID CORRECTION MODE (Original Logic) ---
-    else:
-        print("--- Entering Centroid Correction Mode ---")
-        
-        if steps_if_stepwise is None:
-            # Non-stepwise correction
-            centroid_corrections = construct_centroid_function(xtcavImages, off_idx)
-            
-            # Iterate over all shots
-            for idx in range(N_shots):
-                processed_image = xtcavImages[:, :, idx]
-                corrected_image = np.zeros_like(processed_image)
-                for row in range(Nrows):
-                    shift = int(centroid_corrections[row]) # Ensure shift is integer for np.roll
-                    corrected_image[row, :] = np.roll(processed_image[row, :], shift)
-
-                corrected_image = corrected_image[:, :, np.newaxis]
-                image_ravel = corrected_image.ravel()
-
-                xtcavImages_list_new.append(corrected_image)
-                LPSImage_new.append([image_ravel])
-                
-            # Prepare return value for non-stepwise mode
-            correction_return_value = np.tile(centroid_corrections[:, np.newaxis], (1, N_shots)).T
-
-        else:
-            # Stepwise correction
-            unique_steps = np.unique(steps_if_stepwise)
-            all_corrections = {} # Store corrections by index
-            
-            for step in unique_steps:
-                # Find the indices corresponding to this step that are also 'off_idx'
-                step_off_indices = [i for i in off_idx if steps_if_stepwise[i] == step]
-                
-                # Construct centroid function for this step
-                centroid_corrections_step = construct_centroid_function(xtcavImages, step_off_indices)
-                
-                # Apply correction for all shots belonging to this step
-                for idx in range(N_shots):
-                    if steps_if_stepwise[idx] == step:
-                        processed_image = xtcavImages[:, :, idx]
-                        corrected_image = np.zeros_like(processed_image)
-                        
-                        for row in range(Nrows):
-                            shift = int(centroid_corrections_step[row]) # Ensure shift is integer
-                            corrected_image[row, :] = np.roll(processed_image[row, :], shift)
-
-                        corrected_image = corrected_image[:, :, np.newaxis]
-                        image_ravel = corrected_image.ravel()
-
-                        xtcavImages_list_new.append(corrected_image)
-                        LPSImage_new.append([image_ravel])
-                        all_corrections[idx] = centroid_corrections_step
-
-            # Sort the results by the original shot index (since stepwise iteration is out of order)
-            # This is necessary because the lists were appended out of order.
-            
-            # 1. Create a list of tuples: (original_index, corrected_image, LPSImage_ravel)
-            # This requires a more complex structure, as the original loop order is lost in the provided snippet.
-            # A common fix is to ensure the loop over N_shots is the primary one.
-            
-            # --- RE-IMPLEMENTATION FOR STEPWISE TO PRESERVE ORDER ---
-            # Instead of appending in the inner loop, store by index and then reorder.
-            
-            # Since the original stepwise logic iterates over steps and then all shots,
-            # we need to rebuild the lists in the correct (0 to N_shots-1) order.
-            
-            xtcavImages_ordered = [None] * N_shots
-            LPSImage_ordered = [None] * N_shots
-            corrections_ordered = [None] * N_shots
-            
-            for step in unique_steps:
-                step_off_indices = [i for i in off_idx if steps_if_stepwise[i] == step]
-                centroid_corrections_step = construct_centroid_function(xtcavImages, step_off_indices)
-                
-                for idx in range(N_shots):
-                    if steps_if_stepwise[idx] == step:
-                        processed_image = xtcavImages[:, :, idx]
-                        corrected_image = np.zeros_like(processed_image)
-                        
-                        for row in range(Nrows):
-                            shift = int(centroid_corrections_step[row])
-                            corrected_image[row, :] = np.roll(processed_image[row, :], shift)
-
-                        # Store in the correct index
-                        xtcavImages_ordered[idx] = corrected_image[:, :, np.newaxis]
-                        LPSImage_ordered[idx] = [corrected_image.ravel()]
-                        corrections_ordered[idx] = centroid_corrections_step
-                        
-            xtcavImages_list_new = xtcavImages_ordered
-            LPSImage_new = LPSImage_ordered
-            correction_return_value = np.array(corrections_ordered) # Already in (N_shots, H) shape
-
-    # --- 3. FINAL CONCATENATION AND RETURN ---
-    
-    # Only concatenate if the lists are populated (which they should be)
-    if xtcavImages_list_new and LPSImage_new:
-        xtcavImages_ret = np.concatenate(xtcavImages_list_new, axis=2)
-        LPSImage = np.concatenate(LPSImage_new, axis=0)
-    else:
-        # Should only happen if N_shots=0
-        return xtcavImages, None, None, np.array([])
-    
     return xtcavImages_ret, None, LPSImage, correction_return_value
