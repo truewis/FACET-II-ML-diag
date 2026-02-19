@@ -1006,13 +1006,8 @@ def extract_processed_images(data_struct, experiment, xrange=100, yrange=100, ho
         xtcavImages_list_raw = []
         # --- Determine File Path ---
         if a in steps_to_process:
-            raw_path = data_struct.images.DTOTR2.loc[a-1]
-            # Search for the expected file name pattern
-            match = re.search(rf'(images/DTOTR2/DTOTR2_data_step\d+\.h5)', raw_path)
-            if not match:
-                raise ValueError(f"Path format invalid or not matched: {raw_path}")
-
-            DTOTR2datalocation = str(directory_path) + '/' + match.group(0)
+            width = 2
+            DTOTR2datalocation = str(directory_path) + '/' + f'images/DTOTR2/DTOTR2_data_step{a:0{width}d}.h5'
 
             # --- Read and Prepare Data ---
             with h5py.File(DTOTR2datalocation, 'r') as f:
