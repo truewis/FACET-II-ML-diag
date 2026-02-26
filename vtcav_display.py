@@ -254,7 +254,7 @@ class VTCAVDisplay(Display):
     def __init__(self, parent=None, args=None):
         super().__init__(parent=parent, args=args)
         
-        self.model_folder = "./models/"
+        self.model_folder = Path(__file__).parent / "models"
         self.current_model_path = ""
         self.worker = None
         self.predictors = None
@@ -282,7 +282,7 @@ class VTCAVDisplay(Display):
             self.handle_log(f"Warning: Model directory {self.model_folder} does not exist.")
 
     def setup_daq_ui(self):
-        """This function is useless for now."""
+        """This function is useless now."""
         if os.path.exists(DAQPATH):
             try:
                 pass
@@ -614,37 +614,49 @@ class VTCAVDisplay(Display):
         """
         # Open File Dialog starting at a default processed data path if available
         # We'll use DAQPATH as a base or current directory
-        file_path, _ = QFileDialog.getOpenFileName(
+        # Use getOpenFileNames (plural) to allow multiple selections
+        file_paths, _ = QFileDialog.getOpenFileNames(
             self, 
-            "Select Preprocessed Data File", 
+            "Select Preprocessed Data Files", 
             ".", 
             "Pickle Files (*.pkl)"
         )
 
-        if file_path:
+        if file_paths:  # file_paths is now a list of strings
+            # Join the paths into a single string separated by spaces
+            joined_paths = " ".join(file_paths)
+            
             # Update the UI LineEdit
             if hasattr(self.ui, 'preprocessFilePath'):
-                self.ui.preprocessFilePath.setText(file_path)
+                self.ui.preprocessFilePath.setText(joined_paths)
             
-            print(f"Selected preprocessed file: {file_path}")
+            print(f"Selected preprocessed files: {joined_paths}")
 
     def handle_model_train_write(self):
         """
         Triggers the model training/aggregation process.
         """
         
-        # 1. Get Input Path
-        preprocess_path = self.ui.preprocessFilePath.text()
-        if not preprocess_path:
-            print("Error: No preprocessed file selected.")
+        # 1. Get Input Path(s) from the text box
+        preprocess_path_string = self.ui.preprocessFilePath.text()
+        
+        # Check if it's empty or just whitespace
+        if not preprocess_path_string.strip():
+            print("Error: No preprocessed file(s) selected.")
             return    
         
-        # 3. Get Save Path
-        preprocess_path_obj = pathlib.Path(preprocess_path)
+        # Split the space-separated string back into a list of file paths
+        preprocess_paths = preprocess_path_string.split()
+        
+        # 2. Get Save Path
+        # Use the first file in the list to suggest a default save name
+        first_path_obj = pathlib.Path(preprocess_paths[0])
+        default_save_name = f"./models/{first_path_obj.name.replace('.pkl', '_model_data.pkl')}"
+        
         output_file_path, _ = QFileDialog.getSaveFileName(
             self,
             "Save Model Training Data",
-            "./models/"+preprocess_path_obj.name.replace(".pkl", "_model_data.pkl"),
+            default_save_name,
             "Pickle Files (*.pkl)"
         )
 
@@ -653,18 +665,21 @@ class VTCAVDisplay(Display):
             
         self.ui.modelWritePath.setText(output_file_path)
         
-        print("Preparing data and saving...")
-        
+        print(f"Preparing data from {len(preprocess_paths)} file(s) and saving...")
         # Define architecture constants 
         NCOMP = 16 # Example default
 
+        # 3. Train Model
+        # Pass the list of paths directly to run_pairs
         self.train_model_cvae_rf(
-            run_pairs=[preprocess_path],
+            run_pairs=preprocess_paths,
             n_comp=NCOMP,
             output_file_path=output_file_path
         )
         print("Model data written successfully.")
-        self.setup_model_ui() # This allows the user to load the new model immediately.
+        
+        # Refresh the UI dropdown so the new model is available
+        self.setup_model_ui() 
             
     @Slot()
     def load_selected_model(self):
