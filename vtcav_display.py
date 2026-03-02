@@ -25,6 +25,7 @@ from qtpy.QtWidgets import QMessageBox, QFileDialog, QTableWidgetItem
 from pydm import Display
 import pyqtgraph as pg
 
+
 # Constants for FACET-II/BSA Timing
 PID_MASK = 0x1FFFF  
 PID_MODULUS = 0x20000 
@@ -254,7 +255,7 @@ class VTCAVDisplay(Display):
     def __init__(self, parent=None, args=None):
         super().__init__(parent=parent, args=args)
         
-        self.model_folder = Path(__file__).parent / "models"
+        self.model_folder = pathlib.Path(__file__).parent / "models"
         self.current_model_path = ""
         self.worker = None
         self.predictors = None
@@ -301,7 +302,8 @@ class VTCAVDisplay(Display):
         # DAQ Shot Navigation: nextShotButton, prevShotButton, shotNumberSlider
         self.ui.nextShotButton.clicked.connect(self.daqNextShot)
         self.ui.prevShotButton.clicked.connect(self.daqPrevShot)
-        self.ui.shotNumberSlider.valueChanged.connect(self.emit_daq_image) # Reload data when shot number changes
+        self.ui.shotNumberSlider.valueChanged.connect(lambda idx: self.emit_daq_image(index = idx, display_name='DAQ')) # Reload data when shot number changes
+        self.ui.shotNumberSlider.valueChanged.connect(lambda idx: self.ui.shotNumber.setText(str(idx)+" / "+str(self.ui.shotNumberSlider.maximum())))
         # Control
         self.ui.startPauseButton.clicked.connect(self.toggle_acquisition)
 
@@ -320,6 +322,67 @@ class VTCAVDisplay(Display):
 
         # Tab 5: Train New Model - Train & Write Model File
         self.ui.modelWriteButton.clicked.connect(self.handle_model_train_write)
+
+        """Connects the UI elements for the Compare tab."""
+        # Connect buttons
+        self.ui.prevShotButton_cmp.clicked.connect(self.prev_compare_image)
+        self.ui.nextShotButton_cmp.clicked.connect(self.next_compare_image)
+        
+        # Connect slider (triggers when user drags or clicks)
+        self.ui.shotNumberSlider_cmp.valueChanged.connect(self.on_compare_slider_change)
+        self.ui.shotNumberSlider_cmp.valueChanged.connect(lambda idx: self.ui.shotNumber_cmp.setText(str(idx)+" / "+str(self.ui.shotNumberSlider_cmp.maximum())))
+        self.ui.preprocessLoadButton_cmp.clicked.connect(self.handle_preprocess_load_cmp)
+        
+        # Initialize state variables
+        self.compare_truth_data = None # Will hold preprocessed images
+        
+    def load_compare_data(self, filepath):
+        """Loads truth and DAQ data, then initializes the displays."""
+        try:
+            with open(filepath, 'rb') as f:
+                data = pickle.load(f)
+                
+            # ASSUMPTION: Your pickle file contains a dict or tuple with truth and DAQ data.
+            # Adjust these keys based on your actual data structure.
+            self.compare_truth_data = data['LPSImage'].transpose(2, 0, 1)
+            self.goodShots_scal_common_index_cmp = data['scalarCommonIndex']
+            self.load_daq_data(data['daqPath'])     
+            
+            # Configure slider based on data length
+            num_frames = len(self.compare_truth_data)
+            self.ui.shotNumberSlider_cmp.setMinimum(0)
+            self.ui.shotNumberSlider_cmp.setMaximum(num_frames - 1)
+            self.ui.shotNumberSlider_cmp.setValue(0)
+            
+            # Update UI to show the first frame
+            self.on_compare_slider_change(0)
+            
+        except Exception as e:
+            print(f"Error loading compare data: {e}")
+
+    def prev_compare_image(self):
+        current_val = self.ui.shotNumberSlider_cmp.value()
+        if current_val > 0:
+            self.ui.shotNumberSlider_cmp.setValue(current_val - 1)
+
+    def next_compare_image(self):
+        current_val = self.ui.shotNumberSlider_cmp.value()
+        if current_val < self.ui.shotNumberSlider_cmp.maximum():
+            self.ui.shotNumberSlider_cmp.setValue(current_val + 1)
+
+    def on_compare_slider_change(self, index):
+        """Updates cmp_truth directly and requests a prediction for cmp_pred."""
+        
+        
+        # 1. Update Truth Display immediately
+        truth_image = self.compare_truth_data[index]
+        self.update_image_display(truth_image, 'cmp_truth')
+        
+        # 2. Trigger Prediction
+        self.emit_daq_image(self.goodShots_scal_common_index_cmp[index], 'cmp_pred')
+        self.ui.shotNumberCI_cmp.setText(f"Shot#:{self.goodShots_scal_common_index_cmp[index]}")
+    
+
     @Slot()
     def daqNextShot(self):
         # increase the shot slider by 1, ensuring it doesn't exceed max
@@ -336,14 +399,12 @@ class VTCAVDisplay(Display):
             self.ui.shotNumberSlider.setValue(current_value - 1)
     
     @Slot()
-    def emit_daq_image(self):
+    def emit_daq_image(self, index, display_name):
         # This function will be called when the shot number slider changes.
         # It should load the corresponding shot data and emit it to the image display.
         if self.predictors is None or self.predictor_vars is None:
             # No data loaded yet
             return
-        index = self.ui.shotNumberSlider.value()
-        self.ui.shotNumber.setText(str(index)+" / "+str(self.ui.shotNumberSlider.maximum()))
         # Find total charge for this shot by looking up for TORO:LI20:2452:TMIT in predictor_vars
         total_charge = self.predictors[index, self.predictor_vars.index(CHARGE_PV_C)] if CHARGE_PV_C in self.predictor_vars else None
         # Filter predictors by variable names, given in self.worker.var_names, to ensure correct ordering and selection
@@ -363,6 +424,14 @@ class VTCAVDisplay(Display):
         # Array contains a single sample, hence reshape.
         filtered_predictor = self.predictors[index, var_indices].reshape(1, -1)
         scaled_predictor = self.worker.x_scaler.transform(filtered_predictor)
+
+        try:
+            self.worker.new_prediction_signal.disconnect()
+        except Exception:
+            pass
+        self.worker.new_prediction_signal.connect(
+            lambda data: self.update_image_display(data, display_name)
+        )
         self.worker.emit_prediction(scaled_predictor, total_charge)
         self.update_pv_values(filtered_predictor[0], np.array(self.worker.is_pv_bypassed))
 
@@ -392,6 +461,7 @@ class VTCAVDisplay(Display):
             
             # Call the loading function
             self.load_daq_data(file_path)
+            
     def load_daq_data(self, full_path):
         # First, pause the real-time acquisition if it's running to avoid conflicts
         if self.worker and self.worker.isRunning():
@@ -549,7 +619,7 @@ class VTCAVDisplay(Display):
             
             self.ui.yroiMin.setPlainText(str(0))
             self.ui.yroiMax.setPlainText(str(dims[0]))
-            self.update_image_display(np.average(xtcavImages_raw, axis = 2))
+            self.update_image_display(np.average(xtcavImages_raw, axis = 2), display_name='Prep')
             
         except Exception as e:
             print(f"Error initializing data from {file_path}: {e}")
@@ -631,7 +701,28 @@ class VTCAVDisplay(Display):
                 self.ui.preprocessFilePath.setText(joined_paths)
             
             print(f"Selected preprocessed files: {joined_paths}")
+    def handle_preprocess_load_cmp(self):
+        """
+        Opens a file dialog to select a preprocessed pickle file.
+        Updates the UI to show the selected file path.
+        """
+        # Open File Dialog starting at a default processed data path if available
+        # We'll use DAQPATH as a base or current directory
+        # Use getOpenFileNames (plural) to allow multiple selections
+        file_path, _ = QFileDialog.getOpenFileName(
+            self, 
+            "Select Preprocessed Data File", 
+            ".", 
+            "Pickle Files (*.pkl)"
+        )
 
+        if file_path: 
+            # Update the UI LineEdit
+            if hasattr(self.ui, 'preprocessFilePath_cmp'):
+                self.ui.preprocessFilePath_cmp.setText(file_path)
+            
+            print(f"Selected preprocessed file: {file_path}")
+        self.load_compare_data(file_path)
     def handle_model_train_write(self):
         """
         Triggers the model training/aggregation process.
@@ -694,7 +785,10 @@ class VTCAVDisplay(Display):
         if self.worker is not None:
             self.handle_log("Cleaning up previous worker...")
             self.worker.stop()
-            self.worker.new_prediction_signal.disconnect()
+            try:
+                self.worker.new_prediction_signal.disconnect()
+            except Exception:
+                pass
             self.worker.new_pv_values.disconnect()
             # Ensure the start button is reset
             self.ui.startPauseButton.setText("Start")
@@ -706,7 +800,6 @@ class VTCAVDisplay(Display):
             # 2. Instantiate worker immediately (this triggers load_model_resources)
             self.worker = InferenceWorker(self.current_model_path)
             # 3. Connect signals
-            self.worker.new_prediction_signal.connect(self.update_image_display)
             self.worker.new_pv_values.connect(self.update_pv_values)
             # Re-enable this if you uncomment the emit in InferenceWorker
             # self.worker.new_log_signal.connect(self.handle_log)
@@ -793,35 +886,40 @@ class VTCAVDisplay(Display):
             # START
             btn.setText("Pause")
             self.handle_log("Acquisition Started")
+            try:
+                self.worker.new_prediction_signal.disconnect()
+            except Exception:
+                pass
+            self.worker.new_prediction_signal.connect(
+                lambda data: self.update_image_display(data, display_name='RT')
+            )
             self.worker.start()
 
     def setup_image_plot(self):
         """
-        Embeds a pyqtgraph ImageView into the ui.imageContainer
-        and configures it for a 'jet'-like heatmap.
+        Embeds pyqtgraph ImageViews and PlotWidgets into the respective UI containers
+        for 'RT', 'DAQ', and 'Prep' displays.
         """
-        # Create the ImageView widget
-        # view=pg.PlotItem() allows axes/titles if you want them
-        self.img_view = pg.ImageView(view=pg.PlotItem())
+        from qtpy.QtWidgets import QVBoxLayout
+        import pyqtgraph as pg
+        import numpy as np
+
+        # Create dictionaries to store the generated plot widgets
+        self.img_views = {}
+        self.current_views = {}
+        self.energy_views = {}
         
-        # Hide the ROI button and Menu button for a cleaner look
-        self.img_view.ui.roiBtn.hide()
-        self.img_view.ui.menuBtn.hide()
+        # Mapping logical names to UI container names
+        # Format: 'Name': ('imageContainer', 'currentProfile', 'energyProfile')
+        display_mapping = {
+            'RT':   ('imageContainer_1', 'currentProfile_1', 'energyProfile_1'),
+            'DAQ':  ('imageContainer_2', 'currentProfile_2', 'energyProfile_2'),
+            'Prep': ('imageContainer_3', 'currentProfile_3', 'energyProfile_3'),
+            'cmp_truth': ('imageContainer_4', 'currentProfile_4', 'energyProfile_4'),
+            'cmp_pred': ('imageContainer_5', 'currentProfile_5', 'energyProfile_5'),
+        }
         
-        # Add it to the container layout
-        # Assumes imageContainer has a layout (Vertical/Horizontal)
-        if self.ui.imageContainer.layout() is None:
-            from qtpy.QtWidgets import QVBoxLayout
-            self.ui.imageContainer.setLayout(QVBoxLayout())
-            
-        self.ui.imageContainer.layout().addWidget(self.img_view)
-        
-        # --- SETTING THE COLORMAP (JET) ---
-        # pyqtgraph has built-in colormaps. 
-        # We assume data is 0..1 or similar; the histogram will auto-scale.
-        
-        # Define the positions (0.0 to 1.0) and colors (RGBA byte tuples) for 'jet'
-        # Blue -> Cyan -> Yellow -> Red
+        # Define the 'jet' colormap once to reuse
         pos = np.array([0.0, 0.33, 0.66, 1.0])
         color = np.array([
             [0, 0, 128, 255],   # Dark Blue
@@ -829,67 +927,78 @@ class VTCAVDisplay(Display):
             [255, 255, 0, 255], # Yellow
             [128, 0, 0, 255]    # Dark Red
         ], dtype=np.ubyte)
-        
-        # Create the color map
         cmap = pg.ColorMap(pos, color)
-        
-        # Apply it
-        self.img_view.setColorMap(cmap)
 
-        # Create the PlotWidget widget
-        self.current_view = pg.PlotWidget()
-        
-        # Add it to the container layout
-        # Assumes imageContainer has a layout (Vertical/Horizontal)
-        if self.ui.currentProfile.layout() is None:
-            from qtpy.QtWidgets import QVBoxLayout
-            self.ui.currentProfile.setLayout(QVBoxLayout())
+        # Loop through mapping and create plots for each display
+        for display_name, (img_cnt, cur_cnt, eng_cnt) in display_mapping.items():
             
-        self.ui.currentProfile.layout().addWidget(self.current_view)
-        
-    
-        self.current_view.enableAutoRange(axis = 'x', enable = True)
-        self.current_view.enableAutoRange(axis = 'y', enable = True)
-        self.current_view.setLabel('bottom', text='t', units='fs')
-        self.current_view.setLabel('left', text='Current', units='A')
-        self.current_view.showGrid(x=True, y=True)
-        self.current_view.setMouseEnabled(x=False, y=False)
-
-        # Create the PlotWidget widget
-        self.energy_view = pg.PlotWidget()
-        
-        # Add it to the container layout
-        # Assumes imageContainer has a layout (Vertical/Horizontal)
-        if self.ui.energyProfile.layout() is None:
-            from qtpy.QtWidgets import QVBoxLayout
-            self.ui.energyProfile.setLayout(QVBoxLayout())
+            # Ensure the containers actually exist in the UI file before creating things
+            if not hasattr(self.ui, img_cnt):
+                continue
+                
+            # --- 1. Setup ImageView ---
+            img_view = pg.ImageView(view=pg.PlotItem())
+            img_view.ui.roiBtn.hide()
+            img_view.ui.menuBtn.hide()
+            img_view.setColorMap(cmap)
             
-        self.ui.energyProfile.layout().addWidget(self.energy_view)
+            img_container = getattr(self.ui, img_cnt)
+            if img_container.layout() is None:
+                img_container.setLayout(QVBoxLayout())
+            img_container.layout().addWidget(img_view)
+            
+            self.img_views[display_name] = img_view
+            
+            # --- 2. Setup Current Profile Plot ---
+            current_view = pg.PlotWidget()
+            current_view.enableAutoRange(axis='x', enable=True)
+            current_view.enableAutoRange(axis='y', enable=True)
+            current_view.setLabel('bottom', text='t', units='fs')
+            current_view.setLabel('left', text='Current', units='A')
+            current_view.showGrid(x=True, y=True)
+            current_view.setMouseEnabled(x=False, y=False)
+            
+            cur_container = getattr(self.ui, cur_cnt)
+            if cur_container.layout() is None:
+                cur_container.setLayout(QVBoxLayout())
+            cur_container.layout().addWidget(current_view)
+            
+            self.current_views[display_name] = current_view
+            
+            # --- 3. Setup Energy Profile Plot ---
+            energy_view = pg.PlotWidget()
+            energy_view.enableAutoRange(axis='x', enable=True)
+            energy_view.enableAutoRange(axis='y', enable=True)
+            energy_view.setLabel('bottom', text='Slice Charge', units='Arb.U.')
+            energy_view.setLabel('left', text='Energy', units='Arb.U.')
+            energy_view.showGrid(x=True, y=True)
+            energy_view.setMouseEnabled(x=False, y=False)
+            
+            eng_container = getattr(self.ui, eng_cnt)
+            if eng_container.layout() is None:
+                eng_container.setLayout(QVBoxLayout())
+            eng_container.layout().addWidget(energy_view)
+            
+            self.energy_views[display_name] = energy_view
+
+    @Slot(np.ndarray, str)
+    def update_image_display(self, image_data, display_name):
+        """
+        Receives the numpy array from the worker and the target display name.
+        Renders it into a Jet Heatmap and updates projections for that specific tab.
+        """
+        # Safety check: ensure the requested display name exists
+        if not hasattr(self, 'img_views') or display_name not in self.img_views:
+            return
+            
+        # Retrieve specific widgets for the target display
+        target_img_view = self.img_views[display_name]
+        target_current_view = self.current_views[display_name]
+        target_energy_view = self.energy_views[display_name]
+
+        # 1. Update Image
+        target_img_view.setImage(image_data.T, autoRange=False, autoLevels=False)
         
-    
-        self.energy_view.enableAutoRange(axis = 'x', enable = True)
-        self.energy_view.enableAutoRange(axis = 'y', enable = True)
-        self.energy_view.setLabel('bottom', text='Slice Charge', units='Arb.U.')
-        self.energy_view.setLabel('left', text='Energy', units='Arb.U.')
-        self.energy_view.showGrid(x=True, y=True)
-        self.energy_view.setMouseEnabled(x=False, y=False)
-
-
-    @Slot(np.ndarray)
-    def update_image_display(self, image_data):
-        """
-        Receives the numpy array from the worker.
-        Renders it into a Jet Heatmap using Matplotlib, and then updates the display.
-        Updates horizontal and vertical projections.
-        """
-        # 1. Update Image (The FAST way)
-        # autoRange=False prevents the view from resetting zoom every frame
-        # autoLevels=False keeps the contrast stable (or True if you want auto-scaling)
-        if hasattr(self, 'img_view'):
-            # Note: pyqtgraph often expects (Cols, Rows) or Transposed data 
-            # depending on how you want X/Y to align. 
-            # If the image is rotated, try: image_data.T
-            self.img_view.setImage(image_data.T, autoRange=False, autoLevels=False)
         # 2. Update Projections
         try:
             # image_data shape is (Rows, Cols) -> (Y, X)
@@ -898,18 +1007,20 @@ class VTCAVDisplay(Display):
             
             # Update Energy Spectrum (Vertical)
             y_indices = len(y_proj) - np.arange(len(y_proj)) # Flip due to orientation.
-            self.energy_view.clear()
-            # Plotting y_proj as X-values and indices as Y-values to make it "vertical"
-            self.energy_view.plot(y_proj, y_indices)
+            target_energy_view.clear()
+            target_energy_view.plot(y_proj, y_indices)
 
+            # Update Current Profile (Horizontal)
             x_indices = np.arange(len(x_proj)) * self.worker.xtcalibrationfactor
             x_proj = x_proj / self.worker.xtcalibrationfactor * 1.602e-4 # 1.602e-19 [C]/1e-15 [s]
 
-            self.current_view.clear()
-            self.current_view.plot(x_indices, x_proj)
+            target_current_view.clear()
+            target_current_view.plot(x_indices, x_proj)
                 
         except Exception as e:
+            # Optionally log this to your handle_log function instead of silently passing
             pass
+
     @Slot(int, int)
     def handle_table_click(self, row, col):
         """
@@ -1205,7 +1316,7 @@ class VTCAVDisplay(Display):
         print("\n--- Final Concatenated Data Shapes ---")
         print(f"Total LPS Images (images): {images_tmp.shape}")
         print(f"Total Predictors (predictor): {predictor_tmp.shape}")
-        self.update_image_display(np.average(images_tmp, axis = 0))
+        self.update_image_display(np.average(images_tmp, axis = 0), display_name='Prep')
 
         ampl_idx = next(i for i, var in enumerate(bsaVars) if 'TCAV_LI20_2400_A' in var)
         xtcavAmpl = predictor_tmp[:, ampl_idx]
@@ -1436,7 +1547,7 @@ class VTCAVDisplay(Display):
             'model': model,
             'iz_scaler': iz_scaler,
             'x_scaler': x_scaler,
-            'xtcalibrationfactor': _xtcalibrationfactor,
+            'xtcalibrationfactor': _xtcalibrationfactor * (xrange/100), #We Stretched the image in this function.
             'image_model' : model_cvae,
             'architecture': {
                 'ncomp': NCOMP,
