@@ -647,7 +647,7 @@ class VTCAVDisplay(Display):
             mat = loadmat(dataloc,struct_as_record=False, squeeze_me=True)
             data_struct = mat['data_struct']
         except FileNotFoundError:
-            print(f"Skipping {experiment}_{runname}: .mat file not found at {dataloc}")
+            print(f"Skipping {full_path}: .mat file not found at {dataloc}")
         # 2. Extract full BSA scalars (filtered by step_list if needed)
         # Don't filter by common index here, we'll do it with the goodShots scalar common index loaded from the file
         bsaScalarData, bsaVars = extractDAQBSAScalars(data_struct, filter_index=False)
