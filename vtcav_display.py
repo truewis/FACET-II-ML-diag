@@ -248,9 +248,9 @@ class InferenceWorker(QThread):
                 self.new_prediction_signal.emit(image_data)
             separation_um, blen1_um, blen2_um = self.fit_sep_um(image_data)
             if real_time:
-                epics.caput("SIOC:SYS1:ML00:AO543", separation_um)
-                epics.caput("SIOC:SYS1:ML00:AO544", blen1_um)
-                epics.caput("SIOC:SYS1:ML00:AO545", blen2_um)
+                epics.caput("SIOC:SYS1:ML00:AO542", separation_um)
+                epics.caput("SIOC:SYS1:ML00:AO543", blen1_um)
+                epics.caput("SIOC:SYS1:ML00:AO544", blen2_um)
             self._log(f"New Prediction Emitted. Charge: {total_charge*1.6e-7} pC, Separation: {separation_um} um.")
         except Exception as e:
             raise e
@@ -313,7 +313,7 @@ class InferenceWorker(QThread):
             
         except RuntimeError:
             self._log("Warning: Double Gaussian curve fit failed to converge.")
-            return 0.0  # Return 0 or None if the fit fails to find peaks
+            return 0.0, 0.0, 0.0  # Return 0 or None if the fit fails to find peaks
 
 
     def stop(self):
