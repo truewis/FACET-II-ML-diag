@@ -17,6 +17,7 @@ from sklearn.preprocessing import MinMaxScaler
 from sklearn.model_selection import train_test_split
 import torch
 from scipy.io import loadmat
+from scipy.optimize import curve_fit
 from scipy.ndimage import center_of_mass, shift
 from Python_Functions.functions import cropProfmonImg, matstruct_to_dict, extractDAQBSAScalars, extractDAQNonBSAScalars, segment_centroids_and_com, apply_tcav_zeroing_filter, apply_centroid_correction, extract_processed_images
 from qtpy.QtGui import QColor
@@ -50,6 +51,7 @@ class InferenceWorker(QThread):
         super().__init__()
         self.model_path = model_path
         self.running = False
+        self.display_images_rt = True
         self.model_data = None
         
         # Load resources and initialize the Buffer class
@@ -132,10 +134,11 @@ class InferenceWorker(QThread):
 
         # Track previous valid BSA list to detect changes
         previous_valid_bsa_names = []
-
+        self.cnt = 0
         while self.running:
             start_time = time.time()
-
+            self.cnt = self.cnt+1
+            #self.display_images_rt = (self.cnt % 10 == 0)
             try:
                 # --- Phase 1: Read Synchronized Data (BSA) ---
                 # We only try to read from the buffer if we have valid names in it
@@ -212,9 +215,10 @@ class InferenceWorker(QThread):
                     idx = self.var_names.index(toro_pv)
                     # Use the raw value we collected, or 0 if it was bypassed
                     total_charge = ordered_input[idx]
-                
+                elapsed = time.time() - start_time
+                self._log(f"Time elapsed before emit_prediction: {elapsed}.")
                 # --- Phase 5: Inference ---
-                self.emit_prediction(input_scaled, total_charge)
+                self.emit_prediction(input_scaled, total_charge, real_time=True)
 
             except Exception as e:
                 self._log(f"Loop Error: {e}")
@@ -222,11 +226,13 @@ class InferenceWorker(QThread):
                 traceback.print_exc()
                 time.sleep(1)
 
-            # Maintain requested update rate (~2Hz)
+            # Maintain requested update rate (10Hz)
             elapsed = time.time() - start_time
-            time.sleep(max(0.01, 0.5 - elapsed))
+            if elapsed > 0.1:
+                self._log(f"Warning: Prediction Thread Cannot Catch up at 10 Hz. Time took for prediction: {elapsed}.")
+            time.sleep(max(0.01, 0.1 - elapsed))
 
-    def emit_prediction(self, input_params, total_charge):
+    def emit_prediction(self, input_params, total_charge, real_time=False):
         try:
             X_test = torch.tensor(input_params, dtype=torch.float32)
             
@@ -236,15 +242,79 @@ class InferenceWorker(QThread):
 
             pred_full = self.iz_scaler.inverse_transform(z_pred_full)
             pred_params = pred_full.flatten()
-            print(pred_params)
-            
             image_data = self.image_model.params_to_image(pred_params, total_charge)
             # Figuring out orientation sucks. Seems to work without a T, but sometimes with a T.
-            self.new_prediction_signal.emit(image_data)
-            self._log(f"New Prediction Emitted. Charge: {total_charge*1.6e-7} pC")
+            if self.display_images_rt or not real_time: 
+                self.new_prediction_signal.emit(image_data)
+            separation_um, blen1_um, blen2_um = self.fit_sep_um(image_data)
+            if real_time:
+                epics.caput("SIOC:SYS1:ML00:AO543", separation_um)
+                epics.caput("SIOC:SYS1:ML00:AO544", blen1_um)
+                epics.caput("SIOC:SYS1:ML00:AO545", blen2_um)
+            self._log(f"New Prediction Emitted. Charge: {total_charge*1.6e-7} pC, Separation: {separation_um} um.")
         except Exception as e:
             raise e
             self._log(f"Prediction Error: {e}")
+        
+    def fit_sep_um(self, image_data):
+        """
+        Calculates the horizontal projection of the image, fits a double Gaussian,
+        and returns the peak separation in micrometers (um).
+        """
+        # 1. Get the horizontal projection (1D array)
+        # Summing across rows (axis=0) to get the profile along the x-axis
+        x_proj = np.sum(image_data, axis=0)
+        x_indices = np.arange(len(x_proj))
+        
+        # 2. Define the Double Gaussian function
+        def double_gaussian(x, a1, mu1, sigma1, a2, mu2, sigma2, c):
+            return (a1 * np.exp(-((x - mu1)**2) / (2 * sigma1**2)) +
+                    a2 * np.exp(-((x - mu2)**2) / (2 * sigma2**2)) + c)
+        
+        # 3. Formulate initial guesses [a1, mu1, sigma1, a2, mu2, sigma2, c]
+        # Providing a decent starting point (p0) prevents curve_fit from failing.
+        # We guess the two peaks are roughly at 1/3 and 2/3 of the window width.
+        max_val = np.max(x_proj)
+        min_val = np.min(x_proj)
+        length = len(x_indices)
+        
+        p0 = [
+            max_val, length * 0.33, length * 0.1,  # Peak 1: Amp, Center, Width
+            max_val, length * 0.66, length * 0.1,  # Peak 2: Amp, Center, Width
+            min_val                                # Baseline offset
+        ]
+        
+        # 4. Fit the curve
+        try:
+            popt, _ = curve_fit(double_gaussian, x_indices, x_proj, p0=p0)
+            
+            # Extract the fitted centers (means) of the two peaks
+            mu1 = popt[1]
+            sigma1 = popt[2]
+            mu2 = popt[4]
+            sigma2 = popt[5]
+            
+            # Calculate the absolute separation in pixels
+            pixel_separation = abs(mu1 - mu2)
+            blen1 = abs(2*sigma1)
+            blen2 = abs(2*sigma2)
+            # 5. Convert to micrometers (um)
+            # Convert pixels to time (fs) using the calibration factor
+            time_separation_fs = pixel_separation * self.xtcalibrationfactor
+            blen1_fs = blen1 * self.xtcalibrationfactor
+            blen2_fs = blen2 * self.xtcalibrationfactor
+            # Convert time (fs) to distance (um) using the speed of light
+            # c = 299,792,458 m/s ≈ 0.29979 um/fs
+            separation_um = time_separation_fs * 0.299792458
+            blen1_um = blen1_fs * 0.299792458
+            blen2_um = blen2_fs * 0.299792458
+            
+            return separation_um, blen1_um, blen2_um
+            
+        except RuntimeError:
+            self._log("Warning: Double Gaussian curve fit failed to converge.")
+            return 0.0  # Return 0 or None if the fit fails to find peaks
+
 
     def stop(self):
         self.running = False
@@ -306,7 +376,7 @@ class VTCAVDisplay(Display):
         self.ui.shotNumberSlider.valueChanged.connect(lambda idx: self.ui.shotNumber.setText(str(idx)+" / "+str(self.ui.shotNumberSlider.maximum())))
         # Control
         self.ui.startPauseButton.clicked.connect(self.toggle_acquisition)
-
+        self.ui.doImage.stateChanged.connect(self.toggle_doImage)
         # Table intereaction
         self.ui.pvTable.cellClicked.connect(self.handle_table_click)
 
@@ -894,7 +964,15 @@ class VTCAVDisplay(Display):
                 lambda data: self.update_image_display(data, display_name='RT')
             )
             self.worker.start()
-
+    @Slot(int)
+    def toggle_doImage(self, state):
+        if self.worker is None:
+            return
+        if state == 0:
+            self.worker.display_images_rt = False
+        else:
+            self.worker.display_images_rt = True
+        
     def setup_image_plot(self):
         """
         Embeds pyqtgraph ImageViews and PlotWidgets into the respective UI containers

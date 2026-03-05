@@ -71,7 +71,7 @@
          </sizepolicy>
         </property>
         <property name="currentIndex">
-         <number>4</number>
+         <number>0</number>
         </property>
         <widget class="QWidget" name="tab">
          <attribute name="title">
@@ -137,6 +137,22 @@
           <zorder>energyProfile_1</zorder>
           <zorder>imageContainer_1</zorder>
           <zorder>label_5</zorder>
+         </widget>
+         <widget class="QCheckBox" name="doImage">
+          <property name="geometry">
+           <rect>
+            <x>105</x>
+            <y>10</y>
+            <width>441</width>
+            <height>21</height>
+           </rect>
+          </property>
+          <property name="text">
+           <string>Display Image (Disable for better performance during DAQ sessions)</string>
+          </property>
+          <property name="checked">
+           <bool>true</bool>
+          </property>
          </widget>
         </widget>
         <widget class="QWidget" name="tab_2">
