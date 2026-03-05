@@ -417,7 +417,7 @@ class VTCAVDisplay(Display):
             self.compare_truth_data = data['LPSImage'].transpose(2, 0, 1)
             self.goodShots_scal_common_index_cmp = data['scalarCommonIndex']
             self.load_daq_data(data['daqPath'])     
-            
+            self.compute_compare_correlations()
             # Configure slider based on data length
             num_frames = len(self.compare_truth_data)
             self.ui.shotNumberSlider_cmp.setMinimum(0)
@@ -429,6 +429,110 @@ class VTCAVDisplay(Display):
             
         except Exception as e:
             print(f"Error loading compare data: {e}")
+
+    def compute_compare_correlations(self):
+        """
+        Iterates through all loaded compare shots, generates silent predictions,
+        and computes the correlation between the truth and predicted image 
+        separations, blen1, and blen2.
+        """
+        
+        if not hasattr(self, 'compare_truth_data') or self.predictors is None:
+            print("Error: Compare data or DAQ data is not fully loaded.")
+            return
+
+        num_frames = len(self.compare_truth_data)
+        
+        # Initialize lists to store the fitted values
+        truth_seps, truth_b1s, truth_b2s = [], [], []
+        pred_seps, pred_b1s, pred_b2s = [], [], []
+
+        # Find indices of predictor_vars in worker.var_names once outside the loop
+        if self.worker is None or not hasattr(self.worker, 'var_names'):
+            print("Error: Worker or var_names not initialized.")
+            return
+            
+        var_indices = []
+        for var in self.predictor_vars:
+            try:
+                idx = self.worker.var_names.index(var)
+                var_indices.append(idx)
+            except ValueError:
+                continue
+
+        # Show a status message if it takes a moment
+        if hasattr(self, 'updateStatus'):
+            self.updateStatus(f"Computing correlations across {num_frames} shots...")
+
+        for i in range(num_frames):
+            # --- 1. Process Truth Image ---
+            truth_img = self.compare_truth_data[i]
+            t_sep, t_b1, t_b2 = self.worker.fit_sep_um(truth_img)
+            
+            truth_seps.append(t_sep)
+            truth_b1s.append(t_b1)
+            truth_b2s.append(t_b2)
+
+            # --- 2. Process Prediction Image ---
+            # Get the exact DAQ index corresponding to this truth shot
+            daq_idx = self.goodShots_scal_common_index_cmp[i]
+            
+            # Extract total charge
+            total_charge = None
+            if CHARGE_PV_C in self.predictor_vars:
+                charge_idx = self.predictor_vars.index(CHARGE_PV_C)
+                total_charge = self.predictors[daq_idx, charge_idx]
+
+            # Extract and scale DAQ predictor data
+            filtered_predictor = self.predictors[daq_idx, var_indices].reshape(1, -1)
+            scaled_predictor = self.worker.x_scaler.transform(filtered_predictor)
+
+            # Run the model silently (no UI signals)
+            X_test = torch.tensor(scaled_predictor, dtype=torch.float32)
+            
+            if hasattr(self.worker.model, 'eval'): 
+                self.worker.model.eval()
+                
+            with torch.no_grad():
+                z_pred_full = self.worker.model.predict(X_test)
+
+            pred_full = self.worker.iz_scaler.inverse_transform(z_pred_full)
+            pred_params = pred_full.flatten()
+            pred_img = self.worker.image_model.params_to_image(pred_params, total_charge)
+
+            # Fit the predicted image
+            p_sep, p_b1, p_b2 = self.worker.fit_sep_um(pred_img)
+            
+            pred_seps.append(p_sep)
+            pred_b1s.append(p_b1)
+            pred_b2s.append(p_b2)
+
+        # --- 3. Compute Correlations ---
+        # np.corrcoef returns a 2x2 matrix; [0, 1] is the correlation coefficient
+        # We use a helper to handle cases where standard deviation might be 0
+        def safe_correlation(x, y):
+            if np.std(x) == 0 or np.std(y) == 0:
+                return 0.0
+            return np.corrcoef(x, y)[0, 1]
+
+        corr_sep = safe_correlation(truth_seps, pred_seps)
+        corr_b1 = safe_correlation(truth_b1s, pred_b1s)
+        corr_b2 = safe_correlation(truth_b2s, pred_b2s)
+
+        # Output the results
+        print(f"\n--- Correlation Results ({num_frames} shots) ---")
+        print(f"Separation (um) Correlation: {corr_sep:.4f}")
+        print(f"Separation average of truth: {np.mean(truth_seps):.2f} um, average of prediction: {np.mean(pred_seps):.2f} um")
+        print(f"Bunch Length 1 Correlation:  {corr_b1:.4f}")
+        print(f"Bunch Length 1 average of truth: {np.mean(truth_b1s):.2f} um, average of prediction: {np.mean(pred_b1s):.2f} um")
+        print(f"Bunch Length 2 Correlation:  {corr_b2:.4f}")
+        print(f"Bunch Length 2 average of truth: {np.mean(truth_b2s):.2f} um, average of prediction: {np.mean(pred_b2s):.2f} um")
+        print("------------------------------------------\n")
+
+        if hasattr(self, 'updateStatus'):
+            self.updateStatus("Ready")
+
+        return corr_sep, corr_b1, corr_b2
 
     def prev_compare_image(self):
         current_val = self.ui.shotNumberSlider_cmp.value()
