@@ -10,6 +10,7 @@ import traceback
 import re
 import matplotlib
 import pathlib
+from tqdm import tqdm
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.metrics import mean_squared_error
 from Python_Functions.cvae import CVAE, vae_loss, smooth_cvae_output
@@ -408,28 +409,41 @@ class VTCAVDisplay(Display):
         
     def load_compare_data(self, filepath):
         """Loads truth and DAQ data, then initializes the displays."""
-        try:
-            with open(filepath, 'rb') as f:
-                data = pickle.load(f)
+        
+        with open(filepath, 'rb') as f:
+            data = pickle.load(f)
                 
             # ASSUMPTION: Your pickle file contains a dict or tuple with truth and DAQ data.
             # Adjust these keys based on your actual data structure.
-            self.compare_truth_data = data['LPSImage'].transpose(2, 0, 1)
-            self.goodShots_scal_common_index_cmp = data['scalarCommonIndex']
-            self.load_daq_data(data['daqPath'])     
-            self.compute_compare_correlations()
-            # Configure slider based on data length
-            num_frames = len(self.compare_truth_data)
-            self.ui.shotNumberSlider_cmp.setMinimum(0)
-            self.ui.shotNumberSlider_cmp.setMaximum(num_frames - 1)
-            self.ui.shotNumberSlider_cmp.setValue(0)
-            
-            # Update UI to show the first frame
-            self.on_compare_slider_change(0)
-            
-        except Exception as e:
-            print(f"Error loading compare data: {e}")
+        self.goodShots_scal_common_index_cmp = data['scalarCommonIndex']
+        self.load_daq_data(data['daqPath'])    
 
+        ampl_idx = next(i for i, var in enumerate(self.predictor_vars) if 'TCAV:LI20:2400:A' in var)
+        xtcavAmpl = self.predictors[:, ampl_idx]
+            
+        phase_idx = next(i for i, var in enumerate(self.predictor_vars) if 'TCAV:LI20:2400:P' in var)
+        xtcavPhase = self.predictors[:, phase_idx]
+        xtcavOffShots = xtcavAmpl<0.1
+        xtcavPhase[xtcavOffShots] = 0 #Set this for ease of plotting
+        #
+        self.compare_truth_data = data['LPSImage'].transpose(2, 0, 1)
+        near_minus_90_idx = np.where((xtcavPhase >= -90.55) & (xtcavPhase <= -89.55))[0]
+        near_plus_90_idx = np.where((xtcavPhase >= 89.55) & (xtcavPhase <= 90.55))[0]
+        # near_plus_90_idx is unfiltered index, so it must be compared with scalar common index. 
+        mask = [self.goodShots_scal_common_index_cmp[i] in near_plus_90_idx for i in range(self.compare_truth_data.shape[0])]
+        self.goodShots_scal_common_index_cmp = self.goodShots_scal_common_index_cmp[mask]
+        self.compare_truth_data = self.compare_truth_data[mask]
+        
+        # Configure slider based on data length
+        num_frames = len(self.compare_truth_data)
+        self.ui.shotNumberSlider_cmp.setMinimum(0)
+        self.ui.shotNumberSlider_cmp.setMaximum(num_frames - 1)
+        self.ui.shotNumberSlider_cmp.setValue(0)
+        
+        # Update UI to show the first frame
+        self.on_compare_slider_change(0)
+        self.compute_compare_correlations()
+        
     def compute_compare_correlations(self):
         """
         Iterates through all loaded compare shots, generates silent predictions,
@@ -461,10 +475,9 @@ class VTCAVDisplay(Display):
                 continue
 
         # Show a status message if it takes a moment
-        if hasattr(self, 'updateStatus'):
-            self.updateStatus(f"Computing correlations across {num_frames} shots...")
+        self.updateStatus(f"Computing correlations across {num_frames} shots...")
 
-        for i in range(num_frames):
+        for i in tqdm(range(num_frames), desc="Processing Shots"):
             # --- 1. Process Truth Image ---
             truth_img = self.compare_truth_data[i]
             t_sep, t_b1, t_b2 = self.worker.fit_sep_um(truth_img)
@@ -529,8 +542,8 @@ class VTCAVDisplay(Display):
         print(f"Bunch Length 2 average of truth: {np.mean(truth_b2s):.2f} um, average of prediction: {np.mean(pred_b2s):.2f} um")
         print("------------------------------------------\n")
 
-        if hasattr(self, 'updateStatus'):
-            self.updateStatus("Ready")
+    
+        self.updateStatus("Ready")
 
         return corr_sep, corr_b1, corr_b2
 
@@ -576,6 +589,8 @@ class VTCAVDisplay(Display):
     def emit_daq_image(self, index, display_name):
         # This function will be called when the shot number slider changes.
         # It should load the corresponding shot data and emit it to the image display.
+        # self.predictors are raw scalars before filtering by common index, so we convert the index here.
+        index = self.scalar_common_index[index]
         if self.predictors is None or self.predictor_vars is None:
             # No data loaded yet
             return
@@ -669,10 +684,12 @@ class VTCAVDisplay(Display):
         # C. Append to master lists (Some nonsensical code, but we want to maintain the structure in the notebook for now)
         all_predictors.append(predictor_current)
         predictor_tmp = np.concatenate(all_predictors, axis=0)
+        
         self.predictors = predictor_tmp
         self.predictor_vars = [re.sub(r'(?<!^FAST)(?<!_FAST)_', ':', name) for name in bsaVars]
-        self.handle_log(f"Loaded DAQ data with shape {predictor_current.shape}")
-        self.ui.shotNumberSlider.setMaximum(predictor_current.shape[0])
+        self.scalar_common_index = data_struct.scalars.common_index
+        self.handle_log(f"Loaded DAQ data with shape {self.scalar_common_index.shape}")
+        self.ui.shotNumberSlider.setMaximum(self.scalar_common_index.shape[0]-1)
         self.ui.shotNumberSlider.setMinimum(0)
 
     def setup_pv_table(self):
@@ -841,6 +858,9 @@ class VTCAVDisplay(Display):
             
             # 4. Call the processing function defined earlier
             # Function signature: (daq_file_path, x_roi, y_roi, xrange, yrange, output_file_path)
+            
+            # Show a status message if it takes a moment
+            self.updateStatus(f"Preprocessing XTCAV Images...")
             self.preprocess_and_save_lps(
                 daq_file_path=thedaq_file_path,
                 x_roi=(x_min, x_max),
@@ -849,6 +869,9 @@ class VTCAVDisplay(Display):
                 yrange=y_range_val,
                 output_file_path=theoutput_file_path
             )
+            
+            # Show a status message if it takes a moment
+            self.updateStatus(f"Ready")
             print("Preprocessing Complete.")
                 
     def handle_preprocess_load(self):
@@ -875,6 +898,7 @@ class VTCAVDisplay(Display):
                 self.ui.preprocessFilePath.setText(joined_paths)
             
             print(f"Selected preprocessed files: {joined_paths}")
+            
     def handle_preprocess_load_cmp(self):
         """
         Opens a file dialog to select a preprocessed pickle file.
@@ -949,6 +973,9 @@ class VTCAVDisplay(Display):
     @Slot()
     def load_selected_model(self):
         """Loads the selected model and creates the worker immediately."""
+        
+        # Show a status message if it takes a moment
+        self.updateStatus(f"Loading Model...")
         filename = self.ui.modelName.currentText()
         if not filename:
             return
@@ -981,6 +1008,9 @@ class VTCAVDisplay(Display):
             self.setup_pv_table()
             
             self.handle_log("Worker ready. Press 'Start' to begin acquisition.")
+            
+            # Show a status message if it takes a moment
+            self.updateStatus(f"Ready")
         except Exception as e:
             self.handle_log(f"Failed to initialize worker: {e}")
             self.worker = None
@@ -1334,7 +1364,6 @@ class VTCAVDisplay(Display):
         print("Processing steps:", step_list)
         step_data_filtered = np.isin(step_data, step_list)
         step_data_tmp = np.array(step_data[step_data_filtered])
-        print(off_idx)
         print("Those should be the same lengths:")
         print(step_data_tmp.shape)
         print(xtcavImages_centroid_uncorrected.shape)
@@ -1414,7 +1443,9 @@ class VTCAVDisplay(Display):
         all_indices = []
 
         print("Starting multi-run data loading and concatenation...")
-
+        
+        # Show a status message if it takes a moment
+        self.updateStatus(f"Training Model...")
         # ----------------------------------------------------------------------
         # 3. Loop through runs, load data, and concatenate
         # ----------------------------------------------------------------------
@@ -1741,7 +1772,10 @@ class VTCAVDisplay(Display):
         data_file = output_file_path
         with open(data_file, 'wb') as f:
             pickle.dump(data_to_save, f)
-            
+
+        # Show a status message if it takes a moment
+        self.updateStatus(f"Ready")
+        
     @Slot(str)
     def handle_log(self, message):
         """Appends log messages to the PyDMLogDisplay"""
@@ -1769,7 +1803,15 @@ class VTCAVDisplay(Display):
         if self.worker:
             self.worker.stop()
         super().closeEvent(event)
-
+        
+    def updateStatus(self, status_text):
+        """Updates the UI status label and forces a visual refresh."""
+        if hasattr(self.ui, 'statusLabel'):
+            self.ui.statusLabel.setText(status_text)
+            
+            # Force Qt to update the GUI immediately
+            from qtpy.QtWidgets import QApplication
+            QApplication.processEvents()
     
 
 # Entry point for PyDM
