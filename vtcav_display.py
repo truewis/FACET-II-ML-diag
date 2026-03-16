@@ -19,6 +19,7 @@ from sklearn.model_selection import train_test_split
 import torch
 from scipy.io import loadmat
 from scipy.optimize import curve_fit
+from scipy.signal import find_peaks
 from scipy.ndimage import center_of_mass, shift
 from Python_Functions.functions import cropProfmonImg, matstruct_to_dict, extractDAQBSAScalars, extractDAQNonBSAScalars, segment_centroids_and_com, apply_tcav_zeroing_filter, apply_centroid_correction, extract_processed_images
 from qtpy.QtGui import QColor
@@ -74,7 +75,7 @@ class InferenceWorker(QThread):
             try:
                 self.xtcalibrationfactor = data['xtcalibrationfactor']
             except:
-                self.xtcalibrationfactor = 3.2 # known rough value for FACET-II
+                self.xtcalibrationfactor = 6.2 # fs/um, known rough value for FACET-II
                 self._log("Warning: No xtcalibrationfactor found in the file.")
             #The following solution replaces every _ with :, unless it is immediately preceded by the exact token "FAST", i.e. FAST_PACT
             #This deals with the absolutely crazy pv name formatting of F2_DAQ.
@@ -263,7 +264,7 @@ class InferenceWorker(QThread):
         and returns the peak separation in micrometers (um).
         """
         # 1. Get the horizontal projection (1D array)
-        # Summing across rows (axis=0) to get the profile along the x-axis
+        # Summing across columns (axis=0) to get the profile along the x-axis
         x_proj = np.sum(image_data, axis=0)
         x_indices = np.arange(len(x_proj))
         
@@ -272,19 +273,55 @@ class InferenceWorker(QThread):
             return (a1 * np.exp(-((x - mu1)**2) / (2 * sigma1**2)) +
                     a2 * np.exp(-((x - mu2)**2) / (2 * sigma2**2)) + c)
         
-        # 3. Formulate initial guesses [a1, mu1, sigma1, a2, mu2, sigma2, c]
-        # Providing a decent starting point (p0) prevents curve_fit from failing.
-        # We guess the two peaks are roughly at 1/3 and 2/3 of the window width.
+        # 3. Formulate initial guesses using find_peaks
         max_val = np.max(x_proj)
         min_val = np.min(x_proj)
         length = len(x_indices)
         
-        p0 = [
-            max_val, length * 0.33, length * 0.1,  # Peak 1: Amp, Center, Width
-            max_val, length * 0.66, length * 0.1,  # Peak 2: Amp, Center, Width
-            min_val                                # Baseline offset
-        ]
+        # Find peaks with a prominence of at least 5% of the max value 
+        # to ignore small noise ripples.
+        peaks, properties = find_peaks(x_proj, prominence=max_val * 0.05)
         
+        # Logic to handle the peaks found
+        if len(peaks) >= 2:
+            # Sort by prominence (highest first) and grab the top two
+            sorted_indices = np.argsort(properties["prominences"])[::-1]
+            top_two_peaks = peaks[sorted_indices[:2]]
+            
+            # Sort them spatially (left to right) so mu1 < mu2
+            top_two_peaks.sort()
+            
+            mu1_guess = top_two_peaks[0]
+            a1_guess = x_proj[mu1_guess]
+            
+            mu2_guess = top_two_peaks[1]
+            a2_guess = x_proj[mu2_guess]
+            
+        elif len(peaks) == 1:
+            # If only one peak is found (e.g., bunches merged or highly unequal)
+            mu1_guess = peaks[0]
+            a1_guess = x_proj[mu1_guess]
+            
+            # Guess the second peak is a smaller shoulder nearby
+            mu2_guess = mu1_guess + (length * 0.1)
+            a2_guess = a1_guess * 0.5
+            
+        else:
+            # Fallback if find_peaks completely fails
+            mu1_guess = length * 0.33
+            a1_guess = max_val
+            mu2_guess = length * 0.66
+            a2_guess = max_val
+
+        # A decent starting guess for sigma is ~5% of the window width
+        sigma_guess = length * 0.05
+
+        p0 = [
+            a1_guess, mu1_guess, sigma_guess,  # Peak 1: Amp, Center, Width
+            a2_guess, mu2_guess, sigma_guess,  # Peak 2: Amp, Center, Width
+            min_val                            # Baseline offset
+        ]
+    
         # 4. Fit the curve
         try:
             popt, _ = curve_fit(double_gaussian, x_indices, x_proj, p0=p0)
@@ -1324,7 +1361,7 @@ class VTCAVDisplay(Display):
         step_list = stepsAll # TODO: Read Step List from GUI
 
         # calculate xt calibration factor
-        _xtcalibrationfactor = data_struct.metadata.DTOTR2.RESOLUTION*1e-6/streakFromGUI/3e8
+        _xtcalibrationfactor = data_struct.metadata.DTOTR2.RESOLUTION*1e-6/streakFromGUI/3e8*1e15
         # gaussian filter parameter
         hotPixThreshold = 1e3
         sigma = 1
@@ -1340,7 +1377,7 @@ class VTCAVDisplay(Display):
         phase_idx = next(i for i, var in enumerate(bsaVars) if 'TCAV_LI20_2400_P' in var)
         xtcavPhase = bsaScalarData[phase_idx, :]
 
-        xtcavOffShots = xtcavAmpl<0.1
+        xtcavOffShots = (xtcavAmpl<0.1) | (np.abs(xtcavPhase)<3)
         xtcavPhase[xtcavOffShots] = 0 #Set this for ease of plotting
 
         isChargePV = [bool(re.search(CHARGE_PV_U, pv)) for pv in bsaVars]
@@ -1562,7 +1599,7 @@ class VTCAVDisplay(Display):
         krf = 239.26
         cal = 1167 # um/deg  http://physics-elog.slac.stanford.edu/facetelog/show.jsp?dir=/2025/11/13.03&pos=2025-$
         streakFromGUI = cal*krf*180/np.pi*1e-6#um/um
-        _xtcalibrationfactor = data_struct.metadata.DTOTR2.RESOLUTION*1e-6/streakFromGUI/3e8
+        _xtcalibrationfactor = data_struct.metadata.DTOTR2.RESOLUTION*1e-6/streakFromGUI/3e8*1e15
         # Flags
         # If enabled, GMM fit is weighted to predict better current profile rather than overall image fit
         do_current_profile = True

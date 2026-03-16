@@ -737,6 +737,9 @@ def exclude_bsa_vars(bsaVars):
     exclude_bsa_vars = [
         'TCAV_LI20_2400_A',  # XTCAV Amplitude
         'TCAV_LI20_2400_P',  # XTCAV Phase
+        'SIOC_SYS1_ML00_AO542',
+        'SIOC_SYS1_ML00_AO543',
+        'SIOC_SYS1_ML00_AO544', #Outputs of this program
         
     ]
     # Search for variable names that contain four digit number larger than 3100, this is after the XTCAV.
@@ -1387,7 +1390,7 @@ def apply_centroid_correction(xtcavImages, off_idx, steps_if_stepwise=None, do_r
             for step in unique_steps:
                 # Find the indices corresponding to this step that are also 'off_idx'
                 step_off_indices = [i for i in off_idx if steps_if_stepwise[i] == step]
-                
+                print(f"Step_off_indices length for step {step}:{len(step_off_indices)}")
                 # Construct centroid function for this step
                 centroid_corrections_step = construct_centroid_function(xtcavImages, step_off_indices)
                 
