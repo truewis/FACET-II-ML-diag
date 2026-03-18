@@ -573,7 +573,98 @@ def analyze_SYAG(data_struct, experiment='', runname='',
         'fig': fig,
         'sorted_idx': sorted_idx
     }
+from scipy.interpolate import interp1d
+from scipy.optimize import differential_evolution
+def map_xtcav_to_syag(syag_waterfall, xtcav_waterfall):
+    """
+    Finds the global linear offset and scaling to match XTCAV projections to SYAG projections.
+    
+    Args:
+        syag_waterfall (np.ndarray): 2D array of SYAG projections (rows = pixels, cols = shots).
+        xtcav_waterfall (np.ndarray): 2D array of XTCAV projections (rows = pixels, cols = shots).
+        
+    Returns:
+        dict: Contains the optimal scale, offset, max correlation achieved, and the mapped XTCAV array.
+    """
+    n_syag_pix, n_syag_shots = syag_waterfall.shape
+    n_xtcav_pix, n_xtcav_shots = xtcav_waterfall.shape
+    
+    if n_syag_shots != n_xtcav_shots:
+        raise ValueError(f"Shot counts must match! SYAG has {n_syag_shots}, XTCAV has {n_xtcav_shots}.")
 
+    # 1. Normalize both waterfalls shot-by-shot to decouple the spatial correlation 
+    # from pure charge/intensity variations between the two cameras.
+    syag_norm = syag_waterfall / (np.sum(syag_waterfall, axis=0, keepdims=True) + 1e-9)
+    xtcav_norm = xtcav_waterfall / (np.sum(xtcav_waterfall, axis=0, keepdims=True) + 1e-9)
+
+    syag_axis = np.arange(n_syag_pix)
+    xtcav_axis = np.arange(n_xtcav_pix)
+
+    # 2. Define the objective function for the optimizer
+    def objective(params):
+        scale, offset = params
+        
+        # Apply the linear transformation to the XTCAV pixel coordinates
+        # mapped_xtcav = scale * original_xtcav + offset
+        mapped_xtcav_axis = xtcav_axis * scale + offset
+        
+        # Interpolate the XTCAV data onto the fixed SYAG pixel grid
+        # bounds_error=False and fill_value=0 ensure that data shifted off-screen just becomes 0
+        interp_func = interp1d(
+            mapped_xtcav_axis, 
+            xtcav_norm, 
+            axis=0, 
+            bounds_error=False, 
+            fill_value=0.0
+        )
+        mapped_xtcav_data = interp_func(syag_axis)
+        
+        # Calculate the 2D Pearson correlation coefficient across the flattened arrays
+        corr = np.corrcoef(syag_norm.flatten(), mapped_xtcav_data.flatten())[0, 1]
+        
+        # If the arrays are entirely shifted out of bounds, correlation might be NaN
+        if np.isnan(corr):
+            return 0.0
+            
+        # We want to MAXIMIZE correlation, so we MINIMIZE the negative correlation
+        return -corr
+
+    # 3. Define search bounds for [scale, offset]
+    # Scale: assume XTCAV is anywhere from 25x smaller to 1x larger than SYAG
+    # Offset: assume the shift could be up to the size of the SYAG screen
+    bounds = [
+        (0.04, 1.0), 
+        (-n_syag_pix, n_syag_pix)
+    ]
+    
+    print("Optimizing XTCAV to SYAG mapping. This may take a few seconds...")
+    
+    # 4. Run Global Optimization
+    # seed=42 for reproducibility. workers=-1 uses all available CPU cores.
+    result = differential_evolution(objective, bounds, seed=42, workers=-1)
+    
+    best_scale, best_offset = result.x
+    max_corr = -result.fun
+    
+    print(f"Match found! Scale: {best_scale:.4f}, Offset: {best_offset:.2f} pixels, Correlation: {max_corr:.4f}")
+    
+    # 5. Generate the final transformed XTCAV array using the best parameters
+    final_mapped_axis = xtcav_axis * best_scale + best_offset
+    final_interp_func = interp1d(
+        final_mapped_axis, 
+        xtcav_waterfall, # Interpolating the raw data this time, not the normalized data
+        axis=0, 
+        bounds_error=False, 
+        fill_value=0.0
+    )
+    aligned_xtcav_waterfall = final_interp_func(syag_axis)
+    
+    return {
+        'scale': best_scale,
+        'offset': best_offset,
+        'correlation': max_corr,
+        #'aligned_xtcav': aligned_xtcav_waterfall
+    }
 def matstruct_to_dict(obj):
     """
     Recursively convert MATLAB structs (loaded via scipy.io.loadmat) to Python dictionaries.
@@ -963,9 +1054,106 @@ def plot2DbunchseparationVsCollimatorAndBLEN(bc14BLEN, step_vals, bunchSeparatio
     plt.ylabel('Notch Position')
     plt.title(title)
     plt.colorbar(im, label='Bunch Separation [μm]')
+  
+
+def extract_UVVisSpec(data_struct, step_list=None, directory_path = '/nas/nas-li20-pm00/'
+                             ):
+    """
+    Processes UVVisSpec images from HDF5 files, applying module-defined cropping, 
+    filtering, and calculating horizontal projections (current profiles).
+
+    Assumes the following are available in the current module's scope:
+    - cropProfmonImg, median_filter, gaussian_filter (functions)
+    - xrange, yrange, hotPixThreshold, sigma, threshold (constants)
+
+    Args:
+        data_struct (object): Structure containing image locations and backgrounds 
+                              (e.g., data_struct.images.UVVisSpec.loc, data_struct.backgrounds.UVVisSpec).
+        experiment (str): The name of the experiment, used in the file path pattern.
+        xrange (int): Half-width for cropping in x-direction.
+        yrange (int): Half-height for cropping in y-direction.
+        hotPixThreshold (float): Threshold for hot pixel masking.
+        sigma (float): Sigma for Gaussian smoothing.
+        threshold (float): Threshold below which pixel values are set to zero.
+        step_list (list): List of steps to process. If None, process all steps. Steps start from 1.
+        roi_xrange (tuple): Optional custom cropping range in x-direction (min, max), applied before peak finding. Both roi_xrange and roi_yrange must be provided to apply.
+        roi_yrange (tuple): Optional custom cropping range in y-direction (min, max), applied before peak finding. Both roi_xrange and roi_yrange must be provided to apply.
+        do_load_raw (bool): Load raw image for debugging. Uses a lot of memory.
+
+    Returns:
+        tuple: processed image array.
+               
+    """
+    LPSImage = []
+    stepsAll = data_struct.params.stepsAll
+    step_size = None
+    if stepsAll is None or len(np.atleast_1d(stepsAll)) == 0:
+        stepsAll = [1]
+    steps_to_process = stepsAll if step_list is None else [s for s in stepsAll if s in step_list]
+    images_each_step = []
+    images_raw_each_step = []
+    pid_list_each_step = []
+    for a in range(1, np.max(steps_to_process)+1):
+        xtcavImages_list = []
+        xtcavImages_list_raw = []
+        # --- Determine File Path ---
+        if a in steps_to_process:
+            width = 2
+            UVdatalocation = str(directory_path) + '/' + f'images/UVVisSpec/UVVisSpec_data_step{a:0{width}d}.h5'
+
+            # --- Read and Prepare Data ---
+            with h5py.File(UVdatalocation, 'r') as f:
+                data_raw = f['entry']['data']['data'][:].astype(np.float64) # shape: (N, H, W)
+                pid_list = f["entry/instrument/NDAttributes/NDArrayUniqueId"][:].astype(np.int64)  # shape: (N,)
+            
+            # Transpose to shape: (H, W, N) - Height, Width, Shots
+            UVdata_step = np.transpose(data_raw, (2, 1, 0))
+            # Subtract background (H, W) from all shots (H, W, N)
+            try:
+                # If there is background data
+                xtcavImages_step = UVdata_step - data_struct.backgrounds.UVVisSpec[:,:,np.newaxis].astype(np.float64)
+            except:
+                xtcavImages_step = UVdata_step
+            step_size = UVdata_step.shape[2]
+            # --- Process Individual Shots ---
+            for idx in tqdm(range(step_size), desc="Processing Shots Step {}, {} samples".format(a, step_size)):
+                if idx is None:
+                    continue
+                    
+                image = xtcavImages_step[:,:,idx] # Single shot (H, W)
+                raw_width = image.shape[1]
+                raw_height = image.shape[0]
+                
+                # Calculate current profiles (Horizontal Projection)
+                
+                # Prepare for collection
+                processed_image = image[:,:,np.newaxis]
+                image_ravel = processed_image.ravel()
+                xtcavImages_list.append(processed_image)
+                LPSImage.append([image_ravel]) 
+            images_each_step.append(xtcavImages_list)
+            pid_list_each_step.append(pid_list)
+        else:
+            print(f"Skipping step {a} as it's not in steps_to_process.")
+            images_each_step.append([])
+            pid_list_each_step.append([])
+    # --- Apply Common Indexing ---
+    xtcavImages = []
+    xtcavImages_raw = []
+    for step in steps_to_process:
+        #Find data_struct.scalars.steps row numbers that correspond to this step
+        row_indices = [i for i, ci in enumerate(data_struct.scalars.common_index) if data_struct.scalars.steps[ci-1] == step]
+        # Now find the image common indices that correspond to these row indices
+        img_common_indices = data_struct.images.UVVisSpec.common_index[row_indices] - 1  # Convert to zero-based
+        img_hdf5_pids = data_struct.images.UVVisSpec.pid[img_common_indices]
+        # reconstruct hdf5 indices by matching pids
+        img_hdf5_indices = [np.where(pid_list_each_step[step-1] == pid)[0][0] for pid in img_hdf5_pids]
+        for i in img_hdf5_indices:
+            xtcavImages.append(images_each_step[step-1][i])
+    return np.array(xtcavImages)[:,:,:,0]
 
 def extract_processed_images(data_struct, experiment, xrange=100, yrange=100, hotPixThreshold=1e3, sigma=1, threshold=5, step_list=None,
-                             roi_xrange=None, roi_yrange=None, do_load_raw = False, directory_path = '/nas/nas-li20-pm00/'
+                             roi_xrange=None, roi_yrange=None, do_load_raw = False, directory_path = '/nas/nas-li20-pm00/', instrument = 'DTOTR2'
                              ):
     """
     Processes DTOTR2 images from HDF5 files, applying module-defined cropping, 
@@ -1010,7 +1198,7 @@ def extract_processed_images(data_struct, experiment, xrange=100, yrange=100, ho
         # --- Determine File Path ---
         if a in steps_to_process:
             width = 2
-            DTOTR2datalocation = str(directory_path) + '/' + f'images/DTOTR2/DTOTR2_data_step{a:0{width}d}.h5'
+            DTOTR2datalocation = str(directory_path) + '/' + f'images/{instrument}/{instrument}_data_step{a:0{width}d}.h5'
 
             # --- Read and Prepare Data ---
             with h5py.File(DTOTR2datalocation, 'r') as f:
@@ -1022,7 +1210,7 @@ def extract_processed_images(data_struct, experiment, xrange=100, yrange=100, ho
             # Subtract background (H, W) from all shots (H, W, N)
             try:
                 # If there is background data
-                xtcavImages_step = DTOTR2data_step - data_struct.backgrounds.DTOTR2[:,:,np.newaxis].astype(np.float64)
+                xtcavImages_step = DTOTR2data_step - data_struct.backgrounds[instrument][:,:,np.newaxis].astype(np.float64)
             except:
                 xtcavImages_step = DTOTR2data_step
             step_size = DTOTR2data_step.shape[2]
@@ -1046,7 +1234,10 @@ def extract_processed_images(data_struct, experiment, xrange=100, yrange=100, ho
                     image = image[y_min:y_max, x_min:x_max]
                 
                 # Crop image
-                image_cropped, _ = cropProfmonImg(image, xrange, yrange, plot_flag=False)
+                if xrange is not None and yrange is not None:
+                    image_cropped, _ = cropProfmonImg(image, xrange, yrange, plot_flag=False)
+                else:
+                    image_cropped = image
                 
                 # Filter and mask hot pixels
                 img_filtered = median_filter(image_cropped, size=3)

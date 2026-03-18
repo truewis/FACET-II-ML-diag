@@ -1,6 +1,7 @@
 import os
 import time
 import pickle
+from Python_Functions.gmm_slice import GeometricSliceScaler, SliceGMM, SliceRegressorWrapper, gaussian_1d
 import numpy as np
 import torch
 import epics
@@ -10,7 +11,6 @@ import traceback
 import re
 import matplotlib
 import pathlib
-from tqdm import tqdm
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.metrics import mean_squared_error
 from Python_Functions.cvae import CVAE, vae_loss, smooth_cvae_output
@@ -19,9 +19,8 @@ from sklearn.model_selection import train_test_split
 import torch
 from scipy.io import loadmat
 from scipy.optimize import curve_fit
-from scipy.signal import find_peaks
 from scipy.ndimage import center_of_mass, shift
-from Python_Functions.functions import cropProfmonImg, matstruct_to_dict, extractDAQBSAScalars, extractDAQNonBSAScalars, segment_centroids_and_com, apply_tcav_zeroing_filter, apply_centroid_correction, extract_processed_images
+from Python_Functions.functions import cropProfmonImg, map_xtcav_to_syag, matstruct_to_dict, extractDAQBSAScalars, extractDAQNonBSAScalars, segment_centroids_and_com, apply_tcav_zeroing_filter, apply_centroid_correction, extract_processed_images
 from qtpy.QtGui import QColor
 from qtpy.QtCore import QThread, Signal, Slot, Qt
 from qtpy.QtWidgets import QMessageBox, QFileDialog, QTableWidgetItem
@@ -73,10 +72,18 @@ class InferenceWorker(QThread):
             self.iz_scaler = data['iz_scaler']
             self.image_model = data['image_model']
             try:
+                self.n_eslice = data['n_eslice']
+            except:
+                self._log("Warning: No n_eslice found in the file.")
+            try:
                 self.xtcalibrationfactor = data['xtcalibrationfactor']
             except:
-                self.xtcalibrationfactor = 6.2 # fs/um, known rough value for FACET-II
+                self.xtcalibrationfactor = 3.2 # known rough value for FACET-II
                 self._log("Warning: No xtcalibrationfactor found in the file.")
+            try:
+                self.alignment_data = data['syag_alignment_data']
+            except:
+                self._log("Warning: No SYAG alignment data found in the file.")
             #The following solution replaces every _ with :, unless it is immediately preceded by the exact token "FAST", i.e. FAST_PACT
             #This deals with the absolutely crazy pv name formatting of F2_DAQ.
             self.var_names = [re.sub(r'(?<!^FAST)(?<!_FAST)_', ':', name) for name in data['varNames']]
@@ -244,6 +251,13 @@ class InferenceWorker(QThread):
 
             pred_full = self.iz_scaler.inverse_transform(z_pred_full)
             pred_params = pred_full.flatten()
+            if self.n_eslice is not None:
+                self._log(f"Using n_eslice={self.n_eslice} for SYAG projection.")
+                syag_projection = self.get_SYAG_projection(n_eslice=self.n_eslice)
+                # Normalize it so that the sum is 1.
+                syag_projection = syag_projection / np.sum(syag_projection)
+                # Append the syag_projection to the end of the pred_params as additional features for the image model.
+                pred_params = np.concatenate([pred_params, syag_projection])
             image_data = self.image_model.params_to_image(pred_params, total_charge)
             # Figuring out orientation sucks. Seems to work without a T, but sometimes with a T.
             if self.display_images_rt or not real_time: 
@@ -257,6 +271,59 @@ class InferenceWorker(QThread):
         except Exception as e:
             raise e
             self._log(f"Prediction Error: {e}")
+    
+def get_SYAG_projection(self, n_eslice=20):
+    SYAG_PV = 'CAMR:LI20:100:Image'
+    # Get array from EPICS PV
+    syag_data = epics.PV(SYAG_PV+":ArrayData").get()
+    
+    if self.syag_width is None:
+        self.syag_width = epics.PV(SYAG_PV+":ArraySize0_RBV").get()
+        
+    # Reshape to 2D
+    if syag_data is not None and self.syag_width is not None:
+        syag_image = np.array(syag_data).reshape(self.syag_width, -1)
+        # Crop to top quadrant
+        cropped_syag = syag_image[:, :syag_image.shape[0]//4]
+        # Get horizontal projection
+        x_proj = np.sum(cropped_syag, axis=1)
+        
+        # --- Apply XTCAV Alignment (Inverse Mapping) ---
+        if hasattr(self, 'alignment_data') and self.alignment_data is not None:
+            scale = self.alignment_data['scale']
+            offset = self.alignment_data['offset']
+            
+            # To map accurately, we need the original pixel width of the XTCAV camera 
+            # used during the alignment process.
+            # (If the alignment was done on XTCAV data already binned to n_eslice, 
+            # then xtcav_width is simply n_eslice).
+            xtcav_width = self.alignment_data.get('xtcav_width', getattr(self, 'xtcav_width', None))
+            if xtcav_width is None:
+                raise ValueError("XTCAV native width must be known to map SYAG back to XTCAV coordinates.")
+            
+            # 1. Define the target grid in XTCAV space
+            xtcav_grid = np.linspace(0, xtcav_width - 1, n_eslice)
+            
+            # 2. Map XTCAV coordinates to SYAG pixel coordinates 
+            # (Using the forward equation: SYAG_coord = XTCAV_coord * scale + offset)
+            syag_sample_coords = xtcav_grid * scale + offset
+            
+            # 3. Interpolate the SYAG projection at these overlapping coordinates
+            # left=0, right=0 ensures that if the XTCAV field of view looks 
+            # "outside" the SYAG screen bounds, it registers as 0 charge, not an edge artifact.
+            mapped_proj = np.interp(syag_sample_coords, np.arange(len(x_proj)), x_proj, left=0, right=0)
+            
+            # 4. Conserve Charge
+            # Since dy = scale * dx, the charge per bin must be scaled proportionally.
+            x_proj = mapped_proj * scale
+            
+        else:
+            # Fallback to the original unaligned behavior (maps entire SYAG screen)
+            x_proj = np.interp(np.linspace(0, len(x_proj)-1, n_eslice), np.arange(len(x_proj)), x_proj)
+            
+        return x_proj
+        
+    return None
         
     def fit_sep_um(self, image_data):
         """
@@ -264,7 +331,7 @@ class InferenceWorker(QThread):
         and returns the peak separation in micrometers (um).
         """
         # 1. Get the horizontal projection (1D array)
-        # Summing across columns (axis=0) to get the profile along the x-axis
+        # Summing across rows (axis=0) to get the profile along the x-axis
         x_proj = np.sum(image_data, axis=0)
         x_indices = np.arange(len(x_proj))
         
@@ -273,55 +340,19 @@ class InferenceWorker(QThread):
             return (a1 * np.exp(-((x - mu1)**2) / (2 * sigma1**2)) +
                     a2 * np.exp(-((x - mu2)**2) / (2 * sigma2**2)) + c)
         
-        # 3. Formulate initial guesses using find_peaks
+        # 3. Formulate initial guesses [a1, mu1, sigma1, a2, mu2, sigma2, c]
+        # Providing a decent starting point (p0) prevents curve_fit from failing.
+        # We guess the two peaks are roughly at 1/3 and 2/3 of the window width.
         max_val = np.max(x_proj)
         min_val = np.min(x_proj)
         length = len(x_indices)
         
-        # Find peaks with a prominence of at least 5% of the max value 
-        # to ignore small noise ripples.
-        peaks, properties = find_peaks(x_proj, prominence=max_val * 0.05)
-        
-        # Logic to handle the peaks found
-        if len(peaks) >= 2:
-            # Sort by prominence (highest first) and grab the top two
-            sorted_indices = np.argsort(properties["prominences"])[::-1]
-            top_two_peaks = peaks[sorted_indices[:2]]
-            
-            # Sort them spatially (left to right) so mu1 < mu2
-            top_two_peaks.sort()
-            
-            mu1_guess = top_two_peaks[0]
-            a1_guess = x_proj[mu1_guess]
-            
-            mu2_guess = top_two_peaks[1]
-            a2_guess = x_proj[mu2_guess]
-            
-        elif len(peaks) == 1:
-            # If only one peak is found (e.g., bunches merged or highly unequal)
-            mu1_guess = peaks[0]
-            a1_guess = x_proj[mu1_guess]
-            
-            # Guess the second peak is a smaller shoulder nearby
-            mu2_guess = mu1_guess + (length * 0.1)
-            a2_guess = a1_guess * 0.5
-            
-        else:
-            # Fallback if find_peaks completely fails
-            mu1_guess = length * 0.33
-            a1_guess = max_val
-            mu2_guess = length * 0.66
-            a2_guess = max_val
-
-        # A decent starting guess for sigma is ~5% of the window width
-        sigma_guess = length * 0.05
-
         p0 = [
-            a1_guess, mu1_guess, sigma_guess,  # Peak 1: Amp, Center, Width
-            a2_guess, mu2_guess, sigma_guess,  # Peak 2: Amp, Center, Width
-            min_val                            # Baseline offset
+            max_val, length * 0.33, length * 0.1,  # Peak 1: Amp, Center, Width
+            max_val, length * 0.66, length * 0.1,  # Peak 2: Amp, Center, Width
+            min_val                                # Baseline offset
         ]
-    
+        
         # 4. Fit the curve
         try:
             popt, _ = curve_fit(double_gaussian, x_indices, x_proj, p0=p0)
@@ -446,41 +477,28 @@ class VTCAVDisplay(Display):
         
     def load_compare_data(self, filepath):
         """Loads truth and DAQ data, then initializes the displays."""
-        
-        with open(filepath, 'rb') as f:
-            data = pickle.load(f)
+        try:
+            with open(filepath, 'rb') as f:
+                data = pickle.load(f)
                 
-            # ASSUMPTION: Your pickle file contains a dict or tuple with truth and DAQ data.
-            # Adjust these keys based on your actual data structure.
-        self.goodShots_scal_common_index_cmp = data['scalarCommonIndex']
-        self.load_daq_data(data['daqPath'])    
+            self.compare_truth_data = data['LPSImage'].transpose(2, 0, 1)
 
-        ampl_idx = next(i for i, var in enumerate(self.predictor_vars) if 'TCAV:LI20:2400:A' in var)
-        xtcavAmpl = self.predictors[:, ampl_idx]
+            # This is a 1 based index from MATLAB, which directly corresponds to the shot numbers in the DAQ data. We will use this to align the truth images with the correct DAQ rows for prediction.
+            self.goodShots_scal_common_index_cmp = data['scalarCommonIndex']
+            self.load_daq_data(data['daqPath'])     
+            self.compute_compare_correlations()
+            # Configure slider based on data length
+            num_frames = len(self.compare_truth_data)
+            self.ui.shotNumberSlider_cmp.setMinimum(0)
+            self.ui.shotNumberSlider_cmp.setMaximum(num_frames - 1)
+            self.ui.shotNumberSlider_cmp.setValue(0)
             
-        phase_idx = next(i for i, var in enumerate(self.predictor_vars) if 'TCAV:LI20:2400:P' in var)
-        xtcavPhase = self.predictors[:, phase_idx]
-        xtcavOffShots = xtcavAmpl<0.1
-        xtcavPhase[xtcavOffShots] = 0 #Set this for ease of plotting
-        #
-        self.compare_truth_data = data['LPSImage'].transpose(2, 0, 1)
-        near_minus_90_idx = np.where((xtcavPhase >= -90.55) & (xtcavPhase <= -89.55))[0]
-        near_plus_90_idx = np.where((xtcavPhase >= 89.55) & (xtcavPhase <= 90.55))[0]
-        # near_plus_90_idx is unfiltered index, so it must be compared with scalar common index. 
-        mask = [self.goodShots_scal_common_index_cmp[i] in near_plus_90_idx for i in range(self.compare_truth_data.shape[0])]
-        self.goodShots_scal_common_index_cmp = self.goodShots_scal_common_index_cmp[mask]
-        self.compare_truth_data = self.compare_truth_data[mask]
-        
-        # Configure slider based on data length
-        num_frames = len(self.compare_truth_data)
-        self.ui.shotNumberSlider_cmp.setMinimum(0)
-        self.ui.shotNumberSlider_cmp.setMaximum(num_frames - 1)
-        self.ui.shotNumberSlider_cmp.setValue(0)
-        
-        # Update UI to show the first frame
-        self.on_compare_slider_change(0)
-        self.compute_compare_correlations()
-        
+            # Update UI to show the first frame
+            self.on_compare_slider_change(0)
+            
+        except Exception as e:
+            print(f"Error loading compare data: {e}")
+
     def compute_compare_correlations(self):
         """
         Iterates through all loaded compare shots, generates silent predictions,
@@ -512,9 +530,10 @@ class VTCAVDisplay(Display):
                 continue
 
         # Show a status message if it takes a moment
-        self.updateStatus(f"Computing correlations across {num_frames} shots...")
+        if hasattr(self, 'updateStatus'):
+            self.updateStatus(f"Computing correlations across {num_frames} shots...")
 
-        for i in tqdm(range(num_frames), desc="Processing Shots"):
+        for i in range(num_frames):
             # --- 1. Process Truth Image ---
             truth_img = self.compare_truth_data[i]
             t_sep, t_b1, t_b2 = self.worker.fit_sep_um(truth_img)
@@ -525,7 +544,7 @@ class VTCAVDisplay(Display):
 
             # --- 2. Process Prediction Image ---
             # Get the exact DAQ index corresponding to this truth shot
-            daq_idx = self.goodShots_scal_common_index_cmp[i]
+            daq_idx = self.goodShots_scal_common_index_cmp[i] - 1
             
             # Extract total charge
             total_charge = None
@@ -579,8 +598,8 @@ class VTCAVDisplay(Display):
         print(f"Bunch Length 2 average of truth: {np.mean(truth_b2s):.2f} um, average of prediction: {np.mean(pred_b2s):.2f} um")
         print("------------------------------------------\n")
 
-    
-        self.updateStatus("Ready")
+        if hasattr(self, 'updateStatus'):
+            self.updateStatus("Ready")
 
         return corr_sep, corr_b1, corr_b2
 
@@ -603,7 +622,7 @@ class VTCAVDisplay(Display):
         self.update_image_display(truth_image, 'cmp_truth')
         
         # 2. Trigger Prediction
-        self.emit_daq_image(self.goodShots_scal_common_index_cmp[index], 'cmp_pred')
+        self.emit_daq_image(self.goodShots_scal_common_index_cmp[index] - 1, 'cmp_pred')
         self.ui.shotNumberCI_cmp.setText(f"Shot#:{self.goodShots_scal_common_index_cmp[index]}")
     
 
@@ -626,8 +645,6 @@ class VTCAVDisplay(Display):
     def emit_daq_image(self, index, display_name):
         # This function will be called when the shot number slider changes.
         # It should load the corresponding shot data and emit it to the image display.
-        # self.predictors are raw scalars before filtering by common index, so we convert the index here.
-        index = self.scalar_common_index[index]
         if self.predictors is None or self.predictor_vars is None:
             # No data loaded yet
             return
@@ -721,12 +738,10 @@ class VTCAVDisplay(Display):
         # C. Append to master lists (Some nonsensical code, but we want to maintain the structure in the notebook for now)
         all_predictors.append(predictor_current)
         predictor_tmp = np.concatenate(all_predictors, axis=0)
-        
         self.predictors = predictor_tmp
         self.predictor_vars = [re.sub(r'(?<!^FAST)(?<!_FAST)_', ':', name) for name in bsaVars]
-        self.scalar_common_index = data_struct.scalars.common_index
-        self.handle_log(f"Loaded DAQ data with shape {self.scalar_common_index.shape}")
-        self.ui.shotNumberSlider.setMaximum(self.scalar_common_index.shape[0]-1)
+        self.handle_log(f"Loaded DAQ data with shape {predictor_current.shape}")
+        self.ui.shotNumberSlider.setMaximum(predictor_current.shape[0])
         self.ui.shotNumberSlider.setMinimum(0)
 
     def setup_pv_table(self):
@@ -895,9 +910,6 @@ class VTCAVDisplay(Display):
             
             # 4. Call the processing function defined earlier
             # Function signature: (daq_file_path, x_roi, y_roi, xrange, yrange, output_file_path)
-            
-            # Show a status message if it takes a moment
-            self.updateStatus(f"Preprocessing XTCAV Images...")
             self.preprocess_and_save_lps(
                 daq_file_path=thedaq_file_path,
                 x_roi=(x_min, x_max),
@@ -906,9 +918,6 @@ class VTCAVDisplay(Display):
                 yrange=y_range_val,
                 output_file_path=theoutput_file_path
             )
-            
-            # Show a status message if it takes a moment
-            self.updateStatus(f"Ready")
             print("Preprocessing Complete.")
                 
     def handle_preprocess_load(self):
@@ -935,7 +944,6 @@ class VTCAVDisplay(Display):
                 self.ui.preprocessFilePath.setText(joined_paths)
             
             print(f"Selected preprocessed files: {joined_paths}")
-            
     def handle_preprocess_load_cmp(self):
         """
         Opens a file dialog to select a preprocessed pickle file.
@@ -1010,9 +1018,6 @@ class VTCAVDisplay(Display):
     @Slot()
     def load_selected_model(self):
         """Loads the selected model and creates the worker immediately."""
-        
-        # Show a status message if it takes a moment
-        self.updateStatus(f"Loading Model...")
         filename = self.ui.modelName.currentText()
         if not filename:
             return
@@ -1045,9 +1050,6 @@ class VTCAVDisplay(Display):
             self.setup_pv_table()
             
             self.handle_log("Worker ready. Press 'Start' to begin acquisition.")
-            
-            # Show a status message if it takes a moment
-            self.updateStatus(f"Ready")
         except Exception as e:
             self.handle_log(f"Failed to initialize worker: {e}")
             self.worker = None
@@ -1361,7 +1363,7 @@ class VTCAVDisplay(Display):
         step_list = stepsAll # TODO: Read Step List from GUI
 
         # calculate xt calibration factor
-        _xtcalibrationfactor = data_struct.metadata.DTOTR2.RESOLUTION*1e-6/streakFromGUI/3e8*1e15
+        _xtcalibrationfactor = data_struct.metadata.DTOTR2.RESOLUTION*1e-6/streakFromGUI/3e8
         # gaussian filter parameter
         hotPixThreshold = 1e3
         sigma = 1
@@ -1377,7 +1379,7 @@ class VTCAVDisplay(Display):
         phase_idx = next(i for i, var in enumerate(bsaVars) if 'TCAV_LI20_2400_P' in var)
         xtcavPhase = bsaScalarData[phase_idx, :]
 
-        xtcavOffShots = (xtcavAmpl<0.1) | (np.abs(xtcavPhase)<3)
+        xtcavOffShots = xtcavAmpl<0.1
         xtcavPhase[xtcavOffShots] = 0 #Set this for ease of plotting
 
         isChargePV = [bool(re.search(CHARGE_PV_U, pv)) for pv in bsaVars]
@@ -1401,6 +1403,7 @@ class VTCAVDisplay(Display):
         print("Processing steps:", step_list)
         step_data_filtered = np.isin(step_data, step_list)
         step_data_tmp = np.array(step_data[step_data_filtered])
+        print(off_idx)
         print("Those should be the same lengths:")
         print(step_data_tmp.shape)
         print(xtcavImages_centroid_uncorrected.shape)
@@ -1480,9 +1483,7 @@ class VTCAVDisplay(Display):
         all_indices = []
 
         print("Starting multi-run data loading and concatenation...")
-        
-        # Show a status message if it takes a moment
-        self.updateStatus(f"Training Model...")
+
         # ----------------------------------------------------------------------
         # 3. Loop through runs, load data, and concatenate
         # ----------------------------------------------------------------------
@@ -1599,7 +1600,7 @@ class VTCAVDisplay(Display):
         krf = 239.26
         cal = 1167 # um/deg  http://physics-elog.slac.stanford.edu/facetelog/show.jsp?dir=/2025/11/13.03&pos=2025-$
         streakFromGUI = cal*krf*180/np.pi*1e-6#um/um
-        _xtcalibrationfactor = data_struct.metadata.DTOTR2.RESOLUTION*1e-6/streakFromGUI/3e8*1e15
+        _xtcalibrationfactor = data_struct.metadata.DTOTR2.RESOLUTION*1e-6/streakFromGUI/3e8
         # Flags
         # If enabled, GMM fit is weighted to predict better current profile rather than overall image fit
         do_current_profile = True
@@ -1810,9 +1811,302 @@ class VTCAVDisplay(Display):
         with open(data_file, 'wb') as f:
             pickle.dump(data_to_save, f)
 
-        # Show a status message if it takes a moment
-        self.updateStatus(f"Ready")
-        
+    def train_model_slice_rf(self, run_pairs, output_file_path):
+        # ----------------------------------------------------------------------
+        # 2. Initialize lists for concatenation
+        # ----------------------------------------------------------------------
+        all_images = []
+        all_predictors = []
+        all_indices = []
+
+        print("Starting multi-run data loading and concatenation...")
+
+        # ----------------------------------------------------------------------
+        # 3. Loop through runs, load data, and concatenate
+        # ----------------------------------------------------------------------
+        charge_merged = []
+        for pickle_filename in run_pairs:
+            
+            # --- A. Load Processed LPSImage Data and Good Shots Index ---
+
+            try:
+                with open(pickle_filename, 'rb') as f:
+                    data = pickle.load(f)
+                
+                LPSImage_good = data['LPSImage'] # Filtered LPS images
+                # This 'goodShots' index is relative to the phase-filtered data (all_idx).
+                goodShots_scal_common_index = data['scalarCommonIndex'] 
+                
+                print(f"Loaded pickle_filename: LPSImage shape {LPSImage_good.shape}")
+                
+            except FileNotFoundError:
+                print(f"Skipping pickle_filename: Pickle file not found at {pickle_filename}")
+                continue
+            
+            # --- B. Load and Filter Predictor Data (BSA Scalars) ---
+            
+            # 1. Load data_struct
+            dataloc = data['daqPath']  # Assuming the path to the .mat file is stored in the pickle
+            try:
+                mat = loadmat(dataloc,struct_as_record=False, squeeze_me=True)
+                data_struct = mat['data_struct']
+            except FileNotFoundError:
+                print(f"Skipping pickle_filename: .mat file not found at {dataloc}")
+                continue
+
+            # 2. Extract full BSA scalars (filtered by step_list if needed)
+            # Don't filter by common index here, we'll do it with the goodShots scalar common index loaded from the file
+            bsaScalarData, bsaVars = extractDAQBSAScalars(data_struct, filter_index=False)
+            bsaScalarData = apply_tcav_zeroing_filter(bsaScalarData, bsaVars)
+
+            # 3. Extract non BSA scalars the same way
+            nonBsaScalarData, nonBsaVars = extractDAQNonBSAScalars(data_struct, filter_index=False, debug=False, s20=True)
+            nonBsaScalarData = apply_tcav_zeroing_filter(nonBsaScalarData, nonBsaVars)
+
+            # 4. Combine BSA and non-BSA scalar data
+            bsaScalarData = np.vstack((bsaScalarData, nonBsaScalarData))
+            allVars = bsaVars + nonBsaVars
+
+            # 5. Filter BSA data using the final index
+            # goodShots_scal_common_index is 1 based indexing from MATLAB, convert to 0 based
+            bsaScalarData_filtered = bsaScalarData[:, goodShots_scal_common_index - 1]
+            
+            isChargePV = [bool(re.search(CHARGE_PV_U, pv)) for pv in bsaVars]
+            if isChargePV:
+                # Extract charge data
+                pvidx = [i for i, val in enumerate(isChargePV) if val]
+                charge = bsaScalarData[pvidx, :][0] * 1.6e-19  # in C 
+                charge_filtered = charge[goodShots_scal_common_index - 1]
+            # 6. Construct the predictor array
+            predictor_current = np.vstack(bsaScalarData_filtered).T
+            
+            # C. Append to master lists
+            all_images.append(LPSImage_good)
+            all_predictors.append(predictor_current)
+            charge_merged.append(charge_filtered)
+            
+        # ----------------------------------------------------------------------
+        # 4. Concatenate and finalize arrays
+        # ----------------------------------------------------------------------
+
+
+        # Combine all data arrays from the runs
+        images_tmp = np.concatenate(all_images, axis=0)
+        print(f"TMP Shape: {images_tmp.shape}")
+        # Set image half dimensions (should match preprocessing)
+        yrange = images_tmp.shape[0]//2
+        xrange = images_tmp.shape[1]//2
+        images_tmp = images_tmp.transpose(2, 0, 1)
+        predictor_tmp = np.concatenate(all_predictors, axis=0)
+        charge = np.concatenate(charge_merged, axis=0)
+
+
+        print("\n--- Final Concatenated Data Shapes ---")
+        print(f"Total LPS Images (images): {images_tmp.shape}")
+        print(f"Total Predictors (predictor): {predictor_tmp.shape}")
+        self.update_image_display(np.average(images_tmp, axis = 0), display_name='Prep')
+
+        ampl_idx = next(i for i, var in enumerate(bsaVars) if 'TCAV_LI20_2400_A' in var)
+        xtcavAmpl = predictor_tmp[:, ampl_idx]
+
+        phase_idx = next(i for i, var in enumerate(bsaVars) if 'TCAV_LI20_2400_P' in var)
+        xtcavPhase = predictor_tmp[:, phase_idx]
+        xtcavOffShots = xtcavAmpl<0.1
+        xtcavPhase[xtcavOffShots] = 0 #Set this for ease of plotting
+        # 
+        near_minus_90_idx = np.where((xtcavPhase >= -90.55) & (xtcavPhase <= -89.55))[0]
+        near_plus_90_idx = np.where((xtcavPhase >= 89.55) & (xtcavPhase <= 90.55))[0]
+        lps_idx = near_minus_90_idx.tolist() + near_plus_90_idx.tolist()
+        # Flip image horizontally for -90 deg phase
+        images_flipped = images_tmp.copy()
+        images_flipped[near_minus_90_idx, :, :] = np.flip(images_tmp[near_minus_90_idx, :, :], axis=2)
+
+        from Python_Functions.functions import exclude_bsa_vars
+        excluded_var_idx = exclude_bsa_vars(allVars)
+        bsaVarNames_cleaned = [var for i, var in enumerate(allVars) if i not in excluded_var_idx]
+        predictor_tmp_cleaned = np.delete(predictor_tmp, excluded_var_idx, axis=1)[lps_idx, :]
+        print(f"Predictor shape after excluding variables: {predictor_tmp_cleaned.shape}")
+
+        LPSimg_prezoom = images_flipped[lps_idx]
+        charge_filtered = charge[lps_idx]
+        print(f"LPS Image shape after filtering: {LPSimg_prezoom.shape}")
+
+
+        # Calibration
+        # Define XTCAV calibration
+        krf = 239.26
+        cal = 1167 # um/deg  http://physics-elog.slac.stanford.edu/facetelog/show.jsp?dir=/2025/11/13.03&pos=2025-$
+        streakFromGUI = cal*krf*180/np.pi*1e-6#um/um
+        _xtcalibrationfactor = data_struct.metadata.DTOTR2.RESOLUTION*1e-6/streakFromGUI/3e8
+        # Flags
+        # If enabled, GMM fit is weighted to predict better current profile rather than overall image fit
+        do_current_profile = True
+
+        # Interpolate LPS images to square pixels for CVAE training.
+        # 2* yrange, 2* xrange to 200x200
+        # CVAE model assumes square images with 200x200 pixels, forced by convolutional layers
+        from scipy.ndimage import zoom
+        LPSimg_resized = np.zeros((LPSimg_prezoom.shape[0], 200, 200), dtype=LPSimg_prezoom.dtype)
+        for i in range(LPSimg_prezoom.shape[0]):
+            LPSimg_resized[i] = zoom(LPSimg_prezoom[i], (200/(2*yrange), 200/(2*xrange)), order=1)
+        LPSimg = LPSimg_resized
+
+        NESLICE = 20
+        INPUT_CHANNELS = 1
+
+        # 1. Setup Device
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        print(f"Using device: {device}")
+
+        # --- 2. Image Slicing & Feature Extraction ---
+        # Zoom the slicing axis (assumed axis 1) down to exactly NESLICE
+        # Assuming LPSimg shape is (n_samples, 200, profile_height)
+        zoom_factors = (1.0, NESLICE / LPSimg.shape[1], 1.0) 
+        LPSimg_zoomed = zoom(LPSimg, zoom_factors, order=1)
+
+        # Initialize array for 3 parameters per slice: (mu, sigma, charge/amp)
+        latent_z_array = np.zeros((LPSimg.shape[0], NESLICE * 3))
+
+        for i in range(LPSimg_zoomed.shape[0]):
+            for j in range(NESLICE):
+                # The slice is natively extracted via the zoomed dimension
+                slice_data = LPSimg_zoomed[i, j, :] 
+                x = np.arange(slice_data.shape[0])
+                
+                try:
+                    popt, _ = curve_fit(gaussian_1d, x, slice_data, p0=[slice_data.max(), slice_data.argmax(), 5])
+                    amp, mu, sigma = popt
+                except RuntimeError:
+                    amp, mu, sigma = 0, 0, 1 # Default fallback
+                    
+                # Store as (mu, sigma, amp) triplet
+                latent_z_array[i, j*3] = mu
+                latent_z_array[i, j*3 + 1] = sigma
+                latent_z_array[i, j*3 + 2] = amp
+
+        # Filter logic
+        valid_rows = [True for _ in range(latent_z_array.shape[0])]
+        predictor_filtered = predictor_tmp_cleaned[valid_rows]
+        biGaussian_params_array_filtered = latent_z_array[valid_rows]
+
+        # --- 3. Scaling ---
+        x_scaler = MinMaxScaler()
+        iz_scaler = GeometricSliceScaler(xrange=100, yrange=100) # Ensure ranges match your data
+
+        x_scaled = x_scaler.fit_transform(predictor_filtered)
+        Iz_scaled = iz_scaler.fit_transform(biGaussian_params_array_filtered)
+
+        # --- 4. Prepare Flattened Dataset for the Wrapper ---
+        # Extract charges so they can be appended to X, leaving only (mu, sigma) for Y
+        Iz_scaled_reshaped = Iz_scaled.reshape(-1, NESLICE, 3)
+
+        # Y targets: only mu and sigma, shape (n_samples, 2 * NESLICE)
+        Y_targets = Iz_scaled_reshaped[:, :, :2].reshape(-1, NESLICE * 2)
+
+        # X inputs: predictors + charges
+        charges_scaled = Iz_scaled_reshaped[:, :, 2]
+        X_combined = np.hstack((x_scaled, charges_scaled))
+
+        # --- 5. Train / Test Split ---
+        X_train_full, X_test, Y_train_full, Y_test, ntrain_full, ntest = train_test_split(
+            X_combined, Y_targets, np.arange(X_combined.shape[0]), test_size=0.2, random_state=42)
+
+        X_train, X_validation, Y_train, Y_validation = train_test_split(
+            X_train_full, Y_train_full, test_size=0.2, random_state=42)
+
+        # --- 6. Model Initialization ---
+        print("\n--- Initializing Model ---")
+        rf_model = RandomForestRegressor(
+            n_estimators=500,        
+            max_depth=15,            
+            min_samples_leaf=5,      
+            random_state=42,
+            n_jobs=-1                
+        )
+
+        # Initialize wrapper (ensure n_eslice is explicitly passed)
+        model = SliceRegressorWrapper(rf_model, n_eslice=NESLICE)
+
+        # --- 7. Training ---
+        t0 = time.time()
+        print("\n--- Starting Model Fitting (One Shot) ---")
+        # The wrapper internally expands this to N * NESLICE rows
+        model.fit(X_train, Y_train)
+        t1 = time.time()
+
+        # --- 8. Evaluation ---
+        # predict() returns (mu, sigma, charge) for all slices -> shape (n_samples, 3 * n_eslice)
+        Y_train_pred_full = model.predict(X_train)
+        Y_val_pred_full = model.predict(X_validation)
+
+        # To calculate MSE fairly, we extract just the mu/sigma predictions to compare against our Y_train
+        Y_train_pred_musig = Y_train_pred_full.reshape(-1, NESLICE, 3)[:, :, :2].reshape(-1, NESLICE * 2)
+        Y_val_pred_musig = Y_val_pred_full.reshape(-1, NESLICE, 3)[:, :, :2].reshape(-1, NESLICE * 2)
+
+        train_mse = mean_squared_error(Y_train, Y_train_pred_musig)
+        val_mse = mean_squared_error(Y_validation, Y_val_pred_musig)
+
+        print("\n--- Training Results ---")
+        print(f"Total Fitting Time: {t1 - t0:.2f} seconds")
+        print(f"Final Train MSE (mu, sigma only): {train_mse:.6f}")
+        print(f"Final Validation MSE (mu, sigma only): {val_mse:.6f}")
+
+        print("\n--- Feature Importance ---")
+        for i, importance in enumerate(model.model.feature_importances_):
+            print(f"Feature {i} importance: {importance:.4f}")
+
+        # Inverse transform predictions for final output testing
+        pred_test_scaled_full = model.predict(X_test)
+        pred_test_full = iz_scaler.inverse_transform(pred_test_scaled_full)
+
+        elapsed = time.time() - t0
+        print("Elapsed time [mins] = {:.1f} ".format(elapsed/60))
+
+        # Compute R² score
+        def r2_score(true, pred):
+            RSS = np.sum((true - pred)**2)
+            TSS = np.sum((true - np.mean(true))**2)
+            return 1 - RSS / TSS if TSS != 0 else 0
+
+        # Compute R² on scaled data, instead of the actual bi-Gaussian parameters, to avoid distortion from different scales
+        print("Train R²: {:.2f} %".format(r2_score(Y_train, Y_train_pred_musig) * 100))
+        print("Test R²: {:.2f} %".format(r2_score(Y_test, Y_val_pred_musig) * 100))
+
+        # Optionally, compute SYAG and XTCAV alignment and also store it.
+        # gaussian filter parameter
+        hotPixThreshold = 1e3
+        sigma = 1
+        threshold = 5
+        # Do not specify xrange and yrange for SYAG, we don't need to zoom it, and we want the full image for alignment.
+        _, SYAGImages_raw, _, _ = extract_processed_images(data_struct, '', None, None, hotPixThreshold, sigma, threshold, [1], None, None, do_load_raw=True, directory_path=str(pathlib.Path(dataloc).parent), instrument = 'SYAG')# do_load_raw = False by default.
+        # Crop to the top quadrant and compute projection. this is due to SYAG camera geometry.
+        SYAGImages_cropped = SYAGImages_raw[:, :SYAGImages_raw.shape[1]//4]
+        SYAG_horz_proj = np.sum(SYAGImages_cropped, axis=1)
+        alignment_data = map_xtcav_to_syag(SYAG_horz_proj, LPSimg_prezoom)
+
+        time_stamp = time.strftime("%Y%m%d_%H%M%S")
+
+        data_to_save = {
+            'varNames': bsaVarNames_cleaned,
+            'bsaVarNames': bsaVars,
+            'nonBsaVarNames': nonBsaVars,
+            'model': model,
+            'iz_scaler': iz_scaler,
+            'x_scaler': x_scaler,
+            'xtcalibrationfactor': _xtcalibrationfactor * (xrange/100), #We Stretched the image in this function.
+            'image_model' : SliceGMM(xrange, yrange),
+            'architecture': {
+                'neslice': NESLICE,
+                'xrange': xrange,
+                'yrange': yrange,
+                'type': 'Gaussian Slice Random Forest v2026.03'
+            },
+            'syag_alignment_data' : alignment_data
+        }
+        data_file = output_file_path
+        with open(data_file, 'wb') as f:
+            pickle.dump(data_to_save, f)
+    
     @Slot(str)
     def handle_log(self, message):
         """Appends log messages to the PyDMLogDisplay"""
@@ -1840,15 +2134,7 @@ class VTCAVDisplay(Display):
         if self.worker:
             self.worker.stop()
         super().closeEvent(event)
-        
-    def updateStatus(self, status_text):
-        """Updates the UI status label and forces a visual refresh."""
-        if hasattr(self.ui, 'statusLabel'):
-            self.ui.statusLabel.setText(status_text)
-            
-            # Force Qt to update the GUI immediately
-            from qtpy.QtWidgets import QApplication
-            QApplication.processEvents()
+
     
 
 # Entry point for PyDM
