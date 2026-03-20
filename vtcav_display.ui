@@ -71,7 +71,7 @@
          </sizepolicy>
         </property>
         <property name="currentIndex">
-         <number>0</number>
+         <number>2</number>
         </property>
         <widget class="QWidget" name="tab">
          <attribute name="title">
@@ -619,8 +619,14 @@
             <height>16</height>
            </rect>
           </property>
+          <property name="sizePolicy">
+           <sizepolicy hsizetype="Preferred" vsizetype="Preferred">
+            <horstretch>0</horstretch>
+            <verstretch>0</verstretch>
+           </sizepolicy>
+          </property>
           <property name="text">
-           <string>Arch: CVAE16+RF</string>
+           <string>Arch:</string>
           </property>
           <property name="alignment">
            <set>Qt::AlignCenter</set>
@@ -654,6 +660,35 @@
           <property name="text">
            <string>Write To File</string>
           </property>
+         </widget>
+         <widget class="QComboBox" name="archComboBox">
+          <property name="geometry">
+           <rect>
+            <x>570</x>
+            <y>10</y>
+            <width>400</width>
+            <height>25</height>
+           </rect>
+          </property>
+          <property name="sizePolicy">
+           <sizepolicy hsizetype="Expanding" vsizetype="Fixed">
+            <horstretch>0</horstretch>
+            <verstretch>0</verstretch>
+           </sizepolicy>
+          </property>
+          <property name="currentIndex">
+           <number>0</number>
+          </property>
+          <item>
+           <property name="text">
+            <string>CVAE16+RF</string>
+           </property>
+          </item>
+          <item>
+           <property name="text">
+            <string>GaussianESlice+RF</string>
+           </property>
+          </item>
          </widget>
         </widget>
         <widget class="QWidget" name="tab_7">

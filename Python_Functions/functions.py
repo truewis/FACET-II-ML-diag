@@ -524,7 +524,7 @@ def analyze_SYAG(data_struct, experiment='', runname='',
                     right_idx += 1
                 fwhm_right = right_idx
                 first_peak_fwhms[a] = fwhm_right - fwhm_left
-            if peaks.size is not 2:
+            if peaks.size != 2:
                 dels[a] = 0.0
                 continue
             # Centroid analysis is optional.
@@ -573,6 +573,36 @@ def analyze_SYAG(data_struct, experiment='', runname='',
         'fig': fig,
         'sorted_idx': sorted_idx
     }
+
+# 2. Define the objective function for the optimizer
+def waterfall_alignment_objective(params, xtcav_axis, syag_axis, xtcav_norm, syag_norm):
+    scale, offset = params
+        
+    # Apply the linear transformation to the XTCAV pixel coordinates
+    # mapped_xtcav = scale * original_xtcav + offset
+    mapped_xtcav_axis = xtcav_axis * scale + offset
+        
+    # Interpolate the XTCAV data onto the fixed SYAG pixel grid
+    # bounds_error=False and fill_value=0 ensure that data shifted off-screen just becomes 0
+    interp_func = interp1d(
+        mapped_xtcav_axis, 
+        xtcav_norm, 
+        axis=0, 
+        bounds_error=False, 
+        fill_value=0.0
+    )
+    mapped_xtcav_data = interp_func(syag_axis)
+    
+    # Calculate the 2D Pearson correlation coefficient across the flattened arrays
+    corr = np.corrcoef(syag_norm.flatten(), mapped_xtcav_data.flatten())[0, 1]
+    
+    # If the arrays are entirely shifted out of bounds, correlation might be NaN
+    if np.isnan(corr):
+        return 0.0
+    
+    # We want to MAXIMIZE correlation, so we MINIMIZE the negative correlation
+    return -corr
+
 from scipy.interpolate import interp1d
 from scipy.optimize import differential_evolution
 def map_xtcav_to_syag(syag_waterfall, xtcav_waterfall):
@@ -600,49 +630,22 @@ def map_xtcav_to_syag(syag_waterfall, xtcav_waterfall):
     syag_axis = np.arange(n_syag_pix)
     xtcav_axis = np.arange(n_xtcav_pix)
 
-    # 2. Define the objective function for the optimizer
-    def objective(params):
-        scale, offset = params
-        
-        # Apply the linear transformation to the XTCAV pixel coordinates
-        # mapped_xtcav = scale * original_xtcav + offset
-        mapped_xtcav_axis = xtcav_axis * scale + offset
-        
-        # Interpolate the XTCAV data onto the fixed SYAG pixel grid
-        # bounds_error=False and fill_value=0 ensure that data shifted off-screen just becomes 0
-        interp_func = interp1d(
-            mapped_xtcav_axis, 
-            xtcav_norm, 
-            axis=0, 
-            bounds_error=False, 
-            fill_value=0.0
-        )
-        mapped_xtcav_data = interp_func(syag_axis)
-        
-        # Calculate the 2D Pearson correlation coefficient across the flattened arrays
-        corr = np.corrcoef(syag_norm.flatten(), mapped_xtcav_data.flatten())[0, 1]
-        
-        # If the arrays are entirely shifted out of bounds, correlation might be NaN
-        if np.isnan(corr):
-            return 0.0
-            
-        # We want to MAXIMIZE correlation, so we MINIMIZE the negative correlation
-        return -corr
-
     # 3. Define search bounds for [scale, offset]
     # Scale: assume XTCAV is anywhere from 25x smaller to 1x larger than SYAG
     # Offset: assume the shift could be up to the size of the SYAG screen
     bounds = [
-        (0.04, 1.0), 
-        (-n_syag_pix, n_syag_pix)
+        (5.0, 10.0), 
+        (-n_syag_pix/2, n_syag_pix/2)
     ]
+    # Define the initial guess based on typical ROI
+    initial_guess = [6.0, 100.0]
     
     print("Optimizing XTCAV to SYAG mapping. This may take a few seconds...")
     
     # 4. Run Global Optimization
     # seed=42 for reproducibility. workers=-1 uses all available CPU cores.
-    result = differential_evolution(objective, bounds, seed=42, workers=-1)
-    
+    opt_args = (xtcav_axis, syag_axis, xtcav_norm, syag_norm)
+    result = differential_evolution(waterfall_alignment_objective, bounds, args=opt_args, seed=42, workers=-1, x0=initial_guess)
     best_scale, best_offset = result.x
     max_corr = -result.fun
     
@@ -658,13 +661,42 @@ def map_xtcav_to_syag(syag_waterfall, xtcav_waterfall):
         fill_value=0.0
     )
     aligned_xtcav_waterfall = final_interp_func(syag_axis)
-    
+    # alignment_results = map_xtcav_to_syag(syag_waterfall, xtcav_waterfall)
+    plot_alignment(syag_waterfall, aligned_xtcav_waterfall)
     return {
         'scale': best_scale,
         'offset': best_offset,
         'correlation': max_corr,
         #'aligned_xtcav': aligned_xtcav_waterfall
     }
+
+import matplotlib.pyplot as plt
+
+def plot_alignment(syag_waterfall, aligned_xtcav):
+    """
+    Displays the SYAG waterfall and the mapped XTCAV waterfall side-by-side 
+    for visual verification of the alignment.
+    """
+    # Create a 1x2 subplot with shared axes for synchronized zooming
+    fig, axes = plt.subplots(1, 2, figsize=(14, 6), sharex=True, sharey=True)
+    
+    # Plot 1: Original SYAG Waterfall
+    im1 = axes[0].imshow(syag_waterfall, aspect='auto', origin='lower', cmap='viridis')
+    axes[0].set_title('SYAG Waterfall (Reference)')
+    axes[0].set_xlabel('Shot Number')
+    axes[0].set_ylabel('Pixel Index')
+    fig.colorbar(im1, ax=axes[0], label='Intensity', fraction=0.046, pad=0.04)
+    
+    # Plot 2: Aligned XTCAV Waterfall
+    im2 = axes[1].imshow(aligned_xtcav, aspect='auto', origin='lower', cmap='viridis')
+    axes[1].set_title('Aligned XTCAV Waterfall')
+    axes[1].set_xlabel('Shot Number')
+    # Y-label is omitted here since the axis is shared with the left plot
+    fig.colorbar(im2, ax=axes[1], label='Intensity', fraction=0.046, pad=0.04)
+    
+    plt.tight_layout()
+    plt.show()
+
 def matstruct_to_dict(obj):
     """
     Recursively convert MATLAB structs (loaded via scipy.io.loadmat) to Python dictionaries.
@@ -1273,14 +1305,10 @@ def extract_processed_images(data_struct, experiment, xrange=100, yrange=100, ho
         #Find data_struct.scalars.steps row numbers that correspond to this step
         row_indices = [i for i, ci in enumerate(data_struct.scalars.common_index) if data_struct.scalars.steps[ci-1] == step]
         # Now find the image common indices that correspond to these row indices
-        print(row_indices)
         img_common_indices = data_struct.images.DTOTR2.common_index[row_indices] - 1  # Convert to zero-based
         img_hdf5_pids = data_struct.images.DTOTR2.pid[img_common_indices]
-        print(img_hdf5_pids)
         # reconstruct hdf5 indices by matching pids
-        print(pid_list_each_step[step-1])
         img_hdf5_indices = [np.where(pid_list_each_step[step-1] == pid)[0][0] for pid in img_hdf5_pids]
-        print(img_hdf5_indices)
         for i in img_hdf5_indices:
             xtcavImages.append(images_each_step[step-1][i])
             if do_load_raw:

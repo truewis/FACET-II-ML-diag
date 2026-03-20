@@ -35,7 +35,8 @@ BSA_BUFFER_LENGTH = 2800
 EMPTY_BUFFER = np.zeros(BSA_BUFFER_LENGTH)
 CHARGE_PV_C = 'TORO:LI20:2452:TMIT'
 CHARGE_PV_U = 'TORO_LI20_2452_TMIT'
-
+SYAG_PV = 'CAMR:LI20:100:Image'
+        
 # DAQ Constants
 DAQPATH = "/nas/nas-li20-pm00/"
 sys.path.append("/usr/local/facet/tools/python")
@@ -54,6 +55,12 @@ class InferenceWorker(QThread):
         self.running = False
         self.display_images_rt = True
         self.model_data = None
+        self.alignment_data = None
+        self.n_eslice = 0
+        try:
+            self.syag_width = epics.PV(SYAG_PV+":ArraySize0_RBV").get()
+        except:
+            print("Warning: SYAG is not connected.")
         
         # Load resources and initialize the Buffer class
         self.load_model_resources()
@@ -71,15 +78,19 @@ class InferenceWorker(QThread):
             self.x_scaler = data['x_scaler']
             self.iz_scaler = data['iz_scaler']
             self.image_model = data['image_model']
+            self.xrange = data['architecture']['xrange']
+            self.yrange = data['architecture']['yrange']
             try:
-                self.n_eslice = data['n_eslice']
+                self.n_eslice = data['architecture']['n_eslice']
             except:
+                self.n_eslice = 0
                 self._log("Warning: No n_eslice found in the file.")
             try:
-                self.xtcalibrationfactor = data['xtcalibrationfactor']
+                self.xtcalibrationfactor_fs = data['xtcalibrationfactor']*1e15
+                self._log(f"xtcalibrationfactor is {self.xtcalibrationfactor_fs} [fs/pix].")
             except:
-                self.xtcalibrationfactor = 3.2 # known rough value for FACET-II
-                self._log("Warning: No xtcalibrationfactor found in the file.")
+                self.xtcalibrationfactor_fs = 6.5 # known rough value for FACET-II
+                self._log(f"Warning: No xtcalibrationfactor found in the file. Defaulting to {self.xtcalibrationfactor_fs} [fs/pix].")
             try:
                 self.alignment_data = data['syag_alignment_data']
             except:
@@ -244,20 +255,20 @@ class InferenceWorker(QThread):
     def emit_prediction(self, input_params, total_charge, real_time=False):
         try:
             X_test = torch.tensor(input_params, dtype=torch.float32)
-            
+            if self.n_eslice !=0 :
+                self._log(f"Using n_eslice={self.n_eslice} for SYAG projection.")
+                syag_projection = self.get_SYAG_projection(n_eslice=self.n_eslice)
+                # Normalize it so that the sum is 1.
+                syag_projection = syag_projection / np.sum(syag_projection)
+                #print(syag_projection)
+                # Append the syag_projection to the end of the pred_params as additional features for the image model.
+                X_test = np.concatenate([X_test, syag_projection[np.newaxis, :]], axis = 1)
             if hasattr(self.model, 'eval'): self.model.eval()
             with torch.no_grad():
                 z_pred_full = self.model.predict(X_test)
 
             pred_full = self.iz_scaler.inverse_transform(z_pred_full)
             pred_params = pred_full.flatten()
-            if self.n_eslice is not None:
-                self._log(f"Using n_eslice={self.n_eslice} for SYAG projection.")
-                syag_projection = self.get_SYAG_projection(n_eslice=self.n_eslice)
-                # Normalize it so that the sum is 1.
-                syag_projection = syag_projection / np.sum(syag_projection)
-                # Append the syag_projection to the end of the pred_params as additional features for the image model.
-                pred_params = np.concatenate([pred_params, syag_projection])
             image_data = self.image_model.params_to_image(pred_params, total_charge)
             # Figuring out orientation sucks. Seems to work without a T, but sometimes with a T.
             if self.display_images_rt or not real_time: 
@@ -271,59 +282,50 @@ class InferenceWorker(QThread):
         except Exception as e:
             raise e
             self._log(f"Prediction Error: {e}")
+    def get_SYAG_projection(self, n_eslice):
+        # import matplotlib.pyplot as plt
+        # Get array from EPICS PV
+        syag_data = epics.PV(SYAG_PV+":ArrayData").get()
+        
+        # Reshape to 2D
+        if syag_data is not None and self.syag_width is not None:
+            syag_image = np.array(syag_data).reshape(-1, self.syag_width).T
+            # Crop to top quadrant
+            #print(syag_image.shape)
+            #plt.imshow(syag_image)
+            #plt.show()
+            cropped_syag = syag_image[:, syag_image.shape[1]//4:]
+            syag_background = syag_image[:, :syag_image.shape[1]//4]
+            # Get horizontal projection
+            x_proj = np.sum(cropped_syag, axis=1)-np.sum(syag_background, axis=1)
+            # --- Apply XTCAV Alignment (Inverse Mapping) ---
+            if hasattr(self, 'alignment_data') and self.alignment_data is not None:
+                scale = self.alignment_data['scale']
+                offset = self.alignment_data['offset']
+                xtcav_width = 2* self.yrange
+                # 1. Define the target grid in XTCAV space
+                xtcav_grid = np.linspace(0, xtcav_width - 1, n_eslice)
+                
+                # 2. Map XTCAV coordinates to SYAG pixel coordinates 
+                # (Using the forward equation: SYAG_coord = XTCAV_coord * scale + offset)
+                syag_sample_coords = xtcav_grid * scale + offset
+                
+                # 3. Interpolate the SYAG projection at these overlapping coordinates
+                # left=0, right=0 ensures that if the XTCAV field of view looks 
+                # "outside" the SYAG screen bounds, it registers as 0 charge, not an edge artifact.
+                mapped_proj = np.interp(syag_sample_coords, np.arange(len(x_proj)), x_proj, left=0, right=0)
+                
+                # 4. Conserve Charge
+                # Since dy = scale * dx, the charge per bin must be scaled proportionally.
+                x_proj = mapped_proj * scale
+                
+            else:
+                # Fallback to the original unaligned behavior (maps entire SYAG screen)
+                x_proj = np.interp(np.linspace(0, len(x_proj)-1, n_eslice), np.arange(len(x_proj)), x_proj)
+                
+            return x_proj
+        return None
     
-def get_SYAG_projection(self, n_eslice=20):
-    SYAG_PV = 'CAMR:LI20:100:Image'
-    # Get array from EPICS PV
-    syag_data = epics.PV(SYAG_PV+":ArrayData").get()
-    
-    if self.syag_width is None:
-        self.syag_width = epics.PV(SYAG_PV+":ArraySize0_RBV").get()
-        
-    # Reshape to 2D
-    if syag_data is not None and self.syag_width is not None:
-        syag_image = np.array(syag_data).reshape(self.syag_width, -1)
-        # Crop to top quadrant
-        cropped_syag = syag_image[:, :syag_image.shape[0]//4]
-        # Get horizontal projection
-        x_proj = np.sum(cropped_syag, axis=1)
-        
-        # --- Apply XTCAV Alignment (Inverse Mapping) ---
-        if hasattr(self, 'alignment_data') and self.alignment_data is not None:
-            scale = self.alignment_data['scale']
-            offset = self.alignment_data['offset']
-            
-            # To map accurately, we need the original pixel width of the XTCAV camera 
-            # used during the alignment process.
-            # (If the alignment was done on XTCAV data already binned to n_eslice, 
-            # then xtcav_width is simply n_eslice).
-            xtcav_width = self.alignment_data.get('xtcav_width', getattr(self, 'xtcav_width', None))
-            if xtcav_width is None:
-                raise ValueError("XTCAV native width must be known to map SYAG back to XTCAV coordinates.")
-            
-            # 1. Define the target grid in XTCAV space
-            xtcav_grid = np.linspace(0, xtcav_width - 1, n_eslice)
-            
-            # 2. Map XTCAV coordinates to SYAG pixel coordinates 
-            # (Using the forward equation: SYAG_coord = XTCAV_coord * scale + offset)
-            syag_sample_coords = xtcav_grid * scale + offset
-            
-            # 3. Interpolate the SYAG projection at these overlapping coordinates
-            # left=0, right=0 ensures that if the XTCAV field of view looks 
-            # "outside" the SYAG screen bounds, it registers as 0 charge, not an edge artifact.
-            mapped_proj = np.interp(syag_sample_coords, np.arange(len(x_proj)), x_proj, left=0, right=0)
-            
-            # 4. Conserve Charge
-            # Since dy = scale * dx, the charge per bin must be scaled proportionally.
-            x_proj = mapped_proj * scale
-            
-        else:
-            # Fallback to the original unaligned behavior (maps entire SYAG screen)
-            x_proj = np.interp(np.linspace(0, len(x_proj)-1, n_eslice), np.arange(len(x_proj)), x_proj)
-            
-        return x_proj
-        
-    return None
         
     def fit_sep_um(self, image_data):
         """
@@ -369,9 +371,9 @@ def get_SYAG_projection(self, n_eslice=20):
             blen2 = abs(2*sigma2)
             # 5. Convert to micrometers (um)
             # Convert pixels to time (fs) using the calibration factor
-            time_separation_fs = pixel_separation * self.xtcalibrationfactor
-            blen1_fs = blen1 * self.xtcalibrationfactor
-            blen2_fs = blen2 * self.xtcalibrationfactor
+            time_separation_fs = pixel_separation * self.xtcalibrationfactor_fs
+            blen1_fs = blen1 * self.xtcalibrationfactor_fs
+            blen2_fs = blen2 * self.xtcalibrationfactor_fs
             # Convert time (fs) to distance (um) using the speed of light
             # c = 299,792,458 m/s ≈ 0.29979 um/fs
             separation_um = time_separation_fs * 0.299792458
@@ -985,7 +987,9 @@ class VTCAVDisplay(Display):
         # 2. Get Save Path
         # Use the first file in the list to suggest a default save name
         first_path_obj = pathlib.Path(preprocess_paths[0])
-        default_save_name = f"./models/{first_path_obj.name.replace('.pkl', '_model_data.pkl')}"
+        arch = self.ui.archComboBox.currentText()
+        name_place = first_path_obj.name.replace('.pkl', f'_{arch}_data.pkl')
+        default_save_name = f"./models/{name_place}"
         
         output_file_path, _ = QFileDialog.getSaveFileName(
             self,
@@ -1002,14 +1006,19 @@ class VTCAVDisplay(Display):
         print(f"Preparing data from {len(preprocess_paths)} file(s) and saving...")
         # Define architecture constants 
         NCOMP = 16 # Example default
-
         # 3. Train Model
         # Pass the list of paths directly to run_pairs
-        self.train_model_cvae_rf(
-            run_pairs=preprocess_paths,
-            n_comp=NCOMP,
-            output_file_path=output_file_path
-        )
+        if(arch == "CVAE16+RF"):
+            self.train_model_cvae_rf(
+                run_pairs=preprocess_paths,
+                n_comp=NCOMP,
+                output_file_path=output_file_path
+            )
+        elif(arch == "GaussianESlice+RF"):
+            self.train_model_slice_rf(
+                run_pairs=preprocess_paths,
+                output_file_path=output_file_path
+            )
         print("Model data written successfully.")
         
         # Refresh the UI dropdown so the new model is available
@@ -1262,8 +1271,8 @@ class VTCAVDisplay(Display):
             target_energy_view.plot(y_proj, y_indices)
 
             # Update Current Profile (Horizontal)
-            x_indices = np.arange(len(x_proj)) * self.worker.xtcalibrationfactor
-            x_proj = x_proj / self.worker.xtcalibrationfactor * 1.602e-4 # 1.602e-19 [C]/1e-15 [s]
+            x_indices = np.arange(len(x_proj)) * self.worker.xtcalibrationfactor_fs
+            x_proj = x_proj / self.worker.xtcalibrationfactor_fs * 1.602e-4 # 1.602e-19 [C]/1e-15 [s]
 
             target_current_view.clear()
             target_current_view.plot(x_indices, x_proj)
@@ -1694,19 +1703,13 @@ class VTCAVDisplay(Display):
 
 
         # 80/20 train-test split
-        x_train_full, x_test_scaled, Iz_train_full, Iz_test_scaled, ntrain, ntest = train_test_split(
+        x_train_scaled, x_test_scaled, Iz_train_scaled, Iz_test_scaled, ntrain, ntest = train_test_split(
             x_scaled, Iz_scaled, np.arange(Iz_scaled.shape[0]), test_size=0.2, random_state = 42)
-
-        # 20% validation split 
-        x_train_scaled, x_validation, Iz_train_scaled, y_validation = train_test_split(
-            x_train_full, Iz_train_full, test_size=0.2, random_state = 42)
 
         # Convert to PyTorch tensors
         X_train = torch.tensor(x_train_scaled, dtype=torch.float32)
-        x_validation = torch.tensor(x_validation, dtype=torch.float32)
         X_test = torch.tensor(x_test_scaled, dtype=torch.float32)
         Y_train = torch.tensor(Iz_train_scaled, dtype=torch.float32)
-        y_validation = torch.tensor(y_validation, dtype=torch.float32)
         Y_test = torch.tensor(Iz_test_scaled, dtype=torch.float32)
 
         train_ds = TensorDataset(X_train, Y_train)
@@ -1754,19 +1757,19 @@ class VTCAVDisplay(Display):
         train_mse = mean_squared_error(Y_train, Y_train_pred)
 
         # 2. Validation Set Evaluation
-        Y_val_pred = model.predict(x_validation)
-        val_mse = mean_squared_error(y_validation, Y_val_pred)
-
-
-        print("\n--- Training Results ---")
-        print(f"Total Fitting Time: {t1 - t0:.2f} seconds")
-        print(f"Final Train MSE: {train_mse:.6f}")
-        print(f"Final Validation MSE: {val_mse:.6f}")
+        Y_test_pred = model.predict(X_test)
+        test_mse = mean_squared_error(Y_test, Y_test_pred)
 
         # To see the importance of the input features:
         print("\n--- Feature Importance ---")
         for i, importance in enumerate(model.feature_importances_):
-            print(f"Feature {i} importance: {importance:.4f}")
+            print(f"{bsaVarNames_cleaned[i]} importance: {importance:.4f}")
+
+        print("\n--- Training Results ---")
+        print(f"Total Fitting Time: {t1 - t0:.2f} seconds")
+        print(f"Final Train MSE: {train_mse:.6f}")
+        print(f"Final Test MSE: {test_mse:.6f}")
+
         # Evaluate model
         pred_train_scaled = model.predict(X_train)
         pred_test_scaled = model.predict(X_test)
@@ -1788,7 +1791,6 @@ class VTCAVDisplay(Display):
         # Compute R² on scaled data, instead of the actual bi-Gaussian parameters, to avoid distortion from different scales
         print("Train R²: {:.2f} %".format(r2_score(Iz_train_scaled.ravel(), pred_train_scaled.ravel()) * 100))
         print("Test R²: {:.2f} %".format(r2_score(Iz_test_scaled.ravel(), pred_test_scaled.ravel()) * 100))
-
         time_stamp = time.strftime("%Y%m%d_%H%M%S")
 
         data_to_save = {
@@ -1951,7 +1953,7 @@ class VTCAVDisplay(Display):
             LPSimg_resized[i] = zoom(LPSimg_prezoom[i], (200/(2*yrange), 200/(2*xrange)), order=1)
         LPSimg = LPSimg_resized
 
-        NESLICE = 20
+        NESLICE = 30
         INPUT_CHANNELS = 1
 
         # 1. Setup Device
@@ -1972,10 +1974,10 @@ class VTCAVDisplay(Display):
                 # The slice is natively extracted via the zoomed dimension
                 slice_data = LPSimg_zoomed[i, j, :] 
                 x = np.arange(slice_data.shape[0])
-                
                 try:
-                    popt, _ = curve_fit(gaussian_1d, x, slice_data, p0=[slice_data.max(), slice_data.argmax(), 5])
-                    amp, mu, sigma = popt
+                    popt, _ = curve_fit(gaussian_1d, x, slice_data, p0=[slice_data.argmax(), 10, slice_data.max()])
+                    mu, sigma, amp = popt
+                    #print(f"mu: {mu}, sigma:{sigma}, eslice: {j}")
                 except RuntimeError:
                     amp, mu, sigma = 0, 0, 1 # Default fallback
                     
@@ -2005,14 +2007,19 @@ class VTCAVDisplay(Display):
 
         # X inputs: predictors + charges
         charges_scaled = Iz_scaled_reshaped[:, :, 2]
-        X_combined = np.hstack((x_scaled, charges_scaled))
+        # Calculate the sum of charges along the slice dimension (axis=1)
+        charge_sums = np.sum(charges_scaled, axis=1, keepdims=True)
+
+        # Prevent division by zero for samples that might have failed curve_fit completely
+        charge_sums[charge_sums == 0] = 1.0 
+
+        # Broadcast the division to normalize
+        charges_scaled_normalized = charges_scaled / charge_sums
+        X_combined = np.hstack((x_scaled, charges_scaled_normalized))
 
         # --- 5. Train / Test Split ---
-        X_train_full, X_test, Y_train_full, Y_test, ntrain_full, ntest = train_test_split(
+        X_train, X_test, Y_train, Y_test, ntrain, ntest = train_test_split(
             X_combined, Y_targets, np.arange(X_combined.shape[0]), test_size=0.2, random_state=42)
-
-        X_train, X_validation, Y_train, Y_validation = train_test_split(
-            X_train_full, Y_train_full, test_size=0.2, random_state=42)
 
         # --- 6. Model Initialization ---
         print("\n--- Initializing Model ---")
@@ -2037,24 +2044,26 @@ class VTCAVDisplay(Display):
         # --- 8. Evaluation ---
         # predict() returns (mu, sigma, charge) for all slices -> shape (n_samples, 3 * n_eslice)
         Y_train_pred_full = model.predict(X_train)
-        Y_val_pred_full = model.predict(X_validation)
+        Y_test_pred_full = model.predict(X_test)
 
         # To calculate MSE fairly, we extract just the mu/sigma predictions to compare against our Y_train
         Y_train_pred_musig = Y_train_pred_full.reshape(-1, NESLICE, 3)[:, :, :2].reshape(-1, NESLICE * 2)
-        Y_val_pred_musig = Y_val_pred_full.reshape(-1, NESLICE, 3)[:, :, :2].reshape(-1, NESLICE * 2)
+        Y_test_pred_musig = Y_test_pred_full.reshape(-1, NESLICE, 3)[:, :, :2].reshape(-1, NESLICE * 2)
 
         train_mse = mean_squared_error(Y_train, Y_train_pred_musig)
-        val_mse = mean_squared_error(Y_validation, Y_val_pred_musig)
+        test_mse = mean_squared_error(Y_test, Y_test_pred_musig)
+
+        print("\n--- Feature Importance ---")
+        for i, importance in enumerate(model.model.feature_importances_):
+            if (i<len(bsaVarNames_cleaned)):
+                print(f"{bsaVarNames_cleaned[i]} importance: {importance:.4f}")
+            else:
+                print(f"energy importance: {importance:.4f}")
 
         print("\n--- Training Results ---")
         print(f"Total Fitting Time: {t1 - t0:.2f} seconds")
         print(f"Final Train MSE (mu, sigma only): {train_mse:.6f}")
-        print(f"Final Validation MSE (mu, sigma only): {val_mse:.6f}")
-
-        print("\n--- Feature Importance ---")
-        for i, importance in enumerate(model.model.feature_importances_):
-            print(f"Feature {i} importance: {importance:.4f}")
-
+        print(f"Final Test MSE (mu, sigma only): {test_mse:.6f}")
         # Inverse transform predictions for final output testing
         pred_test_scaled_full = model.predict(X_test)
         pred_test_full = iz_scaler.inverse_transform(pred_test_scaled_full)
@@ -2070,19 +2079,22 @@ class VTCAVDisplay(Display):
 
         # Compute R² on scaled data, instead of the actual bi-Gaussian parameters, to avoid distortion from different scales
         print("Train R²: {:.2f} %".format(r2_score(Y_train, Y_train_pred_musig) * 100))
-        print("Test R²: {:.2f} %".format(r2_score(Y_test, Y_val_pred_musig) * 100))
-
+        print("Test R²: {:.2f} %".format(r2_score(Y_test, Y_test_pred_musig) * 100))
+        print("\n--- SYAG - LPS Alignment ---")
         # Optionally, compute SYAG and XTCAV alignment and also store it.
         # gaussian filter parameter
         hotPixThreshold = 1e3
         sigma = 1
         threshold = 5
         # Do not specify xrange and yrange for SYAG, we don't need to zoom it, and we want the full image for alignment.
-        _, SYAGImages_raw, _, _ = extract_processed_images(data_struct, '', None, None, hotPixThreshold, sigma, threshold, [1], None, None, do_load_raw=True, directory_path=str(pathlib.Path(dataloc).parent), instrument = 'SYAG')# do_load_raw = False by default.
+        _, SYAGImages_raw, _, _ = extract_processed_images(data_struct, '', None, None, hotPixThreshold, sigma, threshold, step_list=None, roi_xrange=None, roi_yrange=None, do_load_raw=True, directory_path=str(pathlib.Path(dataloc).parent), instrument = 'SYAG')# do_load_raw = False by default.
         # Crop to the top quadrant and compute projection. this is due to SYAG camera geometry.
-        SYAGImages_cropped = SYAGImages_raw[:, :SYAGImages_raw.shape[1]//4]
+        print(f"SYAG Raw Loaded:{SYAGImages_raw.shape}")
+        SYAGImages_cropped = SYAGImages_raw[:, SYAGImages_raw.shape[1]//4:, lps_idx]
         SYAG_horz_proj = np.sum(SYAGImages_cropped, axis=1)
-        alignment_data = map_xtcav_to_syag(SYAG_horz_proj, LPSimg_prezoom)
+        LPSimg_vert_proj = np.sum(LPSimg, axis=2).T
+        print(f"SYAG Waterfall Shape: {SYAG_horz_proj.shape}, LPS Waterfall Shape: {LPSimg_vert_proj.shape}")
+        alignment_data = map_xtcav_to_syag(SYAG_horz_proj, LPSimg_vert_proj)
 
         time_stamp = time.strftime("%Y%m%d_%H%M%S")
 
@@ -2096,7 +2108,7 @@ class VTCAVDisplay(Display):
             'xtcalibrationfactor': _xtcalibrationfactor * (xrange/100), #We Stretched the image in this function.
             'image_model' : SliceGMM(xrange, yrange),
             'architecture': {
-                'neslice': NESLICE,
+                'n_eslice': NESLICE,
                 'xrange': xrange,
                 'yrange': yrange,
                 'type': 'Gaussian Slice Random Forest v2026.03'
