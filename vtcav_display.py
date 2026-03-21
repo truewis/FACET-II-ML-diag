@@ -473,6 +473,7 @@ class VTCAVDisplay(Display):
         self.ui.shotNumberSlider_cmp.valueChanged.connect(self.on_compare_slider_change)
         self.ui.shotNumberSlider_cmp.valueChanged.connect(lambda idx: self.ui.shotNumber_cmp.setText(str(idx)+" / "+str(self.ui.shotNumberSlider_cmp.maximum())))
         self.ui.preprocessLoadButton_cmp.clicked.connect(self.handle_preprocess_load_cmp)
+        self.ui.computeCorrButton_cmp.clicked.connect(self.compute_compare_correlations)
         
         # Initialize state variables
         self.compare_truth_data = None # Will hold preprocessed images
@@ -487,8 +488,7 @@ class VTCAVDisplay(Display):
 
             # This is a 1 based index from MATLAB, which directly corresponds to the shot numbers in the DAQ data. We will use this to align the truth images with the correct DAQ rows for prediction.
             self.goodShots_scal_common_index_cmp = data['scalarCommonIndex']
-            self.load_daq_data(data['daqPath'])     
-            self.compute_compare_correlations()
+            self.load_daq_data(data['daqPath'])
             # Configure slider based on data length
             num_frames = len(self.compare_truth_data)
             self.ui.shotNumberSlider_cmp.setMinimum(0)
@@ -621,6 +621,8 @@ class VTCAVDisplay(Display):
         
         # 1. Update Truth Display immediately
         truth_image = self.compare_truth_data[index]
+        total_charge = self.predictors[index, self.predictor_vars.index(CHARGE_PV_C)] if CHARGE_PV_C in self.predictor_vars else 1
+        truth_image = truth_image / np.sum(truth_image)*total_charge
         self.update_image_display(truth_image, 'cmp_truth')
         
         # 2. Trigger Prediction
@@ -946,6 +948,7 @@ class VTCAVDisplay(Display):
                 self.ui.preprocessFilePath.setText(joined_paths)
             
             print(f"Selected preprocessed files: {joined_paths}")
+            
     def handle_preprocess_load_cmp(self):
         """
         Opens a file dialog to select a preprocessed pickle file.
@@ -1397,7 +1400,8 @@ class VTCAVDisplay(Display):
 
         minus_90_idx = np.where((xtcavPhase >= -91) & (xtcavPhase <= -89))[0]
         plus_90_idx = np.where((xtcavPhase >= 89) & (xtcavPhase <= 91))[0]
-        off_idx = np.where(xtcavPhase == 0)[0]
+        if (self.ui.auto_off_idx.isChecked() == False):
+            off_idx = np.where(xtcavPhase == 0)[0] 
         all_idx = np.append(minus_90_idx,plus_90_idx)
         # Extract current profiles and 2D LPS images 
         xtcavImages_list = []
@@ -1405,14 +1409,52 @@ class VTCAVDisplay(Display):
         horz_proj_list = []
         LPSImage = [] 
         xtcavImages_centroid_uncorrected, xtcavImages_raw, horz_proj, LPSImage = extract_processed_images(data_struct, '', xrange, yrange, hotPixThreshold, sigma, threshold, step_list, roi_xrange, roi_yrange, do_load_raw=False, directory_path=directory_path)# do_load_raw = False by default.
-
+        import matplotlib.pyplot as plt
+        if (self.ui.auto_off_idx.isChecked() == True):
+            projections = np.sum(xtcavImages_centroid_uncorrected, axis = 0)
+            pixel_indices = np.arange(projections.shape[0])[:, np.newaxis]
+            projections = projections / np.sum(projections, axis = 0, keepdims = True)
+            peaks = np.max(projections, axis = 0)
+            mean_peaks = np.mean(peaks)
+            mean_pos = np.sum(projections * pixel_indices, axis = 0, keepdims = True)
+            variances = np.sum(projections * (pixel_indices - mean_pos)**2, axis=0)
+            rms_widths = np.sqrt(variances)
+            avg_width = np.mean(rms_widths)
+            #Method 1. use width. Doesn't work because off shot width is not necessarily small.
+            #off_idx = np.where(rms_widths < avg_width*0.95)[0]
+            #Method 2. use peak
+            off_idx = np.where(peaks>mean_peaks*1.1)[0]
+            # unique values in all_idx that are NOT in off_idx
+            all_idx = np.setdiff1d(all_idx, off_idx)
+            fig, ax1 = plt.subplots(figsize = (12, 6))
+            ax1.hist(rms_widths, bins = 30)
+            ax1.set_ylabel('Count')
+            ax1.set_xlabel('Shot Index')
+            ax1.axvline(avg_width)
+            fig.tight_layout()
+            plt.show()
+        fig, ax1 = plt.subplots(figsize = (12, 6))
+        ax1.set_xlabel('Shot Index')
+        ax1.set_ylabel('Amplitude[MV]')
+        line1 = ax1.plot(xtcavAmpl, label = 'Amplitude')
+        ax2 = ax1.twinx()
+        ax2.set_ylabel('Phase(degrees)')
+        line2 = ax2.plot(xtcavPhase, label='Phase')
+        dots = ax2.plot(off_idx, xtcavPhase[off_idx], 'ro')
+        plt.title("TCAV Amplitude & Phase")
+        lines = line1+line2+dots
+        labels = [l.get_label() for l in lines]
+        ax1.legend(lines, labels, loc = 'upper left', framealpha = 0.9)
+        fig.tight_layout()
+        plt.show()
         # Use step_list to filter step_data
         scalars_data = data_struct.scalars.common_index-1
         step_data = data_struct.scalars.steps[scalars_data]
         print("Processing steps:", step_list)
         step_data_filtered = np.isin(step_data, step_list)
         step_data_tmp = np.array(step_data[step_data_filtered])
-        print(off_idx)
+        print("Number of Off Shots:", off_idx.shape)
+        print("Number of On Shots:", all_idx.shape)
         print("Those should be the same lengths:")
         print(step_data_tmp.shape)
         print(xtcavImages_centroid_uncorrected.shape)
