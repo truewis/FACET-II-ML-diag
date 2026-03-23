@@ -252,12 +252,12 @@ class InferenceWorker(QThread):
                 self._log(f"Warning: Prediction Thread Cannot Catch up at 10 Hz. Time took for prediction: {elapsed}.")
             time.sleep(max(0.01, 0.1 - elapsed))
 
-    def emit_prediction(self, input_params, total_charge, real_time=False):
+    def emit_prediction(self, input_params, total_charge, real_time=False, offline_syag_array=None, offline_syag_width=None):
         try:
             X_test = torch.tensor(input_params, dtype=torch.float32)
             if self.n_eslice !=0 :
                 self._log(f"Using n_eslice={self.n_eslice} for SYAG projection.")
-                syag_projection = self.get_SYAG_projection(n_eslice=self.n_eslice)
+                syag_projection = self.get_SYAG_projection(n_eslice=self.n_eslice, offline_syag_array=offline_syag_array, offline_syag_width=offline_syag_width)
                 # Normalize it so that the sum is 1.
                 syag_projection = syag_projection / np.sum(syag_projection)
                 #print(syag_projection)
@@ -282,10 +282,14 @@ class InferenceWorker(QThread):
         except Exception as e:
             raise e
             self._log(f"Prediction Error: {e}")
-    def get_SYAG_projection(self, n_eslice):
+    def get_SYAG_projection(self, n_eslice, offline_syag_array=None, offline_syag_width=None):
         # import matplotlib.pyplot as plt
         # Get array from EPICS PV
-        syag_data = epics.PV(SYAG_PV+":ArrayData").get()
+        if offline_syag_array is not None and offline_syag_width is not None:
+            syag_data = offline_syag_array
+            self.syag_width = offline_syag_width
+        else:
+            syag_data = epics.PV(SYAG_PV+":ArrayData").get()
         
         # Reshape to 2D
         if syag_data is not None and self.syag_width is not None:
@@ -401,6 +405,7 @@ class VTCAVDisplay(Display):
         self.worker = None
         self.predictors = None
         self.predictor_vars = None
+        self.SYAG_daq_images= None
 
         # 1. Setup UI Elements
         self.setup_model_ui()
@@ -671,7 +676,6 @@ class VTCAVDisplay(Display):
         # Array contains a single sample, hence reshape.
         filtered_predictor = self.predictors[index, var_indices].reshape(1, -1)
         scaled_predictor = self.worker.x_scaler.transform(filtered_predictor)
-
         try:
             self.worker.new_prediction_signal.disconnect()
         except Exception:
@@ -679,7 +683,12 @@ class VTCAVDisplay(Display):
         self.worker.new_prediction_signal.connect(
             lambda data: self.update_image_display(data, display_name)
         )
-        self.worker.emit_prediction(scaled_predictor, total_charge)
+        if(self.worker.n_eslice != 0):
+            offline_syag_array = self.SYAG_daq_images[index]
+            offline_syag_width = self.SYAG_daq_images[index].shape[1]
+            self.worker.emit_prediction(scaled_predictor, total_charge, real_time=False, offline_syag_array=offline_syag_array, offline_syag_width=offline_syag_width)
+        else:
+            self.worker.emit_prediction(scaled_predictor, total_charge)
         self.update_pv_values(filtered_predictor[0], np.array(self.worker.is_pv_bypassed))
 
     def init_plots(self):
@@ -747,6 +756,19 @@ class VTCAVDisplay(Display):
         self.handle_log(f"Loaded DAQ data with shape {predictor_current.shape}")
         self.ui.shotNumberSlider.setMaximum(predictor_current.shape[0])
         self.ui.shotNumberSlider.setMinimum(0)
+
+        # Optional: load SYAG images if available for the SYAG projection feature
+        if (self.worker.n_eslice != 0):
+            mat = loadmat(dataloc,struct_as_record=False, squeeze_me=True)
+            data_struct = mat['data_struct']
+            hotPixThreshold = 1e3
+            sigma = 1
+            threshold = 5
+            file_path_obj = pathlib.Path(dataloc)
+            _, syagImages_raw, _, _ = extract_processed_images(data_struct, '', 100, 100, hotPixThreshold, sigma, threshold, [1], None, None, do_load_raw=True, directory_path=str(file_path_obj.parent), instrument="SYAG")
+            # Dimensions of syagImages_raw should be (num_shots, height, width), but it is (height, width, num_shots) due to how MATLAB saves arrays. We need to transpose it to align with the shot indexing.
+            syagImages_raw = np.transpose(syagImages_raw, (2, 0, 1))
+            self.SYAG_daq_images = syagImages_raw
 
     def setup_pv_table(self):
         """
