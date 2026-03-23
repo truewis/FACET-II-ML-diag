@@ -1348,6 +1348,8 @@ class VTCAVDisplay(Display):
             yrange (int): Aspect ratio/size param for Y.
             output_file_path (str): Output pickle filename.
         """
+        if hasattr(self, 'updateStatus'):
+            self.updateStatus(f"Preprocessing...")
         daq_path_obj = pathlib.Path(daq_file_path)
         # Define XTCAV calibration
         krf = 239.26
@@ -1408,7 +1410,11 @@ class VTCAVDisplay(Display):
         xtcavImages_list_raw = []
         horz_proj_list = []
         LPSImage = [] 
-        xtcavImages_centroid_uncorrected, xtcavImages_raw, horz_proj, LPSImage = extract_processed_images(data_struct, '', xrange, yrange, hotPixThreshold, sigma, threshold, step_list, roi_xrange, roi_yrange, do_load_raw=False, directory_path=directory_path)# do_load_raw = False by default.
+        xtcavImages_centroid_uncorrected, _, horz_proj, LPSImage = extract_processed_images(data_struct, '', xrange, yrange, hotPixThreshold, sigma, threshold, step_list, roi_xrange, roi_yrange, do_load_raw=False, directory_path=directory_path)# do_load_raw = False by default.
+        p25 = np.percentile(xtcavImages_centroid_uncorrected, 25, axis= (0, 1), keepdims = True)
+        thresholds = 3*p25
+        xtcavImages_centroid_uncorrected[xtcavImages_centroid_uncorrected < thresholds] = 0
+        
         import matplotlib.pyplot as plt
         if (self.ui.auto_off_idx.isChecked() == True):
             projections = np.sum(xtcavImages_centroid_uncorrected, axis = 0)
@@ -1426,6 +1432,8 @@ class VTCAVDisplay(Display):
             off_idx = np.where(peaks>mean_peaks*1.1)[0]
             # unique values in all_idx that are NOT in off_idx
             all_idx = np.setdiff1d(all_idx, off_idx)
+            plus_90_idx = np.setdiff1d(plus_90_idx, off_idx)
+            minus_90_idx = np.setdiff1d(minus_90_idx, off_idx)
             fig, ax1 = plt.subplots(figsize = (12, 6))
             ax1.hist(rms_widths, bins = 30)
             ax1.set_ylabel('Count')
@@ -1440,7 +1448,7 @@ class VTCAVDisplay(Display):
         ax2 = ax1.twinx()
         ax2.set_ylabel('Phase(degrees)')
         line2 = ax2.plot(xtcavPhase, label='Phase')
-        dots = ax2.plot(off_idx, xtcavPhase[off_idx], 'ro')
+        dots = ax2.plot(off_idx, xtcavPhase[off_idx], 'ro', label = 'Off Shots')
         plt.title("TCAV Amplitude & Phase")
         lines = line1+line2+dots
         labels = [l.get_label() for l in lines]
@@ -1504,6 +1512,16 @@ class VTCAVDisplay(Display):
         # --- Filter the data based on the indexing logic from the MLP setup cell ---
 
         xtcavImages_good = xtcavImages[:,:, goodShots]
+        phase_class = np.full(xtcavImages.shape[2], np.nan)
+        umPerDeg = float(self.ui.umPerDegCal.toPlainText())
+        if umPerDeg>0:
+            factor = -1
+        else:
+            factor = 1
+        phase_class[off_idx] = 0
+        phase_class[plus_90_idx] = 90 * factor
+        phase_class[minus_90_idx] = -90 * factor
+        phase_class_good = phase_class[goodShots]
 
         # ----------------------------------------------------------------
 
@@ -1516,6 +1534,8 @@ class VTCAVDisplay(Display):
             'scalarCommonIndex': scalar_common_idx[goodShots],
             'daqPath': daq_file_path,
             'xtcalibrationfactor': _xtcalibrationfactor,
+            'phase_class': phase_class_good,
+            'umPerDeg': np.abs(umPerDeg),
             'description': '2D LPS Images (flattened) for good shots only, filtered by all_idx and then goodShots.'
         }
 
@@ -1524,6 +1544,8 @@ class VTCAVDisplay(Display):
             pickle.dump(data_to_save, f)
         print(f"Successfully saved good shot LPS Image data to '{filename}'.")
         print(f"Saved image shape: {xtcavImages_good.shape}")
+        if hasattr(self, 'updateStatus'):
+            self.updateStatus(f"Ready")
             
     def train_model_cvae_rf(self, run_pairs, n_comp, output_file_path):
         # ----------------------------------------------------------------------
@@ -1532,6 +1554,8 @@ class VTCAVDisplay(Display):
         all_images = []
         all_predictors = []
         all_indices = []
+        all_phase_classifications = []
+        all_umPerDeg = []
 
         print("Starting multi-run data loading and concatenation...")
 
@@ -1549,7 +1573,7 @@ class VTCAVDisplay(Display):
                 
                 LPSImage_good = data['LPSImage'] # Filtered LPS images
                 # This 'goodShots' index is relative to the phase-filtered data (all_idx).
-                goodShots_scal_common_index = data['scalarCommonIndex'] 
+                goodShots_scal_common_index = data['scalarCommonIndex']
                 
                 print(f"Loaded pickle_filename: LPSImage shape {LPSImage_good.shape}")
                 
@@ -1593,11 +1617,14 @@ class VTCAVDisplay(Display):
                 charge_filtered = charge[goodShots_scal_common_index - 1]
             # 6. Construct the predictor array
             predictor_current = np.vstack(bsaScalarData_filtered).T
-            
+            phase_classifications = data['phase_class']
+            umPerDeg = np.full(phase_classifications.shape[0], np.abs(data['umPerDeg']))
             # C. Append to master lists
             all_images.append(LPSImage_good)
             all_predictors.append(predictor_current)
             charge_merged.append(charge_filtered)
+            all_phase_classifications.append(phase_classifications)
+            all_umPerDeg.append(umPerDeg)
             
         # ----------------------------------------------------------------------
         # 4. Concatenate and finalize arrays
@@ -1613,23 +1640,18 @@ class VTCAVDisplay(Display):
         images_tmp = images_tmp.transpose(2, 0, 1)
         predictor_tmp = np.concatenate(all_predictors, axis=0)
         charge = np.concatenate(charge_merged, axis=0)
+        phase_class_tmp = np.concatenate(all_phase_classifications, axis=0)
+        umPerDeg_tmp = np.concatenate(all_umPerDeg, axis=0)
 
 
         print("\n--- Final Concatenated Data Shapes ---")
         print(f"Total LPS Images (images): {images_tmp.shape}")
         print(f"Total Predictors (predictor): {predictor_tmp.shape}")
+        print(f"Final Phase Class: {phase_class_tmp.shape}")
         self.update_image_display(np.average(images_tmp, axis = 0), display_name='Prep')
 
-        ampl_idx = next(i for i, var in enumerate(bsaVars) if 'TCAV_LI20_2400_A' in var)
-        xtcavAmpl = predictor_tmp[:, ampl_idx]
-
-        phase_idx = next(i for i, var in enumerate(bsaVars) if 'TCAV_LI20_2400_P' in var)
-        xtcavPhase = predictor_tmp[:, phase_idx]
-        xtcavOffShots = xtcavAmpl<0.1
-        xtcavPhase[xtcavOffShots] = 0 #Set this for ease of plotting
-        # 
-        near_minus_90_idx = np.where((xtcavPhase >= -90.55) & (xtcavPhase <= -89.55))[0]
-        near_plus_90_idx = np.where((xtcavPhase >= 89.55) & (xtcavPhase <= 90.55))[0]
+        near_minus_90_idx = np.where(phase_class_tmp == -90)[0]
+        near_plus_90_idx = np.where(phase_class_tmp == 90)[0]
         lps_idx = near_minus_90_idx.tolist() + near_plus_90_idx.tolist()
         # Flip image horizontally for -90 deg phase
         images_flipped = images_tmp.copy()
@@ -1662,7 +1684,12 @@ class VTCAVDisplay(Display):
         from scipy.ndimage import zoom
         LPSimg_resized = np.zeros((LPSimg_prezoom.shape[0], 200, 200), dtype=LPSimg_prezoom.dtype)
         for i in range(LPSimg_prezoom.shape[0]):
-            LPSimg_resized[i] = zoom(LPSimg_prezoom[i], (200/(2*yrange), 200/(2*xrange)), order=1)
+            tmpImage = zoom(LPSimg_prezoom[i], (1, umPerDeg_tmp[i] / cal), order=1)
+            # In case umPerDeg is different than the value here, stretch the image in x direction.
+            tmpImage = zoom(tmpImage, (200/tmpImage.shape[0], 200/tmpImage.shape[1]), order=1)
+            # The final width must remain the same.
+            LPSimg_resized[i] = tmpImage
+            
         LPSimg = LPSimg_resized
 
         
@@ -1862,6 +1889,8 @@ class VTCAVDisplay(Display):
         all_images = []
         all_predictors = []
         all_indices = []
+        all_phase_classifications = []
+        all_umPerDeg = []
 
         print("Starting multi-run data loading and concatenation...")
 
@@ -1879,7 +1908,7 @@ class VTCAVDisplay(Display):
                 
                 LPSImage_good = data['LPSImage'] # Filtered LPS images
                 # This 'goodShots' index is relative to the phase-filtered data (all_idx).
-                goodShots_scal_common_index = data['scalarCommonIndex'] 
+                goodShots_scal_common_index = data['scalarCommonIndex']
                 
                 print(f"Loaded pickle_filename: LPSImage shape {LPSImage_good.shape}")
                 
@@ -1923,11 +1952,14 @@ class VTCAVDisplay(Display):
                 charge_filtered = charge[goodShots_scal_common_index - 1]
             # 6. Construct the predictor array
             predictor_current = np.vstack(bsaScalarData_filtered).T
-            
+            phase_classifications = data['phase_class']
+            umPerDeg = np.full(phase_classifications.shape[0], np.abs(data['umPerDeg']))
             # C. Append to master lists
             all_images.append(LPSImage_good)
             all_predictors.append(predictor_current)
             charge_merged.append(charge_filtered)
+            all_phase_classifications.append(phase_classifications)
+            all_umPerDeg.append(umPerDeg)
             
         # ----------------------------------------------------------------------
         # 4. Concatenate and finalize arrays
@@ -1943,23 +1975,18 @@ class VTCAVDisplay(Display):
         images_tmp = images_tmp.transpose(2, 0, 1)
         predictor_tmp = np.concatenate(all_predictors, axis=0)
         charge = np.concatenate(charge_merged, axis=0)
+        phase_class_tmp = np.concatenate(all_phase_classifications, axis=0)
+        umPerDeg_tmp = np.concatenate(all_umPerDeg, axis=0)
 
 
         print("\n--- Final Concatenated Data Shapes ---")
         print(f"Total LPS Images (images): {images_tmp.shape}")
         print(f"Total Predictors (predictor): {predictor_tmp.shape}")
+        print(f"Final Phase Class: {phase_class_tmp.shape}")
         self.update_image_display(np.average(images_tmp, axis = 0), display_name='Prep')
 
-        ampl_idx = next(i for i, var in enumerate(bsaVars) if 'TCAV_LI20_2400_A' in var)
-        xtcavAmpl = predictor_tmp[:, ampl_idx]
-
-        phase_idx = next(i for i, var in enumerate(bsaVars) if 'TCAV_LI20_2400_P' in var)
-        xtcavPhase = predictor_tmp[:, phase_idx]
-        xtcavOffShots = xtcavAmpl<0.1
-        xtcavPhase[xtcavOffShots] = 0 #Set this for ease of plotting
-        # 
-        near_minus_90_idx = np.where((xtcavPhase >= -90.55) & (xtcavPhase <= -89.55))[0]
-        near_plus_90_idx = np.where((xtcavPhase >= 89.55) & (xtcavPhase <= 90.55))[0]
+        near_minus_90_idx = np.where(phase_class_tmp == -90)[0]
+        near_plus_90_idx = np.where(phase_class_tmp == 90)[0]
         lps_idx = near_minus_90_idx.tolist() + near_plus_90_idx.tolist()
         # Flip image horizontally for -90 deg phase
         images_flipped = images_tmp.copy()
@@ -1992,9 +2019,14 @@ class VTCAVDisplay(Display):
         from scipy.ndimage import zoom
         LPSimg_resized = np.zeros((LPSimg_prezoom.shape[0], 200, 200), dtype=LPSimg_prezoom.dtype)
         for i in range(LPSimg_prezoom.shape[0]):
-            LPSimg_resized[i] = zoom(LPSimg_prezoom[i], (200/(2*yrange), 200/(2*xrange)), order=1)
+            tmpImage = zoom(LPSimg_prezoom[i], (1, umPerDeg_tmp[i] / cal), order=1)
+            # In case umPerDeg is different than the value here, stretch the image in x direction.
+            tmpImage = zoom(tmpImage, (200/tmpImage.shape[0], 200/tmpImage.shape[1]), order=1)
+            # The final width must remain the same.
+            LPSimg_resized[i] = tmpImage
+            
         LPSimg = LPSimg_resized
-
+        
         NESLICE = 30
         INPUT_CHANNELS = 1
 

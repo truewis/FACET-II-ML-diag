@@ -71,7 +71,7 @@
          </sizepolicy>
         </property>
         <property name="currentIndex">
-         <number>4</number>
+         <number>2</number>
         </property>
         <widget class="QWidget" name="tab">
          <attribute name="title">
@@ -110,7 +110,14 @@
           </property>
           <layout class="QGridLayout" name="gridLayout">
            <item row="0" column="0">
-            <widget class="QWidget" name="energyProfile_1" native="true"/>
+            <widget class="QWidget" name="energyProfile_1" native="true">
+             <property name="sizePolicy">
+              <sizepolicy hsizetype="Minimum" vsizetype="Preferred">
+               <horstretch>0</horstretch>
+               <verstretch>0</verstretch>
+              </sizepolicy>
+             </property>
+            </widget>
            </item>
            <item row="0" column="1">
             <widget class="QWidget" name="imageContainer_1" native="true">
@@ -125,7 +132,7 @@
            <item row="1" column="0">
             <widget class="QLabel" name="label_5">
              <property name="text">
-              <string>&lt;html&gt;&lt;head/&gt;&lt;body&gt;&lt;p&gt;  1. Load model from top dropdown.&lt;/p&gt;&lt;p&gt;  2. Click Start.&lt;/p&gt;&lt;p&gt;&lt;span style=&quot; font-style:italic;&quot;&gt;  3. Hmm...Crisp and Flaky Beam...&lt;/span&gt;&lt;/p&gt;&lt;p&gt;&lt;span style=&quot; font-style:italic;&quot;&gt;  --JP--&lt;/span&gt;&lt;/p&gt;&lt;p&gt;&lt;br/&gt;&lt;/p&gt;&lt;/body&gt;&lt;/html&gt;</string>
+              <string>&lt;html&gt;&lt;head/&gt;&lt;body&gt;&lt;p&gt;1. Load model from top dropdown.&lt;/p&gt;&lt;p&gt;2. Click Start.&lt;/p&gt;&lt;p&gt;&lt;span style=&quot; font-style:italic;&quot;&gt;3. Hmm...Crisp and Flaky Beam...&lt;/span&gt;&lt;/p&gt;&lt;p&gt;&lt;span style=&quot; font-style:italic;&quot;&gt;--Head ----&amp;gt; Tail --&lt;/span&gt;&lt;/p&gt;&lt;p&gt;&lt;span style=&quot; font-style:italic;&quot;&gt;--JP--&lt;/span&gt;&lt;/p&gt;&lt;p&gt;&lt;br/&gt;&lt;/p&gt;&lt;/body&gt;&lt;/html&gt;</string>
              </property>
             </widget>
            </item>
@@ -276,7 +283,14 @@
           </property>
           <layout class="QGridLayout" name="gridLayout_4">
            <item row="0" column="0">
-            <widget class="QWidget" name="energyProfile_2" native="true"/>
+            <widget class="QWidget" name="energyProfile_2" native="true">
+             <property name="sizePolicy">
+              <sizepolicy hsizetype="Minimum" vsizetype="Preferred">
+               <horstretch>0</horstretch>
+               <verstretch>0</verstretch>
+              </sizepolicy>
+             </property>
+            </widget>
            </item>
            <item row="0" column="1">
             <widget class="QWidget" name="imageContainer_2" native="true">
@@ -291,7 +305,7 @@
            <item row="1" column="0">
             <widget class="QLabel" name="label_6">
              <property name="text">
-              <string>&lt;html&gt;&lt;head/&gt;&lt;body&gt;&lt;p&gt;1. Load model from top dropdown.&lt;/p&gt;&lt;p&gt;2. Load .mat file of DAQ.&lt;/p&gt;&lt;p&gt;3. Move sliders.&lt;/p&gt;&lt;p&gt;&lt;span style=&quot; font-style:italic;&quot;&gt;4. Hmm...Crisp and Flaky Beam...&lt;/span&gt;&lt;/p&gt;&lt;p&gt;&lt;span style=&quot; font-style:italic;&quot;&gt;--JP--&lt;/span&gt;&lt;/p&gt;&lt;p&gt;&lt;br/&gt;&lt;/p&gt;&lt;/body&gt;&lt;/html&gt;</string>
+              <string>&lt;html&gt;&lt;head/&gt;&lt;body&gt;&lt;p&gt;1. Load model from top dropdown.&lt;/p&gt;&lt;p&gt;2. Load .mat file of DAQ.&lt;/p&gt;&lt;p&gt;3. Move sliders.&lt;/p&gt;&lt;p&gt;&lt;span style=&quot; font-style:italic;&quot;&gt;4. Hmm...Crisp and Flaky Beam...&lt;/span&gt;&lt;/p&gt;&lt;p&gt;&lt;span style=&quot; font-style:italic;&quot;&gt;--Head ----&amp;gt; Tail --&lt;/span&gt;&lt;/p&gt;&lt;p&gt;&lt;span style=&quot; font-style:italic;&quot;&gt;--JP--&lt;/span&gt;&lt;/p&gt;&lt;p&gt;&lt;br/&gt;&lt;/p&gt;&lt;/body&gt;&lt;/html&gt;</string>
              </property>
             </widget>
            </item>
@@ -353,14 +367,14 @@
          <widget class="QLabel" name="shotNumber_4">
           <property name="geometry">
            <rect>
-            <x>435</x>
+            <x>415</x>
             <y>15</y>
-            <width>216</width>
+            <width>111</width>
             <height>16</height>
            </rect>
           </property>
           <property name="text">
-           <string>DTOTR2 Image Required</string>
+           <string>DTOTR2 um/deg</string>
           </property>
           <property name="alignment">
            <set>Qt::AlignCenter</set>
@@ -576,6 +590,19 @@
            <bool>true</bool>
           </property>
          </widget>
+         <widget class="QPlainTextEdit" name="umPerDegCal">
+          <property name="geometry">
+           <rect>
+            <x>530</x>
+            <y>10</y>
+            <width>66</width>
+            <height>26</height>
+           </rect>
+          </property>
+          <property name="plainText">
+           <string>1167</string>
+          </property>
+         </widget>
         </widget>
         <widget class="QWidget" name="tab_5">
          <attribute name="title">
@@ -741,12 +768,19 @@
             </widget>
            </item>
            <item row="0" column="0">
-            <widget class="QWidget" name="energyProfile_4" native="true"/>
+            <widget class="QWidget" name="energyProfile_4" native="true">
+             <property name="sizePolicy">
+              <sizepolicy hsizetype="Minimum" vsizetype="Preferred">
+               <horstretch>0</horstretch>
+               <verstretch>0</verstretch>
+              </sizepolicy>
+             </property>
+            </widget>
            </item>
            <item row="1" column="0">
             <widget class="QLabel" name="label_8">
              <property name="text">
-              <string>&lt;html&gt;&lt;head/&gt;&lt;body&gt;&lt;p&gt;True Image&lt;/p&gt;&lt;/body&gt;&lt;/html&gt;</string>
+              <string>&lt;html&gt;&lt;head/&gt;&lt;body&gt;&lt;p&gt;True Image&lt;/p&gt;&lt;p&gt;&lt;span style=&quot; font-style:italic;&quot;&gt;--Head ----&amp;gt; Tail --&lt;/span&gt;&lt;/p&gt;&lt;/body&gt;&lt;/html&gt;</string>
              </property>
             </widget>
            </item>
@@ -782,12 +816,19 @@
             </widget>
            </item>
            <item row="0" column="0">
-            <widget class="QWidget" name="energyProfile_5" native="true"/>
+            <widget class="QWidget" name="energyProfile_5" native="true">
+             <property name="sizePolicy">
+              <sizepolicy hsizetype="Minimum" vsizetype="Preferred">
+               <horstretch>0</horstretch>
+               <verstretch>0</verstretch>
+              </sizepolicy>
+             </property>
+            </widget>
            </item>
            <item row="1" column="0">
             <widget class="QLabel" name="label_9">
              <property name="text">
-              <string>&lt;html&gt;&lt;head/&gt;&lt;body&gt;&lt;p&gt;Prediction&lt;/p&gt;&lt;/body&gt;&lt;/html&gt;</string>
+              <string>&lt;html&gt;&lt;head/&gt;&lt;body&gt;&lt;p&gt;Prediction&lt;/p&gt;&lt;p&gt;&lt;span style=&quot; font-style:italic;&quot;&gt;--Head ----&amp;gt; Tail --&lt;/span&gt;&lt;/p&gt;&lt;/body&gt;&lt;/html&gt;</string>
              </property>
             </widget>
            </item>
