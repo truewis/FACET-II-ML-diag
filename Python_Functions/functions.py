@@ -1305,8 +1305,8 @@ def extract_processed_images(data_struct, experiment, xrange=100, yrange=100, ho
 		#Find data_struct.scalars.steps row numbers that correspond to this step
 		row_indices = [i for i, ci in enumerate(data_struct.scalars.common_index) if data_struct.scalars.steps[ci-1] == step]
 		# Now find the image common indices that correspond to these row indices
-		img_common_indices = data_struct.images.DTOTR2.common_index[row_indices] - 1  # Convert to zero-based
-		img_hdf5_pids = data_struct.images.DTOTR2.pid[img_common_indices]
+		img_common_indices = data_struct.images.getattr(instrument).common_index[row_indices] - 1  # Convert to zero-based
+		img_hdf5_pids = data_struct.images.getattr(instrument).pid[img_common_indices]
 		# reconstruct hdf5 indices by matching pids
 		img_hdf5_indices = [np.where(pid_list_each_step[step-1] == pid)[0][0] for pid in img_hdf5_pids]
 		for i in img_hdf5_indices:

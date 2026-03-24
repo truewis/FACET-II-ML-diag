@@ -17,7 +17,7 @@ from Python_Functions.cvae import CVAE, vae_loss, smooth_cvae_output
 from sklearn.preprocessing import MinMaxScaler
 from sklearn.model_selection import train_test_split
 import torch
-from scipy.io import loadmat
+from scipy.io import loadmat, savemat
 from scipy.optimize import curve_fit
 from scipy.ndimage import center_of_mass, shift
 from Python_Functions.functions import cropProfmonImg, map_xtcav_to_syag, matstruct_to_dict, extractDAQBSAScalars, extractDAQNonBSAScalars, segment_centroids_and_com, apply_tcav_zeroing_filter, apply_centroid_correction, extract_processed_images
@@ -444,11 +444,12 @@ class VTCAVDisplay(Display):
         
         # DAQ Interaction
         self.ui.daqLoadButton.clicked.connect(self.handle_daq_load)
+        self.ui.cpExportButton_daq.clicked.connect(lambda: self.export_current_profile(mode="daq"))
 
         # DAQ Shot Navigation: nextShotButton, prevShotButton, shotNumberSlider
         self.ui.nextShotButton.clicked.connect(self.daqNextShot)
         self.ui.prevShotButton.clicked.connect(self.daqPrevShot)
-        self.ui.shotNumberSlider.valueChanged.connect(lambda idx: self.emit_daq_image(index = idx, display_name='DAQ')) # Reload data when shot number changes
+        self.ui.shotNumberSlider.valueChanged.connect(lambda idx: self.emit_daq_image(index = self.goodShots_scal_common_idx[idx] - 1, display_name='DAQ')) # Reload data when shot number changes
         self.ui.shotNumberSlider.valueChanged.connect(lambda idx: self.ui.shotNumber.setText(str(idx)+" / "+str(self.ui.shotNumberSlider.maximum())))
         # Control
         self.ui.startPauseButton.clicked.connect(self.toggle_acquisition)
@@ -473,6 +474,7 @@ class VTCAVDisplay(Display):
         # Connect buttons
         self.ui.prevShotButton_cmp.clicked.connect(self.prev_compare_image)
         self.ui.nextShotButton_cmp.clicked.connect(self.next_compare_image)
+        self.ui.cpExportButton_cmp.clicked.connect(lambda: self.export_current_profile(mode="cmp"))
         
         # Connect slider (triggers when user drags or clicks)
         self.ui.shotNumberSlider_cmp.valueChanged.connect(self.on_compare_slider_change)
@@ -609,7 +611,88 @@ class VTCAVDisplay(Display):
             self.updateStatus("Ready")
 
         return corr_sep, corr_b1, corr_b2
+    def export_current_profile(self, mode):
+        """
+        Iterates through compare shots, generates predictions, 
+        and exports truth and predicted images to .pkl and .mat formats.
+        """
+        if not hasattr(self, 'compare_truth_data') or self.predictors is None:
+            print("Error: Compare data or DAQ data is not fully loaded.")
+            return
 
+        # 1. Open File Dialogue
+        file_path, _ = QFileDialog.getSaveFileName(
+            None, "Export Current Profile Data", "", "Data Files (*.pkl *.mat);;All Files (*)"
+        )
+        if not file_path:
+            return
+
+        # Remove extension to handle both formats
+        base_path = file_path.rsplit('.', 1)[0]
+        if(mode == "daq"):
+            scal_common_idx = self.goodShots_scal_common_idx
+        elif (mode == "cmp"):
+            scal_common_idx = self.goodShots_scal_common_idx_cmp
+        num_frames = len(scal_common_idx)
+        # Initialize lists to store the image data
+        all_pred_imgs = []
+
+        # Setup predictor indices (same as correlation logic)
+        if self.worker is None or not hasattr(self.worker, 'var_names'):
+            print("Error: Worker or var_names not initialized.")
+            return
+
+        var_indices = [
+            self.worker.var_names.index(var) 
+            for var in self.predictor_vars if var in self.worker.var_names
+        ]
+
+        if hasattr(self, 'updateStatus'):
+            self.updateStatus(f"Exporting {num_frames} shots...")
+
+        for i in range(num_frames):
+            # --- 2. Process Prediction Image ---
+            daq_idx = scal_common_idx[i] - 1
+
+            total_charge = None
+            if 'CHARGE_PV_C' in self.predictor_vars: # Assuming the constant name
+                charge_idx = self.predictor_vars.index('CHARGE_PV_C')
+                total_charge = self.predictors[daq_idx, charge_idx]
+
+            filtered_predictor = self.predictors[daq_idx, var_indices].reshape(1, -1)
+            scaled_predictor = self.worker.x_scaler.transform(filtered_predictor)
+
+            X_test = torch.tensor(scaled_predictor, dtype=torch.float32)
+
+            if hasattr(self.worker.model, 'eval'): 
+                self.worker.model.eval()
+
+            with torch.no_grad():
+                z_pred_full = self.worker.model.predict(X_test)
+
+            pred_full = self.worker.iz_scaler.inverse_transform(z_pred_full)
+            pred_params = pred_full.flatten()
+            pred_img = self.worker.image_model.params_to_image(pred_params, total_charge)
+            pred_img = np.sum(pred_img, axis = 0)/ self.worker.xtcalibrationfactor_fs * 1.602e-4 # 1.602e-19 [C]/1e-15 [s]
+            all_pred_imgs.append(pred_img)
+        # Convert to numpy arrays for export
+        data_dict = {
+            'current_profile': np.array(all_pred_imgs),
+            'fs_per_px': self.worker.xtcalibrationfactor_fs,
+            'num_frames': num_frames
+        }
+
+        # --- 3. Export to Pickle ---
+        with open(f"{base_path}.pkl", 'wb') as f:
+            pickle.dump(data_dict, f)
+
+        # --- 4. Export to Matlab ---
+        savemat(f"{base_path}.mat", data_dict)
+
+        print(f"Successfully exported data to {base_path}.pkl and .mat")
+        if hasattr(self, 'updateStatus'):
+            self.updateStatus("Export Complete")
+            
     def prev_compare_image(self):
         current_val = self.ui.shotNumberSlider_cmp.value()
         if current_val > 0:
@@ -754,7 +837,8 @@ class VTCAVDisplay(Display):
         self.predictors = predictor_tmp
         self.predictor_vars = [re.sub(r'(?<!^FAST)(?<!_FAST)_', ':', name) for name in bsaVars]
         self.handle_log(f"Loaded DAQ data with shape {predictor_current.shape}")
-        self.ui.shotNumberSlider.setMaximum(predictor_current.shape[0])
+        self.goodShots_scal_common_idx = data_struct.scalars.common_index
+        self.ui.shotNumberSlider.setMaximum(len(self.goodShots_scal_common_idx)-1)
         self.ui.shotNumberSlider.setMinimum(0)
 
         # Optional: load SYAG images if available for the SYAG projection feature
@@ -1226,6 +1310,7 @@ class VTCAVDisplay(Display):
             img_view.ui.roiBtn.hide()
             img_view.ui.menuBtn.hide()
             img_view.setColorMap(cmap)
+            img_view.view.setAspectLocked(False)
             
             img_container = getattr(self.ui, img_cnt)
             if img_container.layout() is None:
@@ -1415,8 +1500,8 @@ class VTCAVDisplay(Display):
         phase_idx = next(i for i, var in enumerate(bsaVars) if 'TCAV_LI20_2400_P' in var)
         xtcavPhase = bsaScalarData[phase_idx, :]
 
-        xtcavOffShots = xtcavAmpl<0.1
-        xtcavPhase[xtcavOffShots] = 0 #Set this for ease of plotting
+        #xtcavOffShots = xtcavAmpl<0.1
+        #xtcavPhase[xtcavOffShots] = 0 #XTCAV hardware change obsoleted this line.
 
         isChargePV = [bool(re.search(CHARGE_PV_U, pv)) for pv in bsaVars]
         pvidx = [i for i, val in enumerate(isChargePV) if val]
@@ -1425,7 +1510,29 @@ class VTCAVDisplay(Display):
         minus_90_idx = np.where((xtcavPhase >= -91) & (xtcavPhase <= -89))[0]
         plus_90_idx = np.where((xtcavPhase >= 89) & (xtcavPhase <= 91))[0]
         if (self.ui.auto_off_idx.isChecked() == False):
-            off_idx = np.where(xtcavPhase == 0)[0] 
+            off_idx = np.where(xtcavPhase == 0)[0]
+            # If there are too few off shots, something is wrong.
+            if off_idx.shape[0] < plus_90_idx.shape[0]*0.25:
+                # Try the new hardware logic where the off shots are slightly off angle in phase, not zero phase.
+                off_idx = np.where(((xtcavPhase >= 87) & (xtcavPhase <= 89)) | (xtcavPhase >= -89) & (xtcavPhase <= -87))[0]
+                # 2. Define your "nearness" threshold
+                # If the next index is > max_dist away, it's not a cluster
+                max_dist = 5 
+
+                if len(off_idx) > 1:
+                    # Calculate distance to the right and to the left
+                    diff_right = np.diff(off_idx)
+                    diff_left = np.insert(diff_right, 0, diff_right[0]) # Align with off_idx
+                    diff_right = np.append(diff_right, diff_right[-1]) # Align with off_idx
+                    
+                    # A point is "near" if either its left or right neighbor is within max_dist
+                    has_neighbor = (diff_left <= max_dist) | (diff_right <= max_dist)
+                    
+                    # Update off_idx to keep only clustered points
+                    off_idx = off_idx[has_neighbor]
+                else:
+                    # If there's only 1 or 0 points, they have no neighbors by definition
+                    off_idx = np.array([], dtype=int)
         all_idx = np.append(minus_90_idx,plus_90_idx)
         # Extract current profiles and 2D LPS images 
         xtcavImages_list = []
@@ -1433,6 +1540,13 @@ class VTCAVDisplay(Display):
         horz_proj_list = []
         LPSImage = [] 
         xtcavImages_centroid_uncorrected, _, horz_proj, LPSImage = extract_processed_images(data_struct, '', xrange, yrange, hotPixThreshold, sigma, threshold, step_list, roi_xrange, roi_yrange, do_load_raw=False, directory_path=directory_path)# do_load_raw = False by default.
+        # 1. Identify NaN values
+        # np.isnan returns a boolean mask of the same shape as your stack
+        nan_mask = np.isnan(xtcavImages_centroid_uncorrected)
+        
+        # 2. Replace NaNs with zero (standard for image processing)
+        xtcavImages_centroid_uncorrected[nan_mask] = 0
+
         p25 = np.percentile(xtcavImages_centroid_uncorrected, 25, axis= (0, 1), keepdims = True)
         thresholds = 3*p25
         xtcavImages_centroid_uncorrected[xtcavImages_centroid_uncorrected < thresholds] = 0
@@ -1441,8 +1555,32 @@ class VTCAVDisplay(Display):
         if (self.ui.auto_off_idx.isChecked() == True):
             projections = np.sum(xtcavImages_centroid_uncorrected, axis = 0)
             pixel_indices = np.arange(projections.shape[0])[:, np.newaxis]
-            projections = projections / np.sum(projections, axis = 0, keepdims = True)
+            col_sums = np.sum(projections, axis=0, keepdims=True)
+
+            # 3. Handle potential Zero-Division
+            # If a column sum is 0, dividing by it will create NaNs.
+            # We replace 0 with 1 for the division step (it stays 0 because 0/1 = 0)
+            col_sums[col_sums == 0] = 1
+            
+            # 4. Normalize
+            projections = projections / col_sums
             peaks = np.max(projections, axis = 0)
+
+            
+            # 3. Define the exclusion bounds (5th and 95th percentiles)
+            low_bound = np.percentile(peaks, 5)
+            high_bound = np.percentile(peaks, 95)
+            
+            # 4. Create a mask to exclude the top and bottom 5%
+            # This creates a boolean array of length nshot
+            mask = (peaks > low_bound) & (peaks < high_bound)
+            
+            # 5. Filter the projections to only include valid shots
+            projections = projections[:,mask]
+            
+            # 6. Recalculate peaks from the filtered set
+            peaks = np.max(projections, axis=0)
+            
             mean_peaks = np.mean(peaks)
             mean_pos = np.sum(projections * pixel_indices, axis = 0, keepdims = True)
             variances = np.sum(projections * (pixel_indices - mean_pos)**2, axis=0)
@@ -1457,10 +1595,10 @@ class VTCAVDisplay(Display):
             plus_90_idx = np.setdiff1d(plus_90_idx, off_idx)
             minus_90_idx = np.setdiff1d(minus_90_idx, off_idx)
             fig, ax1 = plt.subplots(figsize = (12, 6))
-            ax1.hist(rms_widths, bins = 30)
+            ax1.hist(peaks, bins = 30)
             ax1.set_ylabel('Count')
-            ax1.set_xlabel('Shot Index')
-            ax1.axvline(avg_width)
+            ax1.set_xlabel(f'Peak Height [pix], Mean = {mean_peaks}')
+            ax1.axvline(mean_peaks*1.1)
             fig.tight_layout()
             plt.show()
         fig, ax1 = plt.subplots(figsize = (12, 6))

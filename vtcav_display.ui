@@ -71,538 +71,460 @@
          </sizepolicy>
         </property>
         <property name="currentIndex">
-         <number>2</number>
+         <number>4</number>
         </property>
         <widget class="QWidget" name="tab">
          <attribute name="title">
           <string>Real-Time Prediction</string>
          </attribute>
-         <widget class="PyDMPushButton" name="startPauseButton">
-          <property name="geometry">
-           <rect>
-            <x>10</x>
-            <y>10</y>
-            <width>51</width>
-            <height>23</height>
-           </rect>
-          </property>
-          <property name="toolTip">
-           <string/>
-          </property>
-          <property name="text">
-           <string>Start</string>
-          </property>
-         </widget>
-         <widget class="QWidget" name="display1" native="true">
-          <property name="geometry">
-           <rect>
-            <x>-5</x>
-            <y>90</y>
-            <width>1391</width>
-            <height>698</height>
-           </rect>
-          </property>
-          <property name="sizePolicy">
-           <sizepolicy hsizetype="Preferred" vsizetype="Expanding">
-            <horstretch>0</horstretch>
-            <verstretch>3</verstretch>
-           </sizepolicy>
-          </property>
-          <layout class="QGridLayout" name="gridLayout">
-           <item row="0" column="0">
-            <widget class="QWidget" name="energyProfile_1" native="true">
-             <property name="sizePolicy">
-              <sizepolicy hsizetype="Minimum" vsizetype="Preferred">
-               <horstretch>0</horstretch>
-               <verstretch>0</verstretch>
-              </sizepolicy>
-             </property>
-            </widget>
-           </item>
-           <item row="0" column="1">
-            <widget class="QWidget" name="imageContainer_1" native="true">
-             <property name="sizePolicy">
-              <sizepolicy hsizetype="Expanding" vsizetype="Expanding">
-               <horstretch>0</horstretch>
-               <verstretch>0</verstretch>
-              </sizepolicy>
-             </property>
-            </widget>
-           </item>
-           <item row="1" column="0">
-            <widget class="QLabel" name="label_5">
-             <property name="text">
-              <string>&lt;html&gt;&lt;head/&gt;&lt;body&gt;&lt;p&gt;1. Load model from top dropdown.&lt;/p&gt;&lt;p&gt;2. Click Start.&lt;/p&gt;&lt;p&gt;&lt;span style=&quot; font-style:italic;&quot;&gt;3. Hmm...Crisp and Flaky Beam...&lt;/span&gt;&lt;/p&gt;&lt;p&gt;&lt;span style=&quot; font-style:italic;&quot;&gt;--Head ----&amp;gt; Tail --&lt;/span&gt;&lt;/p&gt;&lt;p&gt;&lt;span style=&quot; font-style:italic;&quot;&gt;--JP--&lt;/span&gt;&lt;/p&gt;&lt;p&gt;&lt;br/&gt;&lt;/p&gt;&lt;/body&gt;&lt;/html&gt;</string>
-             </property>
-            </widget>
-           </item>
-           <item row="1" column="1">
-            <widget class="QWidget" name="currentProfile_1" native="true"/>
-           </item>
-          </layout>
-          <zorder>currentProfile_1</zorder>
-          <zorder>energyProfile_1</zorder>
-          <zorder>imageContainer_1</zorder>
-          <zorder>label_5</zorder>
-         </widget>
-         <widget class="QCheckBox" name="doImage">
-          <property name="geometry">
-           <rect>
-            <x>105</x>
-            <y>10</y>
-            <width>441</width>
-            <height>21</height>
-           </rect>
-          </property>
-          <property name="text">
-           <string>Display Image (Disable for better performance during DAQ sessions)</string>
-          </property>
-          <property name="checked">
-           <bool>true</bool>
-          </property>
-         </widget>
+         <layout class="QVBoxLayout" name="verticalLayout_2">
+          <item>
+           <layout class="QHBoxLayout" name="horizontalLayout_3">
+            <item>
+             <widget class="PyDMPushButton" name="startPauseButton">
+              <property name="toolTip">
+               <string/>
+              </property>
+              <property name="text">
+               <string>Start</string>
+              </property>
+             </widget>
+            </item>
+            <item>
+             <widget class="QCheckBox" name="doImage">
+              <property name="text">
+               <string>Display Image (Disable for better performance during DAQ sessions)</string>
+              </property>
+              <property name="checked">
+               <bool>true</bool>
+              </property>
+             </widget>
+            </item>
+           </layout>
+          </item>
+          <item>
+           <widget class="QWidget" name="display1" native="true">
+            <property name="sizePolicy">
+             <sizepolicy hsizetype="Preferred" vsizetype="Expanding">
+              <horstretch>0</horstretch>
+              <verstretch>3</verstretch>
+             </sizepolicy>
+            </property>
+            <layout class="QGridLayout" name="gridLayout" rowstretch="1,1" columnstretch="1,5">
+             <item row="0" column="0">
+              <widget class="QWidget" name="energyProfile_1" native="true">
+               <property name="sizePolicy">
+                <sizepolicy hsizetype="Preferred" vsizetype="Preferred">
+                 <horstretch>0</horstretch>
+                 <verstretch>0</verstretch>
+                </sizepolicy>
+               </property>
+              </widget>
+             </item>
+             <item row="0" column="1">
+              <widget class="QWidget" name="imageContainer_1" native="true">
+               <property name="sizePolicy">
+                <sizepolicy hsizetype="Expanding" vsizetype="Expanding">
+                 <horstretch>0</horstretch>
+                 <verstretch>0</verstretch>
+                </sizepolicy>
+               </property>
+              </widget>
+             </item>
+             <item row="1" column="0">
+              <widget class="QLabel" name="label_5">
+               <property name="text">
+                <string>&lt;html&gt;&lt;head/&gt;&lt;body&gt;&lt;p&gt;1. Load model from top dropdown.&lt;/p&gt;&lt;p&gt;2. Click Start.&lt;/p&gt;&lt;p&gt;&lt;span style=&quot; font-style:italic;&quot;&gt;3. Hmm...Crisp and Flaky Beam...&lt;/span&gt;&lt;/p&gt;&lt;p&gt;&lt;span style=&quot; font-style:italic;&quot;&gt;--Head ----&amp;gt; Tail --&lt;/span&gt;&lt;/p&gt;&lt;p&gt;&lt;span style=&quot; font-style:italic;&quot;&gt;--JP--&lt;/span&gt;&lt;/p&gt;&lt;p&gt;&lt;br/&gt;&lt;/p&gt;&lt;/body&gt;&lt;/html&gt;</string>
+               </property>
+              </widget>
+             </item>
+             <item row="1" column="1">
+              <widget class="QWidget" name="currentProfile_1" native="true"/>
+             </item>
+            </layout>
+            <zorder>currentProfile_1</zorder>
+            <zorder>energyProfile_1</zorder>
+            <zorder>imageContainer_1</zorder>
+            <zorder>label_5</zorder>
+           </widget>
+          </item>
+         </layout>
         </widget>
         <widget class="QWidget" name="tab_2">
          <attribute name="title">
           <string>DAQ Analysis</string>
          </attribute>
-         <widget class="QLineEdit" name="daqFilePath">
-          <property name="geometry">
-           <rect>
-            <x>80</x>
-            <y>10</y>
-            <width>250</width>
-            <height>23</height>
-           </rect>
-          </property>
-          <property name="readOnly">
-           <bool>true</bool>
-          </property>
-          <property name="placeholderText">
-           <string>No file selected...</string>
-          </property>
-         </widget>
-         <widget class="PyDMPushButton" name="daqLoadButton">
-          <property name="geometry">
-           <rect>
-            <x>335</x>
-            <y>10</y>
-            <width>75</width>
-            <height>23</height>
-           </rect>
-          </property>
-          <property name="text">
-           <string>Load File...</string>
-          </property>
-         </widget>
-         <widget class="PyDMPushButton" name="nextShotButton">
-          <property name="geometry">
-           <rect>
-            <x>520</x>
-            <y>50</y>
-            <width>41</width>
-            <height>23</height>
-           </rect>
-          </property>
-          <property name="text">
-           <string>&gt;</string>
-          </property>
-         </widget>
-         <widget class="PyDMPushButton" name="prevShotButton">
-          <property name="geometry">
-           <rect>
-            <x>0</x>
-            <y>50</y>
-            <width>41</width>
-            <height>23</height>
-           </rect>
-          </property>
-          <property name="text">
-           <string>&lt;</string>
-          </property>
-         </widget>
-         <widget class="QLabel" name="shotNumber">
-          <property name="geometry">
-           <rect>
-            <x>215</x>
-            <y>40</y>
-            <width>131</width>
-            <height>16</height>
-           </rect>
-          </property>
-          <property name="text">
-           <string>TextLabel</string>
-          </property>
-          <property name="alignment">
-           <set>Qt::AlignCenter</set>
-          </property>
-         </widget>
-         <widget class="QSlider" name="shotNumberSlider">
-          <property name="geometry">
-           <rect>
-            <x>45</x>
-            <y>55</y>
-            <width>471</width>
-            <height>16</height>
-           </rect>
-          </property>
-          <property name="orientation">
-           <enum>Qt::Horizontal</enum>
-          </property>
-         </widget>
-         <widget class="QLabel" name="shotNumber_2">
-          <property name="geometry">
-           <rect>
-            <x>0</x>
-            <y>15</y>
-            <width>76</width>
-            <height>16</height>
-           </rect>
-          </property>
-          <property name="text">
-           <string>DAQ.mat file</string>
-          </property>
-          <property name="alignment">
-           <set>Qt::AlignCenter</set>
-          </property>
-         </widget>
-         <widget class="QWidget" name="display1_2" native="true">
-          <property name="geometry">
-           <rect>
-            <x>-5</x>
-            <y>90</y>
-            <width>1391</width>
-            <height>698</height>
-           </rect>
-          </property>
-          <property name="sizePolicy">
-           <sizepolicy hsizetype="Preferred" vsizetype="Expanding">
-            <horstretch>0</horstretch>
-            <verstretch>3</verstretch>
-           </sizepolicy>
-          </property>
-          <layout class="QGridLayout" name="gridLayout_4">
-           <item row="0" column="0">
-            <widget class="QWidget" name="energyProfile_2" native="true">
-             <property name="sizePolicy">
-              <sizepolicy hsizetype="Minimum" vsizetype="Preferred">
-               <horstretch>0</horstretch>
-               <verstretch>0</verstretch>
-              </sizepolicy>
-             </property>
-            </widget>
-           </item>
-           <item row="0" column="1">
-            <widget class="QWidget" name="imageContainer_2" native="true">
-             <property name="sizePolicy">
-              <sizepolicy hsizetype="Expanding" vsizetype="Expanding">
-               <horstretch>0</horstretch>
-               <verstretch>0</verstretch>
-              </sizepolicy>
-             </property>
-            </widget>
-           </item>
-           <item row="1" column="0">
-            <widget class="QLabel" name="label_6">
-             <property name="text">
-              <string>&lt;html&gt;&lt;head/&gt;&lt;body&gt;&lt;p&gt;1. Load model from top dropdown.&lt;/p&gt;&lt;p&gt;2. Load .mat file of DAQ.&lt;/p&gt;&lt;p&gt;3. Move sliders.&lt;/p&gt;&lt;p&gt;&lt;span style=&quot; font-style:italic;&quot;&gt;4. Hmm...Crisp and Flaky Beam...&lt;/span&gt;&lt;/p&gt;&lt;p&gt;&lt;span style=&quot; font-style:italic;&quot;&gt;--Head ----&amp;gt; Tail --&lt;/span&gt;&lt;/p&gt;&lt;p&gt;&lt;span style=&quot; font-style:italic;&quot;&gt;--JP--&lt;/span&gt;&lt;/p&gt;&lt;p&gt;&lt;br/&gt;&lt;/p&gt;&lt;/body&gt;&lt;/html&gt;</string>
-             </property>
-            </widget>
-           </item>
-           <item row="1" column="1">
-            <widget class="QWidget" name="currentProfile_2" native="true"/>
-           </item>
-          </layout>
-         </widget>
+         <layout class="QVBoxLayout" name="verticalLayout_5">
+          <item>
+           <layout class="QHBoxLayout" name="horizontalLayout_5">
+            <item>
+             <widget class="QLabel" name="shotNumber_2">
+              <property name="text">
+               <string>DAQ.mat file</string>
+              </property>
+              <property name="alignment">
+               <set>Qt::AlignCenter</set>
+              </property>
+             </widget>
+            </item>
+            <item>
+             <widget class="QLineEdit" name="daqFilePath">
+              <property name="readOnly">
+               <bool>true</bool>
+              </property>
+              <property name="placeholderText">
+               <string>No file selected...</string>
+              </property>
+             </widget>
+            </item>
+            <item>
+             <widget class="PyDMPushButton" name="daqLoadButton">
+              <property name="text">
+               <string>Load File...</string>
+              </property>
+             </widget>
+            </item>
+           </layout>
+          </item>
+          <item>
+           <layout class="QHBoxLayout" name="horizontalLayout_4">
+            <item>
+             <widget class="PyDMPushButton" name="prevShotButton">
+              <property name="text">
+               <string>&lt;</string>
+              </property>
+             </widget>
+            </item>
+            <item>
+             <layout class="QVBoxLayout" name="verticalLayout_3">
+              <item>
+               <widget class="QLabel" name="shotNumber">
+                <property name="sizePolicy">
+                 <sizepolicy hsizetype="Preferred" vsizetype="Preferred">
+                  <horstretch>0</horstretch>
+                  <verstretch>0</verstretch>
+                 </sizepolicy>
+                </property>
+                <property name="text">
+                 <string>TextLabel</string>
+                </property>
+                <property name="alignment">
+                 <set>Qt::AlignCenter</set>
+                </property>
+               </widget>
+              </item>
+              <item>
+               <widget class="QSlider" name="shotNumberSlider">
+                <property name="orientation">
+                 <enum>Qt::Horizontal</enum>
+                </property>
+               </widget>
+              </item>
+             </layout>
+            </item>
+            <item>
+             <widget class="PyDMPushButton" name="nextShotButton">
+              <property name="text">
+               <string>&gt;</string>
+              </property>
+             </widget>
+            </item>
+           </layout>
+          </item>
+          <item>
+           <widget class="QWidget" name="display1_2" native="true">
+            <property name="sizePolicy">
+             <sizepolicy hsizetype="Preferred" vsizetype="Expanding">
+              <horstretch>0</horstretch>
+              <verstretch>3</verstretch>
+             </sizepolicy>
+            </property>
+            <layout class="QGridLayout" name="gridLayout_4" rowstretch="1,1" columnstretch="1,5">
+             <item row="0" column="0">
+              <widget class="QWidget" name="energyProfile_2" native="true">
+               <property name="sizePolicy">
+                <sizepolicy hsizetype="Preferred" vsizetype="Preferred">
+                 <horstretch>0</horstretch>
+                 <verstretch>0</verstretch>
+                </sizepolicy>
+               </property>
+              </widget>
+             </item>
+             <item row="0" column="1">
+              <widget class="QWidget" name="imageContainer_2" native="true">
+               <property name="sizePolicy">
+                <sizepolicy hsizetype="Expanding" vsizetype="Expanding">
+                 <horstretch>0</horstretch>
+                 <verstretch>0</verstretch>
+                </sizepolicy>
+               </property>
+              </widget>
+             </item>
+             <item row="1" column="0">
+              <widget class="QLabel" name="label_6">
+               <property name="text">
+                <string>&lt;html&gt;&lt;head/&gt;&lt;body&gt;&lt;p&gt;1. Load model from top dropdown.&lt;/p&gt;&lt;p&gt;2. Load .mat file of DAQ.&lt;/p&gt;&lt;p&gt;3. Move sliders.&lt;/p&gt;&lt;p&gt;&lt;span style=&quot; font-style:italic;&quot;&gt;4. Hmm...Crisp and Flaky Beam...&lt;/span&gt;&lt;/p&gt;&lt;p&gt;&lt;span style=&quot; font-style:italic;&quot;&gt;--Head ----&amp;gt; Tail --&lt;/span&gt;&lt;/p&gt;&lt;p&gt;&lt;span style=&quot; font-style:italic;&quot;&gt;--JP--&lt;/span&gt;&lt;/p&gt;&lt;p&gt;&lt;br/&gt;&lt;/p&gt;&lt;/body&gt;&lt;/html&gt;</string>
+               </property>
+              </widget>
+             </item>
+             <item row="1" column="1">
+              <widget class="QWidget" name="currentProfile_2" native="true"/>
+             </item>
+            </layout>
+           </widget>
+          </item>
+          <item>
+           <widget class="PyDMPushButton" name="cpExportButton_daq">
+            <property name="text">
+             <string>Export Current Profile...</string>
+            </property>
+           </widget>
+          </item>
+         </layout>
         </widget>
         <widget class="QWidget" name="tab_6">
          <attribute name="title">
           <string>Preprocess XTCAV Image</string>
          </attribute>
-         <widget class="QLineEdit" name="tcavDaqFilePath">
-          <property name="geometry">
-           <rect>
-            <x>80</x>
-            <y>10</y>
-            <width>250</width>
-            <height>23</height>
-           </rect>
-          </property>
-          <property name="readOnly">
-           <bool>true</bool>
-          </property>
-          <property name="placeholderText">
-           <string>No file selected...</string>
-          </property>
-         </widget>
-         <widget class="PyDMPushButton" name="tcavDaqLoadButton">
-          <property name="geometry">
-           <rect>
-            <x>335</x>
-            <y>10</y>
-            <width>75</width>
-            <height>23</height>
-           </rect>
-          </property>
-          <property name="text">
-           <string>Load File...</string>
-          </property>
-         </widget>
-         <widget class="QLabel" name="shotNumber_3">
-          <property name="geometry">
-           <rect>
-            <x>0</x>
-            <y>15</y>
-            <width>76</width>
-            <height>16</height>
-           </rect>
-          </property>
-          <property name="text">
-           <string>DAQ.mat file</string>
-          </property>
-          <property name="alignment">
-           <set>Qt::AlignCenter</set>
-          </property>
-         </widget>
-         <widget class="QLabel" name="shotNumber_4">
-          <property name="geometry">
-           <rect>
-            <x>415</x>
-            <y>15</y>
-            <width>111</width>
-            <height>16</height>
-           </rect>
-          </property>
-          <property name="text">
-           <string>DTOTR2 um/deg</string>
-          </property>
-          <property name="alignment">
-           <set>Qt::AlignCenter</set>
-          </property>
-         </widget>
-         <widget class="QPlainTextEdit" name="xroiMin">
-          <property name="geometry">
-           <rect>
-            <x>75</x>
-            <y>35</y>
-            <width>66</width>
-            <height>26</height>
-           </rect>
-          </property>
-         </widget>
-         <widget class="QLabel" name="shotNumber_5">
-          <property name="geometry">
-           <rect>
-            <x>5</x>
-            <y>40</y>
-            <width>66</width>
-            <height>16</height>
-           </rect>
-          </property>
-          <property name="text">
-           <string>X ROI</string>
-          </property>
-          <property name="alignment">
-           <set>Qt::AlignCenter</set>
-          </property>
-         </widget>
-         <widget class="QLabel" name="shotNumber_6">
-          <property name="geometry">
-           <rect>
-            <x>5</x>
-            <y>60</y>
-            <width>66</width>
-            <height>16</height>
-           </rect>
-          </property>
-          <property name="text">
-           <string>Y ROI</string>
-          </property>
-          <property name="alignment">
-           <set>Qt::AlignCenter</set>
-          </property>
-         </widget>
-         <widget class="QPlainTextEdit" name="xroiMax">
-          <property name="geometry">
-           <rect>
-            <x>165</x>
-            <y>35</y>
-            <width>66</width>
-            <height>26</height>
-           </rect>
-          </property>
-         </widget>
-         <widget class="QPlainTextEdit" name="yroiMin">
-          <property name="geometry">
-           <rect>
-            <x>75</x>
-            <y>60</y>
-            <width>66</width>
-            <height>26</height>
-           </rect>
-          </property>
-         </widget>
-         <widget class="QPlainTextEdit" name="yroiMax">
-          <property name="geometry">
-           <rect>
-            <x>165</x>
-            <y>60</y>
-            <width>66</width>
-            <height>26</height>
-           </rect>
-          </property>
-         </widget>
-         <widget class="QPlainTextEdit" name="xrangeTimesTwo">
-          <property name="geometry">
-           <rect>
-            <x>320</x>
-            <y>35</y>
-            <width>66</width>
-            <height>26</height>
-           </rect>
-          </property>
-         </widget>
-         <widget class="QPlainTextEdit" name="yrangeTimesTwo">
-          <property name="geometry">
-           <rect>
-            <x>320</x>
-            <y>60</y>
-            <width>66</width>
-            <height>26</height>
-           </rect>
-          </property>
-         </widget>
-         <widget class="QLabel" name="shotNumber_7">
-          <property name="geometry">
-           <rect>
-            <x>250</x>
-            <y>40</y>
-            <width>66</width>
-            <height>16</height>
-           </rect>
-          </property>
-          <property name="text">
-           <string>Output W</string>
-          </property>
-          <property name="alignment">
-           <set>Qt::AlignCenter</set>
-          </property>
-         </widget>
-         <widget class="QLabel" name="shotNumber_8">
-          <property name="geometry">
-           <rect>
-            <x>250</x>
-            <y>65</y>
-            <width>66</width>
-            <height>16</height>
-           </rect>
-          </property>
-          <property name="text">
-           <string>Output H</string>
-          </property>
-          <property name="alignment">
-           <set>Qt::AlignCenter</set>
-          </property>
-         </widget>
-         <widget class="QLineEdit" name="preprocessWritePath">
-          <property name="geometry">
-           <rect>
-            <x>410</x>
-            <y>60</y>
-            <width>250</width>
-            <height>23</height>
-           </rect>
-          </property>
-          <property name="readOnly">
-           <bool>true</bool>
-          </property>
-          <property name="placeholderText">
-           <string>No file selected...</string>
-          </property>
-         </widget>
-         <widget class="PyDMPushButton" name="preprocessWriteButton">
-          <property name="geometry">
-           <rect>
-            <x>665</x>
-            <y>60</y>
-            <width>86</width>
-            <height>23</height>
-           </rect>
-          </property>
-          <property name="text">
-           <string>Write To File</string>
-          </property>
-         </widget>
-         <widget class="QWidget" name="display1_3" native="true">
-          <property name="geometry">
-           <rect>
-            <x>-5</x>
-            <y>90</y>
-            <width>1391</width>
-            <height>698</height>
-           </rect>
-          </property>
-          <property name="sizePolicy">
-           <sizepolicy hsizetype="Preferred" vsizetype="Expanding">
-            <horstretch>0</horstretch>
-            <verstretch>3</verstretch>
-           </sizepolicy>
-          </property>
-          <layout class="QGridLayout" name="gridLayout_5">
-           <item row="0" column="0">
-            <widget class="QWidget" name="energyProfile_3" native="true"/>
-           </item>
-           <item row="1" column="0">
-            <widget class="QLabel" name="label_7">
-             <property name="text">
-              <string>&lt;html&gt;&lt;head/&gt;&lt;body&gt;&lt;p&gt;1. Load .mat file of DAQ.&lt;/p&gt;&lt;p&gt;1A. Check averaged image.&lt;/p&gt;&lt;p&gt;2. Set X ROI, Y ROI.&lt;/p&gt;&lt;p&gt;3. output image dim.&lt;/p&gt;&lt;p&gt;4. Click Write To File.&lt;/p&gt;&lt;p&gt;&lt;span style=&quot; font-style:italic;&quot;&gt;--JP--&lt;/span&gt;&lt;/p&gt;&lt;p&gt;&lt;br/&gt;&lt;/p&gt;&lt;/body&gt;&lt;/html&gt;</string>
-             </property>
-            </widget>
-           </item>
-           <item row="1" column="1">
-            <widget class="QWidget" name="currentProfile_3" native="true"/>
-           </item>
-           <item row="0" column="1">
-            <widget class="QWidget" name="imageContainer_3" native="true">
-             <property name="sizePolicy">
-              <sizepolicy hsizetype="Expanding" vsizetype="Expanding">
-               <horstretch>0</horstretch>
-               <verstretch>0</verstretch>
-              </sizepolicy>
-             </property>
-            </widget>
-           </item>
-          </layout>
-         </widget>
-         <widget class="QCheckBox" name="auto_off_idx">
-          <property name="geometry">
-           <rect>
-            <x>410</x>
-            <y>35</y>
-            <width>441</width>
-            <height>21</height>
-           </rect>
-          </property>
-          <property name="text">
-           <string>Select Off Shot using var_x, not TCAV PV</string>
-          </property>
-          <property name="checked">
-           <bool>true</bool>
-          </property>
-         </widget>
-         <widget class="QPlainTextEdit" name="umPerDegCal">
-          <property name="geometry">
-           <rect>
-            <x>530</x>
-            <y>10</y>
-            <width>66</width>
-            <height>26</height>
-           </rect>
-          </property>
-          <property name="plainText">
-           <string>1167</string>
-          </property>
-         </widget>
+         <layout class="QVBoxLayout" name="verticalLayout_6" stretch="1,5">
+          <item>
+           <layout class="QGridLayout" name="gridLayout_8">
+            <item row="0" column="0">
+             <widget class="QLabel" name="shotNumber_3">
+              <property name="text">
+               <string>DAQ.mat file</string>
+              </property>
+              <property name="alignment">
+               <set>Qt::AlignCenter</set>
+              </property>
+             </widget>
+            </item>
+            <item row="0" column="1" colspan="4">
+             <widget class="QLineEdit" name="tcavDaqFilePath">
+              <property name="readOnly">
+               <bool>true</bool>
+              </property>
+              <property name="placeholderText">
+               <string>No file selected...</string>
+              </property>
+             </widget>
+            </item>
+            <item row="0" column="5">
+             <widget class="PyDMPushButton" name="tcavDaqLoadButton">
+              <property name="text">
+               <string>Load File...</string>
+              </property>
+             </widget>
+            </item>
+            <item row="0" column="6">
+             <widget class="QLabel" name="shotNumber_4">
+              <property name="text">
+               <string>DTOTR2 um/deg</string>
+              </property>
+              <property name="alignment">
+               <set>Qt::AlignCenter</set>
+              </property>
+             </widget>
+            </item>
+            <item row="0" column="7">
+             <widget class="QPlainTextEdit" name="umPerDegCal">
+              <property name="verticalScrollBarPolicy">
+               <enum>Qt::ScrollBarAlwaysOff</enum>
+              </property>
+              <property name="horizontalScrollBarPolicy">
+               <enum>Qt::ScrollBarAlwaysOff</enum>
+              </property>
+              <property name="tabChangesFocus">
+               <bool>true</bool>
+              </property>
+              <property name="plainText">
+               <string>1167</string>
+              </property>
+             </widget>
+            </item>
+            <item row="1" column="0">
+             <widget class="QLabel" name="shotNumber_5">
+              <property name="text">
+               <string>X ROI</string>
+              </property>
+              <property name="alignment">
+               <set>Qt::AlignCenter</set>
+              </property>
+             </widget>
+            </item>
+            <item row="1" column="1">
+             <widget class="QPlainTextEdit" name="xroiMin">
+              <property name="verticalScrollBarPolicy">
+               <enum>Qt::ScrollBarAlwaysOff</enum>
+              </property>
+              <property name="horizontalScrollBarPolicy">
+               <enum>Qt::ScrollBarAlwaysOff</enum>
+              </property>
+              <property name="tabChangesFocus">
+               <bool>true</bool>
+              </property>
+             </widget>
+            </item>
+            <item row="1" column="2">
+             <widget class="QPlainTextEdit" name="xroiMax">
+              <property name="verticalScrollBarPolicy">
+               <enum>Qt::ScrollBarAlwaysOff</enum>
+              </property>
+              <property name="horizontalScrollBarPolicy">
+               <enum>Qt::ScrollBarAlwaysOff</enum>
+              </property>
+              <property name="tabChangesFocus">
+               <bool>true</bool>
+              </property>
+             </widget>
+            </item>
+            <item row="1" column="3">
+             <widget class="QLabel" name="shotNumber_7">
+              <property name="text">
+               <string>Output W</string>
+              </property>
+              <property name="alignment">
+               <set>Qt::AlignCenter</set>
+              </property>
+             </widget>
+            </item>
+            <item row="1" column="4" colspan="2">
+             <widget class="QPlainTextEdit" name="xrangeTimesTwo">
+              <property name="verticalScrollBarPolicy">
+               <enum>Qt::ScrollBarAlwaysOff</enum>
+              </property>
+              <property name="horizontalScrollBarPolicy">
+               <enum>Qt::ScrollBarAlwaysOff</enum>
+              </property>
+              <property name="tabChangesFocus">
+               <bool>true</bool>
+              </property>
+             </widget>
+            </item>
+            <item row="1" column="6" colspan="3">
+             <widget class="QCheckBox" name="auto_off_idx">
+              <property name="text">
+               <string>Select Off Shot using var_x, not TCAV PV</string>
+              </property>
+              <property name="checked">
+               <bool>true</bool>
+              </property>
+             </widget>
+            </item>
+            <item row="2" column="0">
+             <widget class="QLabel" name="shotNumber_6">
+              <property name="text">
+               <string>Y ROI</string>
+              </property>
+              <property name="alignment">
+               <set>Qt::AlignCenter</set>
+              </property>
+             </widget>
+            </item>
+            <item row="2" column="1">
+             <widget class="QPlainTextEdit" name="yroiMin">
+              <property name="verticalScrollBarPolicy">
+               <enum>Qt::ScrollBarAlwaysOff</enum>
+              </property>
+              <property name="horizontalScrollBarPolicy">
+               <enum>Qt::ScrollBarAlwaysOff</enum>
+              </property>
+              <property name="tabChangesFocus">
+               <bool>true</bool>
+              </property>
+             </widget>
+            </item>
+            <item row="2" column="2">
+             <widget class="QPlainTextEdit" name="yroiMax">
+              <property name="verticalScrollBarPolicy">
+               <enum>Qt::ScrollBarAlwaysOff</enum>
+              </property>
+              <property name="horizontalScrollBarPolicy">
+               <enum>Qt::ScrollBarAlwaysOff</enum>
+              </property>
+              <property name="tabChangesFocus">
+               <bool>true</bool>
+              </property>
+             </widget>
+            </item>
+            <item row="2" column="3">
+             <widget class="QLabel" name="shotNumber_8">
+              <property name="text">
+               <string>Output H</string>
+              </property>
+              <property name="alignment">
+               <set>Qt::AlignCenter</set>
+              </property>
+             </widget>
+            </item>
+            <item row="2" column="4" colspan="2">
+             <widget class="QPlainTextEdit" name="yrangeTimesTwo">
+              <property name="verticalScrollBarPolicy">
+               <enum>Qt::ScrollBarAlwaysOff</enum>
+              </property>
+              <property name="horizontalScrollBarPolicy">
+               <enum>Qt::ScrollBarAlwaysOff</enum>
+              </property>
+              <property name="tabChangesFocus">
+               <bool>true</bool>
+              </property>
+             </widget>
+            </item>
+            <item row="2" column="6" colspan="2">
+             <widget class="QLineEdit" name="preprocessWritePath">
+              <property name="readOnly">
+               <bool>true</bool>
+              </property>
+              <property name="placeholderText">
+               <string>No file selected...</string>
+              </property>
+             </widget>
+            </item>
+            <item row="2" column="8">
+             <widget class="PyDMPushButton" name="preprocessWriteButton">
+              <property name="text">
+               <string>Write To File</string>
+              </property>
+             </widget>
+            </item>
+           </layout>
+          </item>
+          <item>
+           <widget class="QWidget" name="display1_3" native="true">
+            <property name="sizePolicy">
+             <sizepolicy hsizetype="Preferred" vsizetype="Expanding">
+              <horstretch>0</horstretch>
+              <verstretch>3</verstretch>
+             </sizepolicy>
+            </property>
+            <layout class="QGridLayout" name="gridLayout_5" rowstretch="1,1" columnstretch="1,5">
+             <item row="0" column="0">
+              <widget class="QWidget" name="energyProfile_3" native="true"/>
+             </item>
+             <item row="1" column="0">
+              <widget class="QLabel" name="label_7">
+               <property name="text">
+                <string>&lt;html&gt;&lt;head/&gt;&lt;body&gt;&lt;p&gt;1. Load .mat file of DAQ.&lt;/p&gt;&lt;p&gt;1A. Check averaged image.&lt;/p&gt;&lt;p&gt;2. Set X ROI, Y ROI.&lt;/p&gt;&lt;p&gt;3. output image dim.&lt;/p&gt;&lt;p&gt;4. Click Write To File.&lt;/p&gt;&lt;p&gt;&lt;span style=&quot; font-style:italic;&quot;&gt;--JP--&lt;/span&gt;&lt;/p&gt;&lt;p&gt;&lt;br/&gt;&lt;/p&gt;&lt;/body&gt;&lt;/html&gt;</string>
+               </property>
+              </widget>
+             </item>
+             <item row="1" column="1">
+              <widget class="QWidget" name="currentProfile_3" native="true"/>
+             </item>
+             <item row="0" column="1">
+              <widget class="QWidget" name="imageContainer_3" native="true">
+               <property name="sizePolicy">
+                <sizepolicy hsizetype="Expanding" vsizetype="Expanding">
+                 <horstretch>0</horstretch>
+                 <verstretch>0</verstretch>
+                </sizepolicy>
+               </property>
+              </widget>
+             </item>
+            </layout>
+           </widget>
+          </item>
+         </layout>
         </widget>
         <widget class="QWidget" name="tab_5">
          <attribute name="title">
@@ -738,231 +660,178 @@
          <attribute name="title">
           <string>Compare...</string>
          </attribute>
-         <widget class="QWidget" name="display1_4" native="true">
-          <property name="geometry">
-           <rect>
-            <x>-5</x>
-            <y>95</y>
-            <width>1391</width>
-            <height>376</height>
-           </rect>
-          </property>
-          <property name="sizePolicy">
-           <sizepolicy hsizetype="Preferred" vsizetype="Expanding">
-            <horstretch>0</horstretch>
-            <verstretch>3</verstretch>
-           </sizepolicy>
-          </property>
-          <layout class="QGridLayout" name="gridLayout_6">
-           <item row="1" column="1">
-            <widget class="QWidget" name="currentProfile_4" native="true"/>
-           </item>
-           <item row="0" column="1">
-            <widget class="QWidget" name="imageContainer_4" native="true">
-             <property name="sizePolicy">
-              <sizepolicy hsizetype="Expanding" vsizetype="Expanding">
-               <horstretch>0</horstretch>
-               <verstretch>0</verstretch>
-              </sizepolicy>
-             </property>
-            </widget>
-           </item>
-           <item row="0" column="0">
-            <widget class="QWidget" name="energyProfile_4" native="true">
-             <property name="sizePolicy">
-              <sizepolicy hsizetype="Minimum" vsizetype="Preferred">
-               <horstretch>0</horstretch>
-               <verstretch>0</verstretch>
-              </sizepolicy>
-             </property>
-            </widget>
-           </item>
-           <item row="1" column="0">
-            <widget class="QLabel" name="label_8">
-             <property name="text">
-              <string>&lt;html&gt;&lt;head/&gt;&lt;body&gt;&lt;p&gt;True Image&lt;/p&gt;&lt;p&gt;&lt;span style=&quot; font-style:italic;&quot;&gt;--Head ----&amp;gt; Tail --&lt;/span&gt;&lt;/p&gt;&lt;/body&gt;&lt;/html&gt;</string>
-             </property>
-            </widget>
-           </item>
-          </layout>
-         </widget>
-         <widget class="QWidget" name="display1_5" native="true">
-          <property name="geometry">
-           <rect>
-            <x>-5</x>
-            <y>470</y>
-            <width>1391</width>
-            <height>376</height>
-           </rect>
-          </property>
-          <property name="sizePolicy">
-           <sizepolicy hsizetype="Preferred" vsizetype="Expanding">
-            <horstretch>0</horstretch>
-            <verstretch>3</verstretch>
-           </sizepolicy>
-          </property>
-          <layout class="QGridLayout" name="gridLayout_7">
-           <item row="1" column="1">
-            <widget class="QWidget" name="currentProfile_5" native="true"/>
-           </item>
-           <item row="0" column="1">
-            <widget class="QWidget" name="imageContainer_5" native="true">
-             <property name="sizePolicy">
-              <sizepolicy hsizetype="Expanding" vsizetype="Expanding">
-               <horstretch>0</horstretch>
-               <verstretch>0</verstretch>
-              </sizepolicy>
-             </property>
-            </widget>
-           </item>
-           <item row="0" column="0">
-            <widget class="QWidget" name="energyProfile_5" native="true">
-             <property name="sizePolicy">
-              <sizepolicy hsizetype="Minimum" vsizetype="Preferred">
-               <horstretch>0</horstretch>
-               <verstretch>0</verstretch>
-              </sizepolicy>
-             </property>
-            </widget>
-           </item>
-           <item row="1" column="0">
-            <widget class="QLabel" name="label_9">
-             <property name="text">
-              <string>&lt;html&gt;&lt;head/&gt;&lt;body&gt;&lt;p&gt;Prediction&lt;/p&gt;&lt;p&gt;&lt;span style=&quot; font-style:italic;&quot;&gt;--Head ----&amp;gt; Tail --&lt;/span&gt;&lt;/p&gt;&lt;/body&gt;&lt;/html&gt;</string>
-             </property>
-            </widget>
-           </item>
-          </layout>
-         </widget>
-         <widget class="QLabel" name="shotNumber_11">
-          <property name="geometry">
-           <rect>
-            <x>5</x>
-            <y>15</y>
-            <width>131</width>
-            <height>16</height>
-           </rect>
-          </property>
-          <property name="text">
-           <string>Preprocessed.pkl file</string>
-          </property>
-          <property name="alignment">
-           <set>Qt::AlignCenter</set>
-          </property>
-         </widget>
-         <widget class="QLineEdit" name="preprocessFilePath_cmp">
-          <property name="geometry">
-           <rect>
-            <x>140</x>
-            <y>10</y>
-            <width>250</width>
-            <height>23</height>
-           </rect>
-          </property>
-          <property name="readOnly">
-           <bool>true</bool>
-          </property>
-          <property name="placeholderText">
-           <string>No file selected...</string>
-          </property>
-         </widget>
-         <widget class="PyDMPushButton" name="preprocessLoadButton_cmp">
-          <property name="geometry">
-           <rect>
-            <x>395</x>
-            <y>10</y>
-            <width>75</width>
-            <height>23</height>
-           </rect>
-          </property>
-          <property name="text">
-           <string>Load File...</string>
-          </property>
-         </widget>
-         <widget class="PyDMPushButton" name="prevShotButton_cmp">
-          <property name="geometry">
-           <rect>
-            <x>0</x>
-            <y>50</y>
-            <width>41</width>
-            <height>23</height>
-           </rect>
-          </property>
-          <property name="text">
-           <string>&lt;</string>
-          </property>
-         </widget>
-         <widget class="QSlider" name="shotNumberSlider_cmp">
-          <property name="geometry">
-           <rect>
-            <x>45</x>
-            <y>55</y>
-            <width>471</width>
-            <height>16</height>
-           </rect>
-          </property>
-          <property name="orientation">
-           <enum>Qt::Horizontal</enum>
-          </property>
-         </widget>
-         <widget class="PyDMPushButton" name="nextShotButton_cmp">
-          <property name="geometry">
-           <rect>
-            <x>520</x>
-            <y>50</y>
-            <width>41</width>
-            <height>23</height>
-           </rect>
-          </property>
-          <property name="text">
-           <string>&gt;</string>
-          </property>
-         </widget>
-         <widget class="QLabel" name="shotNumber_cmp">
-          <property name="geometry">
-           <rect>
-            <x>215</x>
-            <y>40</y>
-            <width>131</width>
-            <height>16</height>
-           </rect>
-          </property>
-          <property name="text">
-           <string>TextLabel</string>
-          </property>
-          <property name="alignment">
-           <set>Qt::AlignCenter</set>
-          </property>
-         </widget>
-         <widget class="QLabel" name="shotNumberCI_cmp">
-          <property name="geometry">
-           <rect>
-            <x>355</x>
-            <y>40</y>
-            <width>131</width>
-            <height>16</height>
-           </rect>
-          </property>
-          <property name="text">
-           <string>TextLabel</string>
-          </property>
-          <property name="alignment">
-           <set>Qt::AlignCenter</set>
-          </property>
-         </widget>
-         <widget class="PyDMPushButton" name="computeCorrButton_cmp">
-          <property name="geometry">
-           <rect>
-            <x>485</x>
-            <y>10</y>
-            <width>131</width>
-            <height>23</height>
-           </rect>
-          </property>
-          <property name="text">
-           <string>Compute Correlation</string>
-          </property>
-         </widget>
+         <layout class="QVBoxLayout" name="verticalLayout_7">
+          <item>
+           <layout class="QGridLayout" name="gridLayout_9">
+            <item row="1" column="7" rowspan="2">
+             <widget class="PyDMPushButton" name="nextShotButton_cmp">
+              <property name="text">
+               <string>&gt;</string>
+              </property>
+             </widget>
+            </item>
+            <item row="1" column="3">
+             <widget class="QLabel" name="shotNumber_cmp">
+              <property name="text">
+               <string>TextLabel</string>
+              </property>
+              <property name="alignment">
+               <set>Qt::AlignCenter</set>
+              </property>
+             </widget>
+            </item>
+            <item row="0" column="6" colspan="2">
+             <widget class="PyDMPushButton" name="computeCorrButton_cmp">
+              <property name="text">
+               <string>Compute Correlation</string>
+              </property>
+             </widget>
+            </item>
+            <item row="1" column="0" rowspan="2">
+             <widget class="PyDMPushButton" name="prevShotButton_cmp">
+              <property name="text">
+               <string>&lt;</string>
+              </property>
+             </widget>
+            </item>
+            <item row="1" column="4" colspan="2">
+             <widget class="QLabel" name="shotNumberCI_cmp">
+              <property name="text">
+               <string>TextLabel</string>
+              </property>
+              <property name="alignment">
+               <set>Qt::AlignCenter</set>
+              </property>
+             </widget>
+            </item>
+            <item row="2" column="1" colspan="6">
+             <widget class="QSlider" name="shotNumberSlider_cmp">
+              <property name="orientation">
+               <enum>Qt::Horizontal</enum>
+              </property>
+             </widget>
+            </item>
+            <item row="0" column="0" colspan="2">
+             <widget class="QLabel" name="shotNumber_11">
+              <property name="text">
+               <string>Preprocessed.pkl file</string>
+              </property>
+              <property name="alignment">
+               <set>Qt::AlignCenter</set>
+              </property>
+             </widget>
+            </item>
+            <item row="0" column="2" colspan="3">
+             <widget class="QLineEdit" name="preprocessFilePath_cmp">
+              <property name="readOnly">
+               <bool>true</bool>
+              </property>
+              <property name="placeholderText">
+               <string>No file selected...</string>
+              </property>
+             </widget>
+            </item>
+            <item row="0" column="5">
+             <widget class="PyDMPushButton" name="preprocessLoadButton_cmp">
+              <property name="text">
+               <string>Load File...</string>
+              </property>
+             </widget>
+            </item>
+           </layout>
+          </item>
+          <item>
+           <widget class="QWidget" name="display1_4" native="true">
+            <property name="sizePolicy">
+             <sizepolicy hsizetype="Preferred" vsizetype="Expanding">
+              <horstretch>0</horstretch>
+              <verstretch>3</verstretch>
+             </sizepolicy>
+            </property>
+            <layout class="QGridLayout" name="gridLayout_6" rowstretch="1,1" columnstretch="1,5">
+             <item row="1" column="1">
+              <widget class="QWidget" name="currentProfile_4" native="true"/>
+             </item>
+             <item row="0" column="1">
+              <widget class="QWidget" name="imageContainer_4" native="true">
+               <property name="sizePolicy">
+                <sizepolicy hsizetype="Expanding" vsizetype="Expanding">
+                 <horstretch>0</horstretch>
+                 <verstretch>0</verstretch>
+                </sizepolicy>
+               </property>
+              </widget>
+             </item>
+             <item row="0" column="0">
+              <widget class="QWidget" name="energyProfile_4" native="true">
+               <property name="sizePolicy">
+                <sizepolicy hsizetype="Preferred" vsizetype="Preferred">
+                 <horstretch>0</horstretch>
+                 <verstretch>0</verstretch>
+                </sizepolicy>
+               </property>
+              </widget>
+             </item>
+             <item row="1" column="0">
+              <widget class="QLabel" name="label_8">
+               <property name="text">
+                <string>&lt;html&gt;&lt;head/&gt;&lt;body&gt;&lt;p&gt;True Image&lt;/p&gt;&lt;p&gt;&lt;span style=&quot; font-style:italic;&quot;&gt;--Head ----&amp;gt; Tail --&lt;/span&gt;&lt;/p&gt;&lt;/body&gt;&lt;/html&gt;</string>
+               </property>
+              </widget>
+             </item>
+            </layout>
+           </widget>
+          </item>
+          <item>
+           <widget class="QWidget" name="display1_5" native="true">
+            <property name="sizePolicy">
+             <sizepolicy hsizetype="Preferred" vsizetype="Expanding">
+              <horstretch>0</horstretch>
+              <verstretch>3</verstretch>
+             </sizepolicy>
+            </property>
+            <layout class="QGridLayout" name="gridLayout_7" rowstretch="1,1" columnstretch="1,5">
+             <item row="1" column="1">
+              <widget class="QWidget" name="currentProfile_5" native="true"/>
+             </item>
+             <item row="0" column="1">
+              <widget class="QWidget" name="imageContainer_5" native="true">
+               <property name="sizePolicy">
+                <sizepolicy hsizetype="Expanding" vsizetype="Expanding">
+                 <horstretch>0</horstretch>
+                 <verstretch>0</verstretch>
+                </sizepolicy>
+               </property>
+              </widget>
+             </item>
+             <item row="0" column="0">
+              <widget class="QWidget" name="energyProfile_5" native="true">
+               <property name="sizePolicy">
+                <sizepolicy hsizetype="Preferred" vsizetype="Preferred">
+                 <horstretch>0</horstretch>
+                 <verstretch>0</verstretch>
+                </sizepolicy>
+               </property>
+              </widget>
+             </item>
+             <item row="1" column="0">
+              <widget class="QLabel" name="label_9">
+               <property name="text">
+                <string>&lt;html&gt;&lt;head/&gt;&lt;body&gt;&lt;p&gt;Prediction&lt;/p&gt;&lt;p&gt;&lt;span style=&quot; font-style:italic;&quot;&gt;--Head ----&amp;gt; Tail --&lt;/span&gt;&lt;/p&gt;&lt;p&gt;&lt;br/&gt;&lt;/p&gt;&lt;p&gt;&lt;br/&gt;&lt;/p&gt;&lt;/body&gt;&lt;/html&gt;</string>
+               </property>
+              </widget>
+             </item>
+            </layout>
+           </widget>
+          </item>
+          <item>
+           <widget class="PyDMPushButton" name="cpExportButton_cmp">
+            <property name="text">
+             <string>Export Current Profile...</string>
+            </property>
+           </widget>
+          </item>
+         </layout>
         </widget>
        </widget>
       </item>
@@ -975,7 +844,7 @@
          </sizepolicy>
         </property>
         <property name="currentIndex">
-         <number>1</number>
+         <number>0</number>
         </property>
         <widget class="QWidget" name="tab_3">
          <attribute name="title">
