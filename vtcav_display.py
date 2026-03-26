@@ -11,6 +11,7 @@ import traceback
 import re
 import matplotlib
 import pathlib
+import importlib
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.metrics import mean_squared_error
 from Python_Functions.cvae import CVAE, vae_loss, smooth_cvae_output
@@ -282,6 +283,7 @@ class InferenceWorker(QThread):
         except Exception as e:
             raise e
             self._log(f"Prediction Error: {e}")
+            
     def get_SYAG_projection(self, n_eslice, offline_syag_array=None, offline_syag_width=None):
         # import matplotlib.pyplot as plt
         # Get array from EPICS PV
@@ -298,15 +300,21 @@ class InferenceWorker(QThread):
             #print(syag_image.shape)
             #plt.imshow(syag_image)
             #plt.show()
-            cropped_syag = syag_image[:, syag_image.shape[1]//4:]
+            cropped_syag = syag_image[:, (3*syag_image.shape[1]//4):]
             syag_background = syag_image[:, :syag_image.shape[1]//4]
+            median_noise = np.median(np.sum(syag_background, axis = 1))
             # Get horizontal projection
             x_proj = np.sum(cropped_syag, axis=1)-np.sum(syag_background, axis=1)
+            #import matplotlib.pyplot as plt
+            #plt.plot(x_proj)
+            x_proj[x_proj < median_noise/2] = 0 #Heuristic number
+            #plt.plot(x_proj)
+            plt.show()
             # --- Apply XTCAV Alignment (Inverse Mapping) ---
             if hasattr(self, 'alignment_data') and self.alignment_data is not None:
                 scale = self.alignment_data['scale']
                 offset = self.alignment_data['offset']
-                xtcav_width = 2* self.yrange
+                xtcav_width = 2* 100#self.yrange is not used because map_xtcav_to_syag assumes xtcav height is 200. We are only interested in measuring e slices using the same grid.
                 # 1. Define the target grid in XTCAV space
                 xtcav_grid = np.linspace(0, xtcav_width - 1, n_eslice)
                 
@@ -402,10 +410,14 @@ class VTCAVDisplay(Display):
         
         self.model_folder = pathlib.Path(__file__).parent / "models"
         self.current_model_path = ""
+        
+        # Initialize state variables
         self.worker = None
         self.predictors = None
         self.predictor_vars = None
         self.SYAG_daq_images= None
+        self.compare_truth_data = None # Will hold preprocessed images in the compare function
+        
 
         # 1. Setup UI Elements
         self.setup_model_ui()
@@ -481,9 +493,9 @@ class VTCAVDisplay(Display):
         self.ui.shotNumberSlider_cmp.valueChanged.connect(lambda idx: self.ui.shotNumber_cmp.setText(str(idx)+" / "+str(self.ui.shotNumberSlider_cmp.maximum())))
         self.ui.preprocessLoadButton_cmp.clicked.connect(self.handle_preprocess_load_cmp)
         self.ui.computeCorrButton_cmp.clicked.connect(self.compute_compare_correlations)
-        
-        # Initialize state variables
-        self.compare_truth_data = None # Will hold preprocessed images
+
+        # Scripting
+        self.ui.scriptRunButton.clicked.connect(self.execute_live_script)
         
     def load_compare_data(self, filepath):
         """Loads truth and DAQ data, then initializes the displays."""
@@ -849,9 +861,9 @@ class VTCAVDisplay(Display):
             sigma = 1
             threshold = 5
             file_path_obj = pathlib.Path(dataloc)
-            _, syagImages_raw, _, _ = extract_processed_images(data_struct, '', 100, 100, hotPixThreshold, sigma, threshold, [1], None, None, do_load_raw=True, directory_path=str(file_path_obj.parent), instrument="SYAG")
-            # Dimensions of syagImages_raw should be (num_shots, height, width), but it is (height, width, num_shots) due to how MATLAB saves arrays. We need to transpose it to align with the shot indexing.
-            syagImages_raw = np.transpose(syagImages_raw, (2, 0, 1))
+            _, syagImages_raw, _, _ = extract_processed_images(data_struct, '', 100, 100, hotPixThreshold, sigma, threshold, None, None, None, do_load_raw=True, directory_path=str(file_path_obj.parent), instrument="SYAG")
+            # Dimensions of syagImages_raw should be (num_shots, width, height), but it is (height, width, num_shots) due to how MATLAB saves arrays. We need to transpose it to align with the shot indexing.
+            syagImages_raw = np.transpose(syagImages_raw, (2, 1, 0))
             self.SYAG_daq_images = syagImages_raw
 
     def setup_pv_table(self):
@@ -2324,7 +2336,7 @@ class VTCAVDisplay(Display):
         _, SYAGImages_raw, _, _ = extract_processed_images(data_struct, '', None, None, hotPixThreshold, sigma, threshold, step_list=None, roi_xrange=None, roi_yrange=None, do_load_raw=True, directory_path=str(pathlib.Path(dataloc).parent), instrument = 'SYAG')# do_load_raw = False by default.
         # Crop to the top quadrant and compute projection. this is due to SYAG camera geometry.
         print(f"SYAG Raw Loaded:{SYAGImages_raw.shape}")
-        SYAGImages_cropped = SYAGImages_raw[:, SYAGImages_raw.shape[1]//4:, lps_idx]
+        SYAGImages_cropped = SYAGImages_raw[:, (3*SYAGImages_raw.shape[1]//4):, lps_idx]
         SYAG_horz_proj = np.sum(SYAGImages_cropped, axis=1)
         LPSimg_vert_proj = np.sum(LPSimg, axis=2).T
         print(f"SYAG Waterfall Shape: {SYAG_horz_proj.shape}, LPS Waterfall Shape: {LPSimg_vert_proj.shape}")
@@ -2356,24 +2368,8 @@ class VTCAVDisplay(Display):
     @Slot(str)
     def handle_log(self, message):
         """Appends log messages to the PyDMLogDisplay"""
-        if hasattr(self.ui, 'PyDMLogDisplay'):
-            # PyDMLogDisplay might be a simple widget wrapping a TextEdit. 
-            # If it's a standard QWidget as per UI file, we might need to find the child text edit
-            # or assuming it has a method to add text. 
-            # If it acts like a PyDM text display, we assume standard Qt methods work if exposed.
-            
-            # Attempt to find a method to append text
-            if hasattr(self.ui.PyDMLogDisplay, 'appendPlainText'):
-                self.ui.PyDMLogDisplay.appendPlainText(message)
-            elif hasattr(self.ui.PyDMLogDisplay, 'append'):
-                self.ui.PyDMLogDisplay.append(message)
-            elif hasattr(self.ui.PyDMLogDisplay, 'setText'):
-                # Append manually if only setText exists
-                current = self.ui.PyDMLogDisplay.text() if hasattr(self.ui.PyDMLogDisplay, 'text') else ""
-                self.ui.PyDMLogDisplay.setText(current + "\n" + message)
-            else:
-                # Fallback: Print to console if widget doesn't support text
-                print(message)
+        self.ui.PyDMLogDisplay.write(message)
+        print(message)
 
     def closeEvent(self, event):
         # Clean up thread on close
@@ -2381,6 +2377,33 @@ class VTCAVDisplay(Display):
             self.worker.stop()
         super().closeEvent(event)
 
+    def execute_live_script(self):
+        # 1. Grab the text from the UI
+        script_code = self.ui.scriptInput.toPlainText()
+        
+        # 2. Define the execution environment (Locals)
+        # Passing 'self' is critical. It allows your live script to access 
+        # the main window's attributes, UI elements, and data arrays.
+        live_environment = {
+            'self': self,
+            # You can also pre-load heavy modules here so you don't 
+            # have to import them inside the text box every time.
+            'np': __import__('numpy'), 
+            'pd': __import__('pandas'),
+            'plt': importlib.import_module('matplotlib.pyplot')
+        }
+
+        # 3. Execute the code safely
+        try:
+            # exec(code, globals, locals)
+            exec(script_code, globals(), live_environment)
+            print("--- Script Executed Successfully ---")
+            
+        except Exception as e:
+            # If your script has a typo, we want to catch it here 
+            # instead of letting it crash the entire PyDM application.
+            print("--- Script Error ---")
+            traceback.print_exc()
     
 
 # Entry point for PyDM

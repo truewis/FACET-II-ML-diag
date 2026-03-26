@@ -844,7 +844,7 @@
          </sizepolicy>
         </property>
         <property name="currentIndex">
-         <number>0</number>
+         <number>2</number>
         </property>
         <widget class="QWidget" name="tab_3">
          <attribute name="title">
@@ -951,6 +951,28 @@
               <string>Bypassed</string>
              </property>
             </column>
+           </widget>
+          </item>
+         </layout>
+        </widget>
+        <widget class="QWidget" name="tab_8">
+         <attribute name="title">
+          <string>Scripting</string>
+         </attribute>
+         <layout class="QGridLayout" name="gridLayout_10">
+          <item row="0" column="0">
+           <widget class="QPlainTextEdit" name="scriptInput">
+            <property name="plainText">
+             <string>plt.matshow(np.sum(self.SYAG_daq_images[:, 700:900, :] - self.SYAG_daq_images[:, 0:200, :], axis = 1))
+plt.show()</string>
+            </property>
+           </widget>
+          </item>
+          <item row="1" column="0">
+           <widget class="QPushButton" name="scriptRunButton">
+            <property name="text">
+             <string>Run...</string>
+            </property>
            </widget>
           </item>
          </layout>
