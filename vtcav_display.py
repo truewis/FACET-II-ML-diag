@@ -20,7 +20,7 @@ from sklearn.model_selection import train_test_split
 import torch
 from scipy.io import loadmat, savemat
 from scipy.optimize import curve_fit
-from scipy.ndimage import center_of_mass, shift
+from scipy.ndimage import center_of_mass, shift, zoom
 from Python_Functions.functions import cropProfmonImg, map_xtcav_to_syag, matstruct_to_dict, extractDAQBSAScalars, extractDAQNonBSAScalars, segment_centroids_and_com, apply_tcav_zeroing_filter, apply_centroid_correction, extract_processed_images
 from qtpy.QtGui import QColor
 from qtpy.QtCore import QThread, Signal, Slot, Qt
@@ -429,7 +429,7 @@ class VTCAVDisplay(Display):
         self.setup_image_plot()
 
         # Initialize constants
-        self.cvae_loss_strength = 0.3
+        self.cvae_loss_strength = 0.97
         self.cvae_proj_log_strength = 0
 
     def ui_filename(self):
@@ -725,6 +725,7 @@ class VTCAVDisplay(Display):
         
         # 1. Update Truth Display immediately
         truth_image = self.compare_truth_data[index]
+        truth_image = zoom(truth_image, (200 / truth_image.shape[0], 200 / truth_image.shape[1]), order=1)
         total_charge = self.predictors[index, self.predictor_vars.index(CHARGE_PV_C)] if CHARGE_PV_C in self.predictor_vars else 1
         truth_image = truth_image / np.sum(truth_image)*total_charge
         self.update_image_display(truth_image, 'cmp_truth')
@@ -1857,7 +1858,6 @@ class VTCAVDisplay(Display):
         # Interpolate LPS images to square pixels for CVAE training.
         # 2* yrange, 2* xrange to 200x200
         # CVAE model assumes square images with 200x200 pixels, forced by convolutional layers
-        from scipy.ndimage import zoom
         LPSimg_resized = np.zeros((LPSimg_prezoom.shape[0], 200, 200), dtype=LPSimg_prezoom.dtype)
         for i in range(LPSimg_prezoom.shape[0]):
             tmpImage = zoom(LPSimg_prezoom[i], (1, umPerDeg_tmp[i] / cal), order=1)
@@ -1912,7 +1912,7 @@ class VTCAVDisplay(Display):
                 # Calculate loss
                 # Like normal loss, vae_loss is not great for predicting LPS with small isolated features.
                 # Using projection loss to improve reconstruction of small features, which are enhanced logarithmically in the projection.
-                loss = proj_vae_loss(reconstruction, data, mu, logvar, strength=self.cvae_loss_strength, log_strength = self.cvae_proj_log_strength, do_current_profile=do_current_profile)
+                loss = proj_vae_loss(reconstruction, data, mu, logvar, strength=self.cvae_loss_strength, log_strength = self.cvae_proj_log_strength)
                 
                 # Backpropagation
                 optimizer.zero_grad()
@@ -2192,7 +2192,6 @@ class VTCAVDisplay(Display):
         # Interpolate LPS images to square pixels for CVAE training.
         # 2* yrange, 2* xrange to 200x200
         # CVAE model assumes square images with 200x200 pixels, forced by convolutional layers
-        from scipy.ndimage import zoom
         LPSimg_resized = np.zeros((LPSimg_prezoom.shape[0], 200, 200), dtype=LPSimg_prezoom.dtype)
         for i in range(LPSimg_prezoom.shape[0]):
             tmpImage = zoom(LPSimg_prezoom[i], (1, umPerDeg_tmp[i] / cal), order=1)
