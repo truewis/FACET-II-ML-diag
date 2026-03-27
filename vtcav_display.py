@@ -309,7 +309,7 @@ class InferenceWorker(QThread):
             #plt.plot(x_proj)
             x_proj[x_proj < median_noise/2] = 0 #Heuristic number
             #plt.plot(x_proj)
-            plt.show()
+            #plt.show()
             # --- Apply XTCAV Alignment (Inverse Mapping) ---
             if hasattr(self, 'alignment_data') and self.alignment_data is not None:
                 scale = self.alignment_data['scale']
@@ -2199,7 +2199,7 @@ class VTCAVDisplay(Display):
             
         LPSimg = LPSimg_resized
         
-        NESLICE = 30
+        NESLICE = 50
         INPUT_CHANNELS = 1
 
         # 1. Setup Device
