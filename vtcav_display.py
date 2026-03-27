@@ -428,6 +428,10 @@ class VTCAVDisplay(Display):
         self.init_plots()
         self.setup_image_plot()
 
+        # Initialize constants
+        self.cvae_loss_strength = 0.3
+        self.cvae_proj_log_strength = 0
+
     def ui_filename(self):
         return "vtcav_display.ui"
 
@@ -1908,7 +1912,7 @@ class VTCAVDisplay(Display):
                 # Calculate loss
                 # Like normal loss, vae_loss is not great for predicting LPS with small isolated features.
                 # Using projection loss to improve reconstruction of small features, which are enhanced logarithmically in the projection.
-                loss = proj_vae_loss(reconstruction, data, mu, logvar, strength=0.5)
+                loss = proj_vae_loss(reconstruction, data, mu, logvar, strength=self.cvae_loss_strength, log_strength = self.cvae_proj_log_strength, do_current_profile=do_current_profile)
                 
                 # Backpropagation
                 optimizer.zero_grad()
