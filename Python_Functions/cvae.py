@@ -159,10 +159,17 @@ def vae_loss(reconstruction, x, mu, logvar):
     # Total loss is the sum of these two components
     return BCE + KL_Divergence
 
-def proj_vae_loss(reconstruction, x, mu, logvar, strength = 0.5):
+def proj_vae_loss(reconstruction, x, mu, logvar, strength = 0.5, log_strength = 0):
     """
     Linear combination of VAE loss and projection loss.
     Projection loss is the Binary Cross-Entropy between the X-projections of the original and reconstructed images.
+    arguments:
+    - reconstruction: The output from the CVAE decoder (N, C, H, W)
+    - x: The original input image (N, C, H, W)
+    - mu: The mean vector from the encoder (N, latent_dim)
+    - logvar: The log variance vector from the encoder (N, latent_dim)
+    - strength: A value between 0 and 1 that determines the weight of the projection loss relative to the VAE loss. 0 means only VAE loss, 1 means only projection loss.
+    - log_strength: A value between 0 and 1 that determines the weight of the logarithmic projection loss relative to the regular projection loss. 0 means only regular projection loss, 1 means only logarithmic projection loss.
     """
     # 1. VAE Loss
     vae_loss_value = vae_loss(reconstruction, x, mu, logvar)
@@ -173,18 +180,20 @@ def proj_vae_loss(reconstruction, x, mu, logvar, strength = 0.5):
     proj_recon = torch.sum(reconstruction, dim=2)  # Shape: (N, C, W)
     
     # Normalize proj_orig logarithmically so that each value is between 0 and 1
-    proj_orig = torch.log(proj_orig + 1e-8)  # Add small epsilon to avoid log(0)
-    proj_orig = (proj_orig - proj_orig.min(dim=2, keepdim=True)[0]) / (proj_orig.max(dim=2, keepdim=True)[0] - proj_orig.min(dim=2, keepdim=True)[0] + 1e-8)
-
+    proj_orig_log = torch.log(proj_orig + 1e-8)  # Add small epsilon to avoid log(0)
+    proj_orig_log = (proj_orig_log - proj_orig_log.min(dim=2, keepdim=True)[0]) / (proj_orig_log.max(dim=2, keepdim=True)[0] - proj_orig_log.min(dim=2, keepdim=True)[0] + 1e-8)
+    # Regular normalization without log
+    proj_orig_norm = (proj_orig - proj_orig.min(dim=2, keepdim=True)[0]) / (proj_orig.max(dim=2, keepdim=True)[0] - proj_orig.min(dim=2, keepdim=True)[0] + 1e-8)
     # Similarly normalize proj_recon
-    proj_recon = torch.log(proj_recon + 1e-8)
-    proj_recon = (proj_recon - proj_recon.min(dim=2, keepdim=True)[0]) / (proj_recon.max(dim=2, keepdim=True)[0] - proj_recon.min(dim=2, keepdim=True)[0] + 1e-8)
-
+    proj_recon_log = torch.log(proj_recon + 1e-8)
+    proj_recon_log = (proj_recon_log - proj_recon_log.min(dim=2, keepdim=True)[0]) / (proj_recon_log.max(dim=2, keepdim=True)[0] - proj_recon_log.min(dim=2, keepdim=True)[0] + 1e-8)
+    proj_recon_norm = (proj_recon - proj_recon.min(dim=2, keepdim=True)[0]) / (proj_recon.max(dim=2, keepdim=True)[0] - proj_recon.min(dim=2, keepdim=True)[0] + 1e-8)
     # Use Binary Cross-Entropy for projection loss
-    proj_loss = F.binary_cross_entropy_with_logits(proj_recon, proj_orig, reduction='sum')
-    
+    proj_loss_log = F.binary_cross_entropy_with_logits(proj_recon_log, proj_orig_log, reduction='sum')
+    proj_loss_norm = F.binary_cross_entropy_with_logits(proj_recon_norm, proj_orig_norm, reduction='sum')
+
     # Total loss is a weighted sum of VAE loss and projection loss
-    total_loss = (1 - strength) * vae_loss_value + strength * proj_loss
+    total_loss = (1 - strength) * vae_loss_value + strength* log_strength * proj_loss_log + strength*(1 - log_strength) * proj_loss_norm
     
     return total_loss
 
