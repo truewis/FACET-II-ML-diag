@@ -71,7 +71,7 @@
          </sizepolicy>
         </property>
         <property name="currentIndex">
-         <number>3</number>
+         <number>0</number>
         </property>
         <widget class="QWidget" name="tab">
          <attribute name="title">
@@ -110,7 +110,14 @@
               <verstretch>3</verstretch>
              </sizepolicy>
             </property>
-            <layout class="QGridLayout" name="gridLayout" rowstretch="1,1" columnstretch="1,5">
+            <layout class="QGridLayout" name="gridLayout" rowstretch="1,0" columnstretch="1,0">
+             <item row="1" column="0">
+              <widget class="QLabel" name="label_5">
+               <property name="text">
+                <string>&lt;html&gt;&lt;head/&gt;&lt;body&gt;&lt;p&gt;1. Load model from top dropdown.&lt;/p&gt;&lt;p&gt;2. Click Start.&lt;/p&gt;&lt;p&gt;&lt;span style=&quot; font-style:italic;&quot;&gt;3. Hmm...Crisp and Flaky Beam...&lt;/span&gt;&lt;/p&gt;&lt;p&gt;&lt;span style=&quot; font-style:italic;&quot;&gt;--Head ----&amp;gt; Tail --&lt;/span&gt;&lt;/p&gt;&lt;p&gt;&lt;span style=&quot; font-style:italic;&quot;&gt;--JP--&lt;/span&gt;&lt;/p&gt;&lt;p&gt;&lt;br/&gt;&lt;/p&gt;&lt;/body&gt;&lt;/html&gt;</string>
+               </property>
+              </widget>
+             </item>
              <item row="0" column="0">
               <widget class="QWidget" name="energyProfile_1" native="true">
                <property name="sizePolicy">
@@ -121,6 +128,9 @@
                </property>
               </widget>
              </item>
+             <item row="1" column="1">
+              <widget class="QWidget" name="currentProfile_1" native="true"/>
+             </item>
              <item row="0" column="1">
               <widget class="QWidget" name="imageContainer_1" native="true">
                <property name="sizePolicy">
@@ -130,16 +140,6 @@
                 </sizepolicy>
                </property>
               </widget>
-             </item>
-             <item row="1" column="0">
-              <widget class="QLabel" name="label_5">
-               <property name="text">
-                <string>&lt;html&gt;&lt;head/&gt;&lt;body&gt;&lt;p&gt;1. Load model from top dropdown.&lt;/p&gt;&lt;p&gt;2. Click Start.&lt;/p&gt;&lt;p&gt;&lt;span style=&quot; font-style:italic;&quot;&gt;3. Hmm...Crisp and Flaky Beam...&lt;/span&gt;&lt;/p&gt;&lt;p&gt;&lt;span style=&quot; font-style:italic;&quot;&gt;--Head ----&amp;gt; Tail --&lt;/span&gt;&lt;/p&gt;&lt;p&gt;&lt;span style=&quot; font-style:italic;&quot;&gt;--JP--&lt;/span&gt;&lt;/p&gt;&lt;p&gt;&lt;br/&gt;&lt;/p&gt;&lt;/body&gt;&lt;/html&gt;</string>
-               </property>
-              </widget>
-             </item>
-             <item row="1" column="1">
-              <widget class="QWidget" name="currentProfile_1" native="true"/>
              </item>
             </layout>
             <zorder>currentProfile_1</zorder>
@@ -984,6 +984,66 @@ plt.show()</string>
            </widget>
           </item>
          </layout>
+        </widget>
+        <widget class="QWidget" name="tab_9">
+         <attribute name="title">
+          <string>Options</string>
+         </attribute>
+         <widget class="QComboBox" name="unitComboBox">
+          <property name="geometry">
+           <rect>
+            <x>155</x>
+            <y>120</y>
+            <width>79</width>
+            <height>23</height>
+           </rect>
+          </property>
+          <property name="sizePolicy">
+           <sizepolicy hsizetype="Expanding" vsizetype="Fixed">
+            <horstretch>0</horstretch>
+            <verstretch>0</verstretch>
+           </sizepolicy>
+          </property>
+          <item>
+           <property name="text">
+            <string>um</string>
+           </property>
+          </item>
+          <item>
+           <property name="text">
+            <string>fs</string>
+           </property>
+          </item>
+         </widget>
+         <widget class="QLabel" name="label_10">
+          <property name="geometry">
+           <rect>
+            <x>9</x>
+            <y>125</y>
+            <width>136</width>
+            <height>16</height>
+           </rect>
+          </property>
+          <property name="text">
+           <string>Current Profile Units:</string>
+          </property>
+         </widget>
+         <widget class="QCheckBox" name="doManualSYAG">
+          <property name="geometry">
+           <rect>
+            <x>10</x>
+            <y>150</y>
+            <width>680</width>
+            <height>21</height>
+           </rect>
+          </property>
+          <property name="text">
+           <string>Manual SYAG Cut</string>
+          </property>
+          <property name="checked">
+           <bool>true</bool>
+          </property>
+         </widget>
         </widget>
        </widget>
       </item>

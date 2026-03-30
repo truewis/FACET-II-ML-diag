@@ -445,7 +445,7 @@ class VTCAVDisplay(Display):
         self.predictor_vars = None
         self.SYAG_daq_images= None
         self.compare_truth_data = None # Will hold preprocessed images in the compare function
-        
+        self.unit = "um"
 
         # 1. Setup UI Elements
         self.setup_model_ui()
@@ -465,6 +465,7 @@ class VTCAVDisplay(Display):
 
     def setup_model_ui(self):
         """Populate modelName combobox with files from ./models/"""
+        self.ui.modelName.clear()
         if os.path.exists(self.model_folder):
             files = glob.glob(os.path.join(self.model_folder, "*.pkl"))
             filenames = [os.path.basename(f) for f in files]
@@ -528,6 +529,22 @@ class VTCAVDisplay(Display):
 
         # Scripting
         self.ui.scriptRunButton.clicked.connect(self.execute_live_script)
+
+        # Options
+        self.ui.doManualSYAG.toggled.connect(self.set_manual_SYAG)
+        self.ui.unitComboBox.currentTextChanged.connect(self.set_current_profile_unit)
+
+    def set_manual_SYAG(self, checked):
+        self.worker.manual_SYAG = checked
+
+    def set_current_profile_unit(self, unit):
+        self.unit = unit
+        for (current_name, current_view) in self.current_views.items():
+            current_view.clear()
+            if unit == "fs":
+                current_view.setLabel('bottom', text='t', units='fs')
+            else:
+                current_view.setLabel('bottom', text='z', units='um')
         
     def load_compare_data(self, filepath):
         """Loads truth and DAQ data, then initializes the displays."""
@@ -811,7 +828,7 @@ class VTCAVDisplay(Display):
         self.worker.new_prediction_signal.connect(
             lambda data: self.update_image_display(data, display_name)
         )
-        if(self.worker.n_eslice != 0):
+        if(self.worker.n_eslice != 0 | self.worker.manual_SYAG):
             offline_syag_array = self.SYAG_daq_images[index]
             offline_syag_width = self.SYAG_daq_images[index].shape[1]
             self.worker.emit_prediction(scaled_predictor, total_charge, real_time=False, offline_syag_array=offline_syag_array, offline_syag_width=offline_syag_width)
@@ -887,7 +904,7 @@ class VTCAVDisplay(Display):
         self.ui.shotNumberSlider.setMinimum(0)
 
         # Optional: load SYAG images if available for the SYAG projection feature
-        if (self.worker.n_eslice != 0):
+        if (self.worker.n_eslice != 0 | self.worker.manual_SYAG):
             mat = loadmat(dataloc,struct_as_record=False, squeeze_me=True)
             data_struct = mat['data_struct']
             hotPixThreshold = 1e3
@@ -1227,6 +1244,7 @@ class VTCAVDisplay(Display):
             self.handle_log(f"Failed to initialize worker: {e}")
             self.worker = None
 
+        self.ui.doManualSYAG.setChecked(self.worker.manual_SYAG)
         self.updateStatus("Ready")
 
     def update_pv_values(self, latest_inputs, bypass_flags):
@@ -1380,7 +1398,7 @@ class VTCAVDisplay(Display):
             current_view = pg.PlotWidget()
             current_view.enableAutoRange(axis='x', enable=True)
             current_view.enableAutoRange(axis='y', enable=True)
-            current_view.setLabel('bottom', text='t', units='fs')
+            current_view.setLabel('bottom', text='z', units='um')
             current_view.setLabel('left', text='Current', units='A')
             current_view.showGrid(x=True, y=True)
             current_view.setMouseEnabled(x=False, y=False)
@@ -1438,7 +1456,11 @@ class VTCAVDisplay(Display):
             target_energy_view.plot(y_proj, y_indices)
 
             # Update Current Profile (Horizontal)
-            x_indices = np.arange(len(x_proj)) * self.worker.xtcalibrationfactor_fs
+            if self.unit == "fs":
+                x_indices = np.arange(len(x_proj)) * self.worker.xtcalibrationfactor_fs
+            else:
+                x_indices = np.arange(len(x_proj)) * self.worker.xtcalibrationfactor_fs * 0.299792458 # um/fs
+                
             x_proj = x_proj / self.worker.xtcalibrationfactor_fs * 1.602e-4 # 1.602e-19 [C]/1e-15 [s]
 
             target_current_view.clear()
