@@ -25,6 +25,7 @@ from Python_Functions.functions import cropProfmonImg, map_xtcav_to_syag, matstr
 from qtpy.QtGui import QColor
 from qtpy.QtCore import QThread, Signal, Slot, Qt
 from qtpy.QtWidgets import QMessageBox, QFileDialog, QTableWidgetItem
+from qtpy.QtWidgets import QApplication
 from pydm import Display
 import pyqtgraph as pg
 
@@ -58,6 +59,8 @@ class InferenceWorker(QThread):
         self.model_data = None
         self.alignment_data = None
         self.n_eslice = 0
+        self.manual_SYAG = True
+        self.manual_SYAG_masking_threshold = 0.1
         try:
             self.syag_width = epics.PV(SYAG_PV+":ArraySize0_RBV").get()
         except:
@@ -83,6 +86,7 @@ class InferenceWorker(QThread):
             self.yrange = data['architecture']['yrange']
             try:
                 self.n_eslice = data['architecture']['n_eslice']
+                self.manual_SYAG = False # Since this is a slice model, no need for manual SYAG masking.
             except:
                 self.n_eslice = 0
                 self._log("Warning: No n_eslice found in the file.")
@@ -271,6 +275,30 @@ class InferenceWorker(QThread):
             pred_full = self.iz_scaler.inverse_transform(z_pred_full)
             pred_params = pred_full.flatten()
             image_data = self.image_model.params_to_image(pred_params, total_charge)
+            if self.manual_SYAG:
+                syag_projection = self.get_SYAG_projection(n_eslice=image_data.shape[1], offline_syag_array=offline_syag_array, offline_syag_width=offline_syag_width)
+                
+                # 1. Calculate the maximum of the projection
+                max_proj = np.max(syag_projection)
+                
+                # 2. Create the mask (1 if >= 10% of median, else 0)
+                mask = (syag_projection >= self.manual_SYAG_masking_threshold * max_proj).astype(image_data.dtype)
+                
+                # 3. Store the original total sum for normalization later
+                original_sum = np.sum(image_data)
+                
+                # 4. Apply the mask to the image.
+                # Assuming syag_projection corresponds to the vertical (Y) axis (shape[0]),
+                # we use [:, np.newaxis] to broadcast the 1D mask across all horizontal slices.
+                # Note: If syag_projection aligns with the X axis instead, use [np.newaxis, :]
+                image_data = image_data * mask[:, np.newaxis]
+                
+                # 5. Normalize the image so the new sum matches the original sum
+                masked_sum = np.sum(image_data)
+                
+                # Prevent division by zero in case the mask wipes out the entire image
+                if masked_sum > 0:
+                    image_data = image_data * (original_sum / masked_sum)
             # Figuring out orientation sucks. Seems to work without a T, but sometimes with a T.
             if self.display_images_rt or not real_time: 
                 self.new_prediction_signal.emit(image_data)
@@ -429,7 +457,7 @@ class VTCAVDisplay(Display):
         self.setup_image_plot()
 
         # Initialize constants
-        self.cvae_loss_strength = 0.97
+        self.cvae_loss_strength = 0.9
         self.cvae_proj_log_strength = 0
 
     def ui_filename(self):
@@ -522,7 +550,7 @@ class VTCAVDisplay(Display):
             self.on_compare_slider_change(0)
             
         except Exception as e:
-            print(f"Error loading compare data: {e}")
+            self.handle_log(f"Error loading compare data: {e}")
 
     def compute_compare_correlations(self):
         """
@@ -532,7 +560,7 @@ class VTCAVDisplay(Display):
         """
         
         if not hasattr(self, 'compare_truth_data') or self.predictors is None:
-            print("Error: Compare data or DAQ data is not fully loaded.")
+            self.handle_log("Error: Compare data or DAQ data is not fully loaded.")
             return
 
         num_frames = len(self.compare_truth_data)
@@ -543,7 +571,7 @@ class VTCAVDisplay(Display):
 
         # Find indices of predictor_vars in worker.var_names once outside the loop
         if self.worker is None or not hasattr(self.worker, 'var_names'):
-            print("Error: Worker or var_names not initialized.")
+            self.handle_log("Error: Worker or var_names not initialized.")
             return
             
         var_indices = []
@@ -614,14 +642,14 @@ class VTCAVDisplay(Display):
         corr_b2 = safe_correlation(truth_b2s, pred_b2s)
 
         # Output the results
-        print(f"\n--- Correlation Results ({num_frames} shots) ---")
-        print(f"Separation (um) Correlation: {corr_sep:.4f}")
-        print(f"Separation average of truth: {np.mean(truth_seps):.2f} um, average of prediction: {np.mean(pred_seps):.2f} um")
-        print(f"Bunch Length 1 Correlation:  {corr_b1:.4f}")
-        print(f"Bunch Length 1 average of truth: {np.mean(truth_b1s):.2f} um, average of prediction: {np.mean(pred_b1s):.2f} um")
-        print(f"Bunch Length 2 Correlation:  {corr_b2:.4f}")
-        print(f"Bunch Length 2 average of truth: {np.mean(truth_b2s):.2f} um, average of prediction: {np.mean(pred_b2s):.2f} um")
-        print("------------------------------------------\n")
+        self.handle_log(f"\n--- Correlation Results ({num_frames} shots) ---")
+        self.handle_log(f"Separation (um) Correlation: {corr_sep:.4f}")
+        self.handle_log(f"Separation average of truth: {np.mean(truth_seps):.2f} um, average of prediction: {np.mean(pred_seps):.2f} um")
+        self.handle_log(f"Bunch Length 1 Correlation:  {corr_b1:.4f}")
+        self.handle_log(f"Bunch Length 1 average of truth: {np.mean(truth_b1s):.2f} um, average of prediction: {np.mean(pred_b1s):.2f} um")
+        self.handle_log(f"Bunch Length 2 Correlation:  {corr_b2:.4f}")
+        self.handle_log(f"Bunch Length 2 average of truth: {np.mean(truth_b2s):.2f} um, average of prediction: {np.mean(pred_b2s):.2f} um")
+        self.handle_log("------------------------------------------\n")
 
         if hasattr(self, 'updateStatus'):
             self.updateStatus("Ready")
@@ -633,7 +661,7 @@ class VTCAVDisplay(Display):
         and exports truth and predicted images to .pkl and .mat formats.
         """
         if not hasattr(self, 'compare_truth_data') or self.predictors is None:
-            print("Error: Compare data or DAQ data is not fully loaded.")
+            self.handle_log("Error: Compare data or DAQ data is not fully loaded.")
             return
 
         # 1. Open File Dialogue
@@ -655,7 +683,7 @@ class VTCAVDisplay(Display):
 
         # Setup predictor indices (same as correlation logic)
         if self.worker is None or not hasattr(self.worker, 'var_names'):
-            print("Error: Worker or var_names not initialized.")
+            self.handle_log("Error: Worker or var_names not initialized.")
             return
 
         var_indices = [
@@ -705,7 +733,7 @@ class VTCAVDisplay(Display):
         # --- 4. Export to Matlab ---
         savemat(f"{base_path}.mat", data_dict)
 
-        print(f"Successfully exported data to {base_path}.pkl and .mat")
+        self.handle_log(f"Successfully exported data to {base_path}.pkl and .mat")
         if hasattr(self, 'updateStatus'):
             self.updateStatus("Export Complete")
             
@@ -829,7 +857,7 @@ class VTCAVDisplay(Display):
             mat = loadmat(dataloc,struct_as_record=False, squeeze_me=True)
             data_struct = mat['data_struct']
         except FileNotFoundError:
-            print(f"Skipping {full_path}: .mat file not found at {dataloc}")
+            self.handle_log(f"Skipping {full_path}: .mat file not found at {dataloc}")
         # 2. Extract full BSA scalars (filtered by step_list if needed)
         # Don't filter by common index here, we'll do it with the goodShots scalar common index loaded from the file
         bsaScalarData, bsaVars = extractDAQBSAScalars(data_struct, filter_index=False)
@@ -889,7 +917,7 @@ class VTCAVDisplay(Display):
         # Calculate Min/Max by inverse transforming 0 and 1
         # We create dummy vectors of 0s and 1s to feed the scaler
         n_features = len(var_names)
-        print(f"Number of Features:{n_features}")
+        self.handle_log(f"Number of Features:{n_features}")
         # Create input arrays for 0 (Min) and 1 (Max)
         # Note: We reshape to (1, -1) because scaler expects 2D array
         zeros = np.zeros((1, n_features))
@@ -974,25 +1002,26 @@ class VTCAVDisplay(Display):
             self.ui.xrangeTimesTwo.setPlainText("200")
             self.ui.yrangeTimesTwo.setPlainText("200")
             
-            print(f"Loaded XTCAV DAQ: {file_path}. ROIs populated.")
+            self.handle_log(f"Loaded XTCAV DAQ: {file_path}. ROIs populated.")
             mat = loadmat(file_path,struct_as_record=False, squeeze_me=True)
             data_struct = mat['data_struct']
             hotPixThreshold = 1e3
             sigma = 1
             threshold = 5
             file_path_obj = pathlib.Path(file_path)
+            self.updateStatus(f"Loading Sample Images...")
             xtcavImages_centroid_uncorrected, xtcavImages_raw, horz_proj, LPSImage = extract_processed_images(data_struct, '', 100, 100, hotPixThreshold, sigma, threshold, [1], None, None, do_load_raw=True, directory_path=str(file_path_obj.parent))# do_load_raw = False by default.
             # Populate UI elements
             dims = xtcavImages_raw.shape
             self.ui.xroiMin.setPlainText(str(0))
             self.ui.xroiMax.setPlainText(str(dims[1]))
-            
+            self.updateStatus(f"Ready")
             self.ui.yroiMin.setPlainText(str(0))
             self.ui.yroiMax.setPlainText(str(dims[0]))
             self.update_image_display(np.average(xtcavImages_raw, axis = 2), display_name='Prep')
             
         except Exception as e:
-            print(f"Error initializing data from {file_path}: {e}")
+            self.handle_log(f"Error initializing data from {file_path}: {e}")
 
     def handle_preprocess_write(self):
         """
@@ -1002,7 +1031,7 @@ class VTCAVDisplay(Display):
         # 1. Get Input File Path
         thedaq_file_path = self.ui.tcavDaqFilePath.text()
         if not thedaq_file_path:
-            print("Error: No DAQ file selected.")
+            self.handle_log("Error: No DAQ file selected.")
             return
 
         # 2. Read ROI and Range values from TextBoxes
@@ -1018,7 +1047,7 @@ class VTCAVDisplay(Display):
             y_range_val = int(self.ui.yrangeTimesTwo.toPlainText()) // 2
             
         except ValueError:
-            print("Error: Please ensure all ROI and Range fields contain valid integers.")
+            self.handle_log("Error: Please ensure all ROI and Range fields contain valid integers.")
             return
 
         # 3. Open Save Dialog
@@ -1033,7 +1062,7 @@ class VTCAVDisplay(Display):
         if theoutput_file_path:
             self.ui.preprocessWritePath.setText(theoutput_file_path)
             
-            print("Starting preprocessing...")
+            self.handle_log("Starting preprocessing...")
             
             # 4. Call the processing function defined earlier
             # Function signature: (daq_file_path, x_roi, y_roi, xrange, yrange, output_file_path)
@@ -1045,7 +1074,7 @@ class VTCAVDisplay(Display):
                 yrange=y_range_val,
                 output_file_path=theoutput_file_path
             )
-            print("Preprocessing Complete.")
+            self.handle_log("Preprocessing Complete.")
                 
     def handle_preprocess_load(self):
         """
@@ -1070,7 +1099,7 @@ class VTCAVDisplay(Display):
             if hasattr(self.ui, 'preprocessFilePath'):
                 self.ui.preprocessFilePath.setText(joined_paths)
             
-            print(f"Selected preprocessed files: {joined_paths}")
+            self.handle_log(f"Selected preprocessed files: {joined_paths}")
             
     def handle_preprocess_load_cmp(self):
         """
@@ -1092,7 +1121,7 @@ class VTCAVDisplay(Display):
             if hasattr(self.ui, 'preprocessFilePath_cmp'):
                 self.ui.preprocessFilePath_cmp.setText(file_path)
             
-            print(f"Selected preprocessed file: {file_path}")
+            self.handle_log(f"Selected preprocessed file: {file_path}")
         self.load_compare_data(file_path)
     def handle_model_train_write(self):
         """
@@ -1104,7 +1133,7 @@ class VTCAVDisplay(Display):
         
         # Check if it's empty or just whitespace
         if not preprocess_path_string.strip():
-            print("Error: No preprocessed file(s) selected.")
+            self.handle_log("Error: No preprocessed file(s) selected.")
             return    
         
         # Split the space-separated string back into a list of file paths
@@ -1129,12 +1158,20 @@ class VTCAVDisplay(Display):
             
         self.ui.modelWritePath.setText(output_file_path)
         
-        print(f"Preparing data from {len(preprocess_paths)} file(s) and saving...")
-        # Define architecture constants 
-        NCOMP = 16 # Example default
+        self.handle_log(f"Preparing data from {len(preprocess_paths)} file(s) and saving...")
+        # Define architecture constants
         # 3. Train Model
         # Pass the list of paths directly to run_pairs
+        self.updateStatus("Training Model...")
         if(arch == "CVAE16+RF"):
+            NCOMP = 16 # Example default
+            self.train_model_cvae_rf(
+                run_pairs=preprocess_paths,
+                n_comp=NCOMP,
+                output_file_path=output_file_path
+            )
+        elif(arch == "CVAE20+RF"):
+            NCOMP = 20
             self.train_model_cvae_rf(
                 run_pairs=preprocess_paths,
                 n_comp=NCOMP,
@@ -1145,8 +1182,8 @@ class VTCAVDisplay(Display):
                 run_pairs=preprocess_paths,
                 output_file_path=output_file_path
             )
-        print("Model data written successfully.")
-        
+        self.handle_log("Model data written successfully.")
+        self.updateStatus("Ready")
         # Refresh the UI dropdown so the new model is available
         self.setup_model_ui() 
             
@@ -1158,7 +1195,8 @@ class VTCAVDisplay(Display):
             return
 
         full_path = os.path.join(self.model_folder, filename)
-        
+
+        self.updateStatus(f"Loading Model...")
         # 1. Clean up existing worker if it exists
         if self.worker is not None:
             self.handle_log("Cleaning up previous worker...")
@@ -1188,6 +1226,8 @@ class VTCAVDisplay(Display):
         except Exception as e:
             self.handle_log(f"Failed to initialize worker: {e}")
             self.worker = None
+
+        self.updateStatus("Ready")
 
     def update_pv_values(self, latest_inputs, bypass_flags):
         """
@@ -1477,8 +1517,8 @@ class VTCAVDisplay(Display):
         daq_path_obj = pathlib.Path(daq_file_path)
         # Define XTCAV calibration
         krf = 239.26
-        cal = 1167 # um/deg  http://physics-elog.slac.stanford.edu/facetelog/show.jsp?dir=/2025/11/13.03&pos=2025-$
-        streakFromGUI = cal*krf*180/np.pi*1e-6#um/um
+        umPerDeg = float(self.ui.umPerDegCal.toPlainText()) # um/deg  http://physics-elog.slac.stanford.edu/facetelog/show.jsp?dir=/2025/11/13.03&pos=2025-$
+        streakFromGUI = umPerDeg*krf*180/np.pi*1e-6#um/um
 
         # Sets the main beam energy
         mainbeamE_eV = 10e9
@@ -1506,11 +1546,11 @@ class VTCAVDisplay(Display):
         hotPixThreshold = 1e3
         sigma = 1
         threshold = 5
-        print("Processing steps:", step_list)
+        self.handle_log(f"Processing steps:{step_list}")
         bsaScalarData, bsaVars = extractDAQBSAScalars(data_struct, step_list)
         bsaScalarData = apply_tcav_zeroing_filter(bsaScalarData, bsaVars)
-        print("Extracted BSA scalar data shape:", bsaScalarData.shape)
-        print("bhsVars:"+str(bsaVars))
+        self.handle_log(f"Extracted BSA scalar data shape:{bsaScalarData.shape}")
+        self.handle_log("bhsVars:"+str(bsaVars))
         ampl_idx = next(i for i, var in enumerate(bsaVars) if 'TCAV_LI20_2400_A' in var)
         xtcavAmpl = bsaScalarData[ampl_idx, :]
 
@@ -1556,7 +1596,7 @@ class VTCAVDisplay(Display):
         xtcavImages_list_raw = []
         horz_proj_list = []
         LPSImage = [] 
-        xtcavImages_centroid_uncorrected, _, horz_proj, LPSImage = extract_processed_images(data_struct, '', xrange, yrange, hotPixThreshold, sigma, threshold, step_list, roi_xrange, roi_yrange, do_load_raw=False, directory_path=directory_path)# do_load_raw = False by default.
+        xtcavImages_centroid_uncorrected, _, _, _ = extract_processed_images(data_struct, '', xrange, yrange, hotPixThreshold, sigma, threshold, step_list, roi_xrange, roi_yrange, do_load_raw=False, directory_path=directory_path)# do_load_raw = False by default.
         # 1. Identify NaN values
         # np.isnan returns a boolean mask of the same shape as your stack
         nan_mask = np.isnan(xtcavImages_centroid_uncorrected)
@@ -1570,7 +1610,7 @@ class VTCAVDisplay(Display):
         
         import matplotlib.pyplot as plt
         if (self.ui.auto_off_idx.isChecked() == True):
-            projections = np.sum(xtcavImages_centroid_uncorrected, axis = 0)
+            projections = np.sum(xtcavImages_centroid_uncorrected, axis = 0, dtype = np.int64)
             pixel_indices = np.arange(projections.shape[0])[:, np.newaxis]
             col_sums = np.sum(projections, axis=0, keepdims=True)
 
@@ -1635,14 +1675,14 @@ class VTCAVDisplay(Display):
         # Use step_list to filter step_data
         scalars_data = data_struct.scalars.common_index-1
         step_data = data_struct.scalars.steps[scalars_data]
-        print("Processing steps:", step_list)
+        self.handle_log(f"Processing steps:{step_list}")
         step_data_filtered = np.isin(step_data, step_list)
         step_data_tmp = np.array(step_data[step_data_filtered])
-        print("Number of Off Shots:", off_idx.shape)
-        print("Number of On Shots:", all_idx.shape)
-        print("Those should be the same lengths:")
-        print(step_data_tmp.shape)
-        print(xtcavImages_centroid_uncorrected.shape)
+        self.handle_log(f"Number of Off Shots:{off_idx.shape}")
+        self.handle_log(f"Number of On Shots:{all_idx.shape}")
+        self.handle_log("Those should be the same lengths:")
+        self.handle_log(f"Step Data Shape: {step_data_tmp.shape}")
+        self.handle_log(f"Centroid Shape: {xtcavImages_centroid_uncorrected.shape}")
         xtcavImages, horz_proj, _, centroid_corrections = apply_centroid_correction(xtcavImages_centroid_uncorrected, off_idx, steps_if_stepwise=step_data_tmp, do_rotate=False)
 
          # Calculate target center (image center)
@@ -1680,17 +1720,18 @@ class VTCAVDisplay(Display):
             scalar_common_idx.append(scal_idx)
             max.append(np.max(xtcavImages[:, :, ij]))
         max = np.array(max)
+        p25 = np.percentile(max, 25)
         scalar_common_idx = np.array(scalar_common_idx)
 
 
         #goodShots = np.arange(xtcavImages.shape[2])
-        goodShots = np.where((max > 200))[0] # (np.abs(mu1 - mu2) > 20)  & (a_ratio > 0.05) & (a_ratio < 20)
+        # Filter blurry shots.
+        goodShots = np.where((max > p25*0.5))[0] # (np.abs(mu1 - mu2) > 20)  & (a_ratio > 0.05) & (a_ratio < 20)
         #goodShots_twobunch_tcav = np.where((R_squared > 0.97) & (amp1 < 50) & ((mu1 > mu2) & (amp1 < amp2)))[0]
         # --- Filter the data based on the indexing logic from the MLP setup cell ---
 
         xtcavImages_good = xtcavImages[:,:, goodShots]
         phase_class = np.full(xtcavImages.shape[2], np.nan)
-        umPerDeg = float(self.ui.umPerDegCal.toPlainText())
         if umPerDeg>0:
             factor = -1
         else:
@@ -1719,8 +1760,8 @@ class VTCAVDisplay(Display):
         # 2. Save the data using pickle
         with open(filename, 'wb') as f:
             pickle.dump(data_to_save, f)
-        print(f"Successfully saved good shot LPS Image data to '{filename}'.")
-        print(f"Saved image shape: {xtcavImages_good.shape}")
+        self.handle_log(f"Successfully saved good shot LPS Image data to '{filename}'.")
+        self.handle_log(f"Saved image shape: {xtcavImages_good.shape}")
         if hasattr(self, 'updateStatus'):
             self.updateStatus(f"Ready")
             
@@ -1734,7 +1775,7 @@ class VTCAVDisplay(Display):
         all_phase_classifications = []
         all_umPerDeg = []
 
-        print("Starting multi-run data loading and concatenation...")
+        self.handle_log("Starting multi-run data loading and concatenation...")
 
         # ----------------------------------------------------------------------
         # 3. Loop through runs, load data, and concatenate
@@ -1752,10 +1793,10 @@ class VTCAVDisplay(Display):
                 # This 'goodShots' index is relative to the phase-filtered data (all_idx).
                 goodShots_scal_common_index = data['scalarCommonIndex']
                 
-                print(f"Loaded pickle_filename: LPSImage shape {LPSImage_good.shape}")
+                self.handle_log(f"Loaded pickle_filename: LPSImage shape {LPSImage_good.shape}")
                 
             except FileNotFoundError:
-                print(f"Skipping pickle_filename: Pickle file not found at {pickle_filename}")
+                self.handle_log(f"Skipping pickle_filename: Pickle file not found at {pickle_filename}")
                 continue
             
             # --- B. Load and Filter Predictor Data (BSA Scalars) ---
@@ -1766,7 +1807,7 @@ class VTCAVDisplay(Display):
                 mat = loadmat(dataloc,struct_as_record=False, squeeze_me=True)
                 data_struct = mat['data_struct']
             except FileNotFoundError:
-                print(f"Skipping pickle_filename: .mat file not found at {dataloc}")
+                self.handle_log(f"Skipping pickle_filename: .mat file not found at {dataloc}")
                 continue
 
             # 2. Extract full BSA scalars (filtered by step_list if needed)
@@ -1810,7 +1851,7 @@ class VTCAVDisplay(Display):
 
         # Combine all data arrays from the runs
         images_tmp = np.concatenate(all_images, axis=0)
-        print(f"TMP Shape: {images_tmp.shape}")
+        self.handle_log(f"TMP Shape: {images_tmp.shape}")
         # Set image half dimensions (should match preprocessing)
         yrange = images_tmp.shape[0]//2
         xrange = images_tmp.shape[1]//2
@@ -1821,10 +1862,10 @@ class VTCAVDisplay(Display):
         umPerDeg_tmp = np.concatenate(all_umPerDeg, axis=0)
 
 
-        print("\n--- Final Concatenated Data Shapes ---")
-        print(f"Total LPS Images (images): {images_tmp.shape}")
-        print(f"Total Predictors (predictor): {predictor_tmp.shape}")
-        print(f"Final Phase Class: {phase_class_tmp.shape}")
+        self.handle_log("\n--- Final Concatenated Data Shapes ---")
+        self.handle_log(f"Total LPS Images (images): {images_tmp.shape}")
+        self.handle_log(f"Total Predictors (predictor): {predictor_tmp.shape}")
+        self.handle_log(f"Final Phase Class: {phase_class_tmp.shape}")
         self.update_image_display(np.average(images_tmp, axis = 0), display_name='Prep')
 
         near_minus_90_idx = np.where(phase_class_tmp == -90)[0]
@@ -1838,17 +1879,17 @@ class VTCAVDisplay(Display):
         excluded_var_idx = exclude_bsa_vars(allVars)
         bsaVarNames_cleaned = [var for i, var in enumerate(allVars) if i not in excluded_var_idx]
         predictor_tmp_cleaned = np.delete(predictor_tmp, excluded_var_idx, axis=1)[lps_idx, :]
-        print(f"Predictor shape after excluding variables: {predictor_tmp_cleaned.shape}")
+        self.handle_log(f"Predictor shape after excluding variables: {predictor_tmp_cleaned.shape}")
 
         LPSimg_prezoom = images_flipped[lps_idx]
         charge_filtered = charge[lps_idx]
-        print(f"LPS Image shape after filtering: {LPSimg_prezoom.shape}")
+        self.handle_log(f"LPS Image shape after filtering: {LPSimg_prezoom.shape}")
 
 
         # Calibration
         # Define XTCAV calibration
         krf = 239.26
-        cal = 1167 # um/deg  http://physics-elog.slac.stanford.edu/facetelog/show.jsp?dir=/2025/11/13.03&pos=2025-$
+        cal = umPerDeg_tmp[0] # um/deg  http://physics-elog.slac.stanford.edu/facetelog/show.jsp?dir=/2025/11/13.03&pos=2025-$
         streakFromGUI = cal*krf*180/np.pi*1e-6#um/um
         _xtcalibrationfactor = data_struct.metadata.DTOTR2.RESOLUTION*1e-6/streakFromGUI/3e8
         # Flags
@@ -1877,7 +1918,7 @@ class VTCAVDisplay(Display):
         INPUT_CHANNELS = 1 # Assuming LPSimg is grayscale/single-channel data
         # 1. Setup Device
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        print(f"Using device: {device}")
+        self.handle_log(f"Using device: {device}")
         # 2. Initialize Model and Optimizer
         model_cvae = CVAE(latent_dim=NCOMP).to(device)
         optimizer = torch.optim.Adam(model_cvae.parameters(), lr=1e-3)
@@ -1898,7 +1939,7 @@ class VTCAVDisplay(Display):
 
         # 4. Training Loop
         N_EPOCHS = 8
-        print("\nStarting training loop ({} epochs)...".format(N_EPOCHS))
+        self.handle_log("\nStarting training loop ({} epochs)...".format(N_EPOCHS))
 
         for epoch in range(1, N_EPOCHS + 1):
             total_loss = 0
@@ -1922,7 +1963,7 @@ class VTCAVDisplay(Display):
                 total_loss += loss.item()
 
             avg_loss = total_loss / len(dataset)
-            print(f"Epoch {epoch}/{N_EPOCHS}, Average VAE Loss: {avg_loss:.4f}")
+            self.handle_log(f"Epoch {epoch}/{N_EPOCHS}, Average VAE Loss: {avg_loss:.4f}")
 
         # Encode all LPS images to latent z parameters.
         latent_z_array = np.zeros((LPSimg.shape[0], NCOMP )) 
@@ -1936,7 +1977,7 @@ class VTCAVDisplay(Display):
         valid_rows = [True for i in range(latent_z_array.shape[0])]
         predictor_filtered = predictor_tmp_cleaned[valid_rows]
         biGaussian_params_array_filtered = latent_z_array[valid_rows]
-        print(f"After removing invalid rows, dataset shape: Predictors {predictor_filtered.shape}, Bi-Gaussian Params {biGaussian_params_array_filtered.shape}")
+        self.handle_log(f"After removing invalid rows, dataset shape: Predictors {predictor_filtered.shape}, Bi-Gaussian Params {biGaussian_params_array_filtered.shape}")
 
         # --- Original scaling and splitting logic follows ---
 
@@ -1960,14 +2001,14 @@ class VTCAVDisplay(Display):
         train_ds = TensorDataset(X_train, Y_train)
         train_dl = DataLoader(train_ds, batch_size=24, shuffle=True)
 
-        print(f"X_train shape: {X_train.shape}")
-        print(f"Y_train shape: {Y_train.shape}")
+        self.handle_log(f"X_train shape: {X_train.shape}")
+        self.handle_log(f"Y_train shape: {Y_train.shape}")
 
         # --- 2. Model and Hyperparameter Setup ---
         # The Random Forest is initialized with its structure (number of trees, depth, etc.)
         # This replaces the PyTorch MLP class definition.
 
-        print("\n--- Initializing Model ---")
+        self.handle_log("\n--- Initializing Model ---")
         # Equivalent to: model = MLP(X_train.shape[1], Y_train.shape[1])
         # n_estimators is equivalent to the overall model complexity/capacity
         # max_depth controls the depth, similar to the number of layers/nodes.
@@ -1988,7 +2029,7 @@ class VTCAVDisplay(Display):
         # We mimic the training block structure and calculate loss/metrics.
 
         t0 = time.time()
-        print("\n--- Starting Model Fitting (One Shot) ---")
+        self.handle_log("\n--- Starting Model Fitting (One Shot) ---")
 
         # Fit the model (This is the entire 'training loop' for RF)
         model.fit(X_train, Y_train)
@@ -2006,14 +2047,14 @@ class VTCAVDisplay(Display):
         test_mse = mean_squared_error(Y_test, Y_test_pred)
 
         # To see the importance of the input features:
-        print("\n--- Feature Importance ---")
+        self.handle_log("\n--- Feature Importance ---")
         for i, importance in enumerate(model.feature_importances_):
-            print(f"{bsaVarNames_cleaned[i]} importance: {importance:.4f}")
+            self.handle_log(f"{bsaVarNames_cleaned[i]} importance: {importance:.4f}")
 
-        print("\n--- Training Results ---")
-        print(f"Total Fitting Time: {t1 - t0:.2f} seconds")
-        print(f"Final Train MSE: {train_mse:.6f}")
-        print(f"Final Test MSE: {test_mse:.6f}")
+        self.handle_log("\n--- Training Results ---")
+        self.handle_log(f"Total Fitting Time: {t1 - t0:.2f} seconds")
+        self.handle_log(f"Final Train MSE: {train_mse:.6f}")
+        self.handle_log(f"Final Test MSE: {test_mse:.6f}")
 
         # Evaluate model
         pred_train_scaled = model.predict(X_train)
@@ -2025,7 +2066,7 @@ class VTCAVDisplay(Display):
         Iz_train_true = iz_scaler.inverse_transform(Iz_train_scaled)
         Iz_test_true = iz_scaler.inverse_transform(Iz_test_scaled)
         elapsed = time.time() - t0
-        print("Elapsed time [mins] = {:.1f} ".format(elapsed/60))
+        self.handle_log("Elapsed time [mins] = {:.1f} ".format(elapsed/60))
 
         # Compute R² score
         def r2_score(true, pred):
@@ -2034,8 +2075,8 @@ class VTCAVDisplay(Display):
             return 1 - RSS / TSS if TSS != 0 else 0
 
         # Compute R² on scaled data, instead of the actual bi-Gaussian parameters, to avoid distortion from different scales
-        print("Train R²: {:.2f} %".format(r2_score(Iz_train_scaled.ravel(), pred_train_scaled.ravel()) * 100))
-        print("Test R²: {:.2f} %".format(r2_score(Iz_test_scaled.ravel(), pred_test_scaled.ravel()) * 100))
+        self.handle_log("Train R²: {:.2f} %".format(r2_score(Iz_train_scaled.ravel(), pred_train_scaled.ravel()) * 100))
+        self.handle_log("Test R²: {:.2f} %".format(r2_score(Iz_test_scaled.ravel(), pred_test_scaled.ravel()) * 100))
         time_stamp = time.strftime("%Y%m%d_%H%M%S")
 
         data_to_save = {
@@ -2053,6 +2094,7 @@ class VTCAVDisplay(Display):
                 'yrange': yrange,
                 'type': 'CVAE Random Forest v2025.12'
             },
+            'syag_alignment_data' : self.create_alignment_data(data_struct, dataloc, lps_idx, LPSimg)
         }
         data_file = output_file_path
         with open(data_file, 'wb') as f:
@@ -2068,7 +2110,7 @@ class VTCAVDisplay(Display):
         all_phase_classifications = []
         all_umPerDeg = []
 
-        print("Starting multi-run data loading and concatenation...")
+        self.handle_log("Starting multi-run data loading and concatenation...")
 
         # ----------------------------------------------------------------------
         # 3. Loop through runs, load data, and concatenate
@@ -2086,10 +2128,10 @@ class VTCAVDisplay(Display):
                 # This 'goodShots' index is relative to the phase-filtered data (all_idx).
                 goodShots_scal_common_index = data['scalarCommonIndex']
                 
-                print(f"Loaded pickle_filename: LPSImage shape {LPSImage_good.shape}")
+                self.handle_log(f"Loaded pickle_filename: LPSImage shape {LPSImage_good.shape}")
                 
             except FileNotFoundError:
-                print(f"Skipping pickle_filename: Pickle file not found at {pickle_filename}")
+                self.handle_log(f"Skipping pickle_filename: Pickle file not found at {pickle_filename}")
                 continue
             
             # --- B. Load and Filter Predictor Data (BSA Scalars) ---
@@ -2100,7 +2142,7 @@ class VTCAVDisplay(Display):
                 mat = loadmat(dataloc,struct_as_record=False, squeeze_me=True)
                 data_struct = mat['data_struct']
             except FileNotFoundError:
-                print(f"Skipping pickle_filename: .mat file not found at {dataloc}")
+                self.handle_log(f"Skipping pickle_filename: .mat file not found at {dataloc}")
                 continue
 
             # 2. Extract full BSA scalars (filtered by step_list if needed)
@@ -2144,7 +2186,7 @@ class VTCAVDisplay(Display):
 
         # Combine all data arrays from the runs
         images_tmp = np.concatenate(all_images, axis=0)
-        print(f"TMP Shape: {images_tmp.shape}")
+        self.handle_log(f"TMP Shape: {images_tmp.shape}")
         # Set image half dimensions (should match preprocessing)
         yrange = images_tmp.shape[0]//2
         xrange = images_tmp.shape[1]//2
@@ -2155,10 +2197,10 @@ class VTCAVDisplay(Display):
         umPerDeg_tmp = np.concatenate(all_umPerDeg, axis=0)
 
 
-        print("\n--- Final Concatenated Data Shapes ---")
-        print(f"Total LPS Images (images): {images_tmp.shape}")
-        print(f"Total Predictors (predictor): {predictor_tmp.shape}")
-        print(f"Final Phase Class: {phase_class_tmp.shape}")
+        self.handle_log("\n--- Final Concatenated Data Shapes ---")
+        self.handle_log(f"Total LPS Images (images): {images_tmp.shape}")
+        self.handle_log(f"Total Predictors (predictor): {predictor_tmp.shape}")
+        self.handle_log(f"Final Phase Class: {phase_class_tmp.shape}")
         self.update_image_display(np.average(images_tmp, axis = 0), display_name='Prep')
 
         near_minus_90_idx = np.where(phase_class_tmp == -90)[0]
@@ -2172,17 +2214,17 @@ class VTCAVDisplay(Display):
         excluded_var_idx = exclude_bsa_vars(allVars)
         bsaVarNames_cleaned = [var for i, var in enumerate(allVars) if i not in excluded_var_idx]
         predictor_tmp_cleaned = np.delete(predictor_tmp, excluded_var_idx, axis=1)[lps_idx, :]
-        print(f"Predictor shape after excluding variables: {predictor_tmp_cleaned.shape}")
+        self.handle_log(f"Predictor shape after excluding variables: {predictor_tmp_cleaned.shape}")
 
         LPSimg_prezoom = images_flipped[lps_idx]
         charge_filtered = charge[lps_idx]
-        print(f"LPS Image shape after filtering: {LPSimg_prezoom.shape}")
+        self.handle_log(f"LPS Image shape after filtering: {LPSimg_prezoom.shape}")
 
 
         # Calibration
         # Define XTCAV calibration
         krf = 239.26
-        cal = 1167 # um/deg  http://physics-elog.slac.stanford.edu/facetelog/show.jsp?dir=/2025/11/13.03&pos=2025-$
+        cal = umPerDeg_tmp[0] # um/deg  http://physics-elog.slac.stanford.edu/facetelog/show.jsp?dir=/2025/11/13.03&pos=2025-$
         streakFromGUI = cal*krf*180/np.pi*1e-6#um/um
         _xtcalibrationfactor = data_struct.metadata.DTOTR2.RESOLUTION*1e-6/streakFromGUI/3e8
         # Flags
@@ -2207,7 +2249,7 @@ class VTCAVDisplay(Display):
 
         # 1. Setup Device
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        print(f"Using device: {device}")
+        self.handle_log(f"Using device: {device}")
 
         # --- 2. Image Slicing & Feature Extraction ---
         # Zoom the slicing axis (assumed axis 1) down to exactly NESLICE
@@ -2226,7 +2268,7 @@ class VTCAVDisplay(Display):
                 try:
                     popt, _ = curve_fit(gaussian_1d, x, slice_data, p0=[slice_data.argmax(), 10, slice_data.max()])
                     mu, sigma, amp = popt
-                    #print(f"mu: {mu}, sigma:{sigma}, eslice: {j}")
+                    #self.handle_log(f"mu: {mu}, sigma:{sigma}, eslice: {j}")
                 except RuntimeError:
                     amp, mu, sigma = 0, 0, 1 # Default fallback
                     
@@ -2271,7 +2313,7 @@ class VTCAVDisplay(Display):
             X_combined, Y_targets, np.arange(X_combined.shape[0]), test_size=0.2, random_state=42)
 
         # --- 6. Model Initialization ---
-        print("\n--- Initializing Model ---")
+        self.handle_log("\n--- Initializing Model ---")
         rf_model = RandomForestRegressor(
             n_estimators=500,        
             max_depth=15,            
@@ -2285,7 +2327,7 @@ class VTCAVDisplay(Display):
 
         # --- 7. Training ---
         t0 = time.time()
-        print("\n--- Starting Model Fitting (One Shot) ---")
+        self.handle_log("\n--- Starting Model Fitting (One Shot) ---")
         # The wrapper internally expands this to N * NESLICE rows
         model.fit(X_train, Y_train)
         t1 = time.time()
@@ -2302,23 +2344,23 @@ class VTCAVDisplay(Display):
         train_mse = mean_squared_error(Y_train, Y_train_pred_musig)
         test_mse = mean_squared_error(Y_test, Y_test_pred_musig)
 
-        print("\n--- Feature Importance ---")
+        self.handle_log("\n--- Feature Importance ---")
         for i, importance in enumerate(model.model.feature_importances_):
             if (i<len(bsaVarNames_cleaned)):
-                print(f"{bsaVarNames_cleaned[i]} importance: {importance:.4f}")
+                self.handle_log(f"{bsaVarNames_cleaned[i]} importance: {importance:.4f}")
             else:
-                print(f"energy importance: {importance:.4f}")
+                self.handle_log(f"energy importance: {importance:.4f}")
 
-        print("\n--- Training Results ---")
-        print(f"Total Fitting Time: {t1 - t0:.2f} seconds")
-        print(f"Final Train MSE (mu, sigma only): {train_mse:.6f}")
-        print(f"Final Test MSE (mu, sigma only): {test_mse:.6f}")
+        self.handle_log("\n--- Training Results ---")
+        self.handle_log(f"Total Fitting Time: {t1 - t0:.2f} seconds")
+        self.handle_log(f"Final Train MSE (mu, sigma only): {train_mse:.6f}")
+        self.handle_log(f"Final Test MSE (mu, sigma only): {test_mse:.6f}")
         # Inverse transform predictions for final output testing
         pred_test_scaled_full = model.predict(X_test)
         pred_test_full = iz_scaler.inverse_transform(pred_test_scaled_full)
 
         elapsed = time.time() - t0
-        print("Elapsed time [mins] = {:.1f} ".format(elapsed/60))
+        self.handle_log("Elapsed time [mins] = {:.1f} ".format(elapsed/60))
 
         # Compute R² score
         def r2_score(true, pred):
@@ -2327,24 +2369,9 @@ class VTCAVDisplay(Display):
             return 1 - RSS / TSS if TSS != 0 else 0
 
         # Compute R² on scaled data, instead of the actual bi-Gaussian parameters, to avoid distortion from different scales
-        print("Train R²: {:.2f} %".format(r2_score(Y_train, Y_train_pred_musig) * 100))
-        print("Test R²: {:.2f} %".format(r2_score(Y_test, Y_test_pred_musig) * 100))
-        print("\n--- SYAG - LPS Alignment ---")
-        # Optionally, compute SYAG and XTCAV alignment and also store it.
-        # gaussian filter parameter
-        hotPixThreshold = 1e3
-        sigma = 1
-        threshold = 5
-        # Do not specify xrange and yrange for SYAG, we don't need to zoom it, and we want the full image for alignment.
-        _, SYAGImages_raw, _, _ = extract_processed_images(data_struct, '', None, None, hotPixThreshold, sigma, threshold, step_list=None, roi_xrange=None, roi_yrange=None, do_load_raw=True, directory_path=str(pathlib.Path(dataloc).parent), instrument = 'SYAG')# do_load_raw = False by default.
-        # Crop to the top quadrant and compute projection. this is due to SYAG camera geometry.
-        print(f"SYAG Raw Loaded:{SYAGImages_raw.shape}")
-        SYAGImages_cropped = SYAGImages_raw[:, (3*SYAGImages_raw.shape[1]//4):, lps_idx]
-        SYAG_horz_proj = np.sum(SYAGImages_cropped, axis=1)
-        LPSimg_vert_proj = np.sum(LPSimg, axis=2).T
-        print(f"SYAG Waterfall Shape: {SYAG_horz_proj.shape}, LPS Waterfall Shape: {LPSimg_vert_proj.shape}")
-        alignment_data = map_xtcav_to_syag(SYAG_horz_proj, LPSimg_vert_proj)
-
+        self.handle_log("Train R²: {:.2f} %".format(r2_score(Y_train, Y_train_pred_musig) * 100))
+        self.handle_log("Test R²: {:.2f} %".format(r2_score(Y_test, Y_test_pred_musig) * 100))
+        
         time_stamp = time.strftime("%Y%m%d_%H%M%S")
 
         data_to_save = {
@@ -2362,16 +2389,41 @@ class VTCAVDisplay(Display):
                 'yrange': yrange,
                 'type': 'Gaussian Slice Random Forest v2026.03'
             },
-            'syag_alignment_data' : alignment_data
+            'syag_alignment_data' : self.create_alignment_data(data_struct, dataloc, lps_idx, LPSimg)
         }
         data_file = output_file_path
         with open(data_file, 'wb') as f:
             pickle.dump(data_to_save, f)
+    def create_alignment_data(self, data_struct, dataloc, lps_idx, LPSimg):
+        self.handle_log("\n--- SYAG - LPS Alignment ---")
+        # Optionally, compute SYAG and XTCAV alignment and also store it.
+        # gaussian filter parameter
+        hotPixThreshold = 1e3
+        sigma = 1
+        threshold = 5
+        # Do not specify xrange and yrange for SYAG, we don't need to zoom it, and we want the full image for alignment.
+        SYAGImages_raw, _, _, _ = extract_processed_images(data_struct, '', None, None, hotPixThreshold, sigma, threshold, step_list=None, roi_xrange=None, roi_yrange=None, do_load_raw=False, directory_path=str(pathlib.Path(dataloc).parent), instrument = 'SYAG')# do_load_raw = False by default.
+        # Crop to the top quadrant and compute projection. this is due to SYAG camera geometry.
+        self.handle_log(f"SYAG Raw Loaded:{SYAGImages_raw.shape}")
+        SYAGImages_cropped = SYAGImages_raw[:, (3*SYAGImages_raw.shape[1]//4):, lps_idx]
+        SYAG_horz_proj = np.sum(SYAGImages_cropped, axis=1, dtype=np.int64)
+        LPSimg_vert_proj = np.sum(LPSimg, axis=2, dtype=np.int64).T
+        self.handle_log(f"SYAG Waterfall Shape: {SYAG_horz_proj.shape}, LPS Waterfall Shape: {LPSimg_vert_proj.shape}")
+        return map_xtcav_to_syag(SYAG_horz_proj, LPSimg_vert_proj)
+
     
+    def updateStatus(self, status_text):
+        """Updates the UI status label and forces a visual refresh."""
+        if hasattr(self.ui, 'statusLabel'):
+            self.ui.statusLabel.setText(status_text)
+            
+            # Force Qt to update the GUI immediately
+            QApplication.processEvents()
     @Slot(str)
     def handle_log(self, message):
         """Appends log messages to the PyDMLogDisplay"""
         self.ui.PyDMLogDisplay.write(message)
+        QApplication.processEvents()
         print(message)
 
     def closeEvent(self, event):
@@ -2400,12 +2452,12 @@ class VTCAVDisplay(Display):
         try:
             # exec(code, globals, locals)
             exec(script_code, globals(), live_environment)
-            print("--- Script Executed Successfully ---")
+            self.handle_log("--- Script Executed Successfully ---")
             
         except Exception as e:
             # If your script has a typo, we want to catch it here 
             # instead of letting it crash the entire PyDM application.
-            print("--- Script Error ---")
+            self.handle_log("--- Script Error ---")
             traceback.print_exc()
     
 

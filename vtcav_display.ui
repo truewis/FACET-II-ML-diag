@@ -71,7 +71,7 @@
          </sizepolicy>
         </property>
         <property name="currentIndex">
-         <number>4</number>
+         <number>3</number>
         </property>
         <widget class="QWidget" name="tab">
          <attribute name="title">
@@ -403,11 +403,14 @@
             </item>
             <item row="1" column="6" colspan="3">
              <widget class="QCheckBox" name="auto_off_idx">
+              <property name="enabled">
+               <bool>true</bool>
+              </property>
               <property name="text">
                <string>Select Off Shot using var_x, not TCAV PV</string>
               </property>
               <property name="checked">
-               <bool>true</bool>
+               <bool>false</bool>
               </property>
              </widget>
             </item>
@@ -651,6 +654,11 @@
           </item>
           <item>
            <property name="text">
+            <string>CVAE20+RF</string>
+           </property>
+          </item>
+          <item>
+           <property name="text">
             <string>GaussianESlice+RF</string>
            </property>
           </item>
@@ -844,7 +852,7 @@
          </sizepolicy>
         </property>
         <property name="currentIndex">
-         <number>2</number>
+         <number>0</number>
         </property>
         <widget class="QWidget" name="tab_3">
          <attribute name="title">
