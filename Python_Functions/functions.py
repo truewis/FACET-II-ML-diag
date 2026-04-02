@@ -1213,7 +1213,6 @@ def extract_processed_images(data_struct, experiment, xrange=100, yrange=100, ho
 		tuple: A tuple containing the processed image arrays:
 			   (xtcavImages, xtcavImages_raw, horz_proj, LPSImage)
 	"""
-	LPSImage = []
 	stepsAll = data_struct.params.stepsAll
 	step_size = None
 	raw_width = None
@@ -1234,7 +1233,7 @@ def extract_processed_images(data_struct, experiment, xrange=100, yrange=100, ho
 
 			# --- Read and Prepare Data ---
 			with h5py.File(DTOTR2datalocation, 'r') as f:
-				data_raw = f['entry']['data']['data'][:].astype(np.float64) # shape: (N, H, W)
+				data_raw = f['entry']['data']['data'][:].astype(np.uint8) # shape: (N, H, W)
 				pid_list = f["entry/instrument/NDAttributes/NDArrayUniqueId"][:].astype(np.int64)  # shape: (N,)
 			
 			# Transpose to shape: (H, W, N) - Height, Width, Shots
@@ -1242,7 +1241,7 @@ def extract_processed_images(data_struct, experiment, xrange=100, yrange=100, ho
 			# Subtract background (H, W) from all shots (H, W, N)
 			try:
 				# If there is background data
-				xtcavImages_step = DTOTR2data_step - data_struct.backgrounds[instrument][:,:,np.newaxis].astype(np.float64)
+				xtcavImages_step = DTOTR2data_step - data_struct.backgrounds[instrument][:,:,np.newaxis].astype(np.uint8)
 			except:
 				xtcavImages_step = DTOTR2data_step
 			step_size = DTOTR2data_step.shape[2]
@@ -1274,19 +1273,17 @@ def extract_processed_images(data_struct, experiment, xrange=100, yrange=100, ho
 				# Filter and mask hot pixels
 				img_filtered = median_filter(image_cropped, size=3)
 				hotPixels = img_filtered > hotPixThreshold
-				img_filtered = np.ma.masked_array(img_filtered, hotPixels)
+				img_filtered = np.ma.masked_array(img_filtered, hotPixels).astype(np.float64)
 				
 				# Gaussian smoothing and thresholding
-				processed_image = gaussian_filter(img_filtered, sigma=sigma, radius = 6*sigma + 1)
+				processed_image = gaussian_filter(img_filtered, sigma=sigma)
 				processed_image[processed_image < threshold] = 0.0
 				
 				# Calculate current profiles (Horizontal Projection)
 				
 				# Prepare for collection
 				processed_image = processed_image[:,:,np.newaxis]
-				image_ravel = processed_image.ravel()
 				xtcavImages_list.append(processed_image)
-				LPSImage.append([image_ravel]) 
 			images_each_step.append(xtcavImages_list)
 			pid_list_each_step.append(pid_list)
 			if do_load_raw:

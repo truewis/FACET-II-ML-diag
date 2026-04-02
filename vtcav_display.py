@@ -1755,9 +1755,9 @@ class VTCAVDisplay(Display):
         xtcavImages_good = xtcavImages[:,:, goodShots]
         phase_class = np.full(xtcavImages.shape[2], np.nan)
         if umPerDeg>0:
-            factor = -1
-        else:
             factor = 1
+        else:
+            factor = -1
         phase_class[off_idx] = 0
         phase_class[plus_90_idx] = 90 * factor
         phase_class[minus_90_idx] = -90 * factor
