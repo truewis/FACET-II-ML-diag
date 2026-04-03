@@ -21,7 +21,7 @@ import torch
 from scipy.io import loadmat, savemat
 from scipy.optimize import curve_fit
 from scipy.ndimage import center_of_mass, shift, zoom
-from Python_Functions.functions import cropProfmonImg, map_xtcav_to_syag, matstruct_to_dict, extractDAQBSAScalars, extractDAQNonBSAScalars, segment_centroids_and_com, apply_tcav_zeroing_filter, apply_centroid_correction, extract_processed_images
+from Python_Functions.functions import cropProfmonImg, find_2d_mask_intervals, map_xtcav_to_syag, matstruct_to_dict, extractDAQBSAScalars, extractDAQNonBSAScalars, segment_centroids_and_com, apply_tcav_zeroing_filter, apply_centroid_correction, extract_processed_images
 from qtpy.QtGui import QColor
 from qtpy.QtCore import QThread, Signal, Slot, Qt
 from qtpy.QtWidgets import QMessageBox, QFileDialog, QTableWidgetItem
@@ -446,6 +446,8 @@ class VTCAVDisplay(Display):
         self.SYAG_daq_images= None
         self.compare_truth_data = None # Will hold preprocessed images in the compare function
         self.unit = "um"
+        self.do_syag_alignment = False
+        self.do_collimator_study = False
 
         # 1. Setup UI Elements
         self.setup_model_ui()
@@ -532,10 +534,16 @@ class VTCAVDisplay(Display):
 
         # Options
         self.ui.doManualSYAG.toggled.connect(self.set_manual_SYAG)
+        self.ui.doManualCollimator.toggled.connect(self.set_manual_Collimator)
+        self.ui.doSYAGAlignment.toggled.connect(self.set_do_syag_alignment)
         self.ui.unitComboBox.currentTextChanged.connect(self.set_current_profile_unit)
 
     def set_manual_SYAG(self, checked):
         self.worker.manual_SYAG = checked
+    def set_manual_Collimator(self, checked):
+        self.do_collimator_study = checked
+    def set_do_syag_alignment(self, checked):
+        self.do_syag_alignment = checked
 
     def set_current_profile_unit(self, unit):
         self.unit = unit
@@ -1444,6 +1452,23 @@ class VTCAVDisplay(Display):
         # 1. Update Image
         target_img_view.setImage(image_data.T, autoRange=False, autoLevels=False)
         
+        if self.do_collimator_study:
+            separations_um = [75, 100, 125, 150, 175]
+            tolerance_um = 5
+            fwhm_um = 25
+            syag_scale = self.worker.alignment_data['scale']
+            syag_offset = self.worker.alignment_data['offset']
+            for separation in separations_um:
+                separation_pix = separation / (self.worker.xtcalibrationfactor_fs * 0.299792458) # Convert um to pixels using calibration (um/pix)
+                tolerance_pix = tolerance_um / (self.worker.xtcalibrationfactor_fs * 0.299792458) # Convert um to pixels
+                fwhm_pix = fwhm_um / (self.worker.xtcalibrationfactor_fs * 0.299792458) # Convert um to pixels
+                a,b,c = find_2d_mask_intervals(image_data, separation = separation_pix, ratio_bounds = (0.05, 0.3), max_fwhm_smaller = fwhm_pix, sep_tolerance=tolerance_pix)
+                # Convert a,b,c back to SYAG positions using scaling and offset.
+                a_syag = a * syag_scale + syag_offset
+                b_syag = b * syag_scale + syag_offset
+                c_syag = c * syag_scale + syag_offset
+                self.handle_log(f"Collimator Study - Separation: {separation} um -> Found intervals (a, b, c): ({a_syag}, {b_syag}, {c_syag})")
+
         # 2. Update Projections
         try:
             # image_data shape is (Rows, Cols) -> (Y, X)
@@ -1755,9 +1780,9 @@ class VTCAVDisplay(Display):
         xtcavImages_good = xtcavImages[:,:, goodShots]
         phase_class = np.full(xtcavImages.shape[2], np.nan)
         if umPerDeg>0:
-            factor = 1
-        else:
             factor = -1
+        else:
+            factor = 1
         phase_class[off_idx] = 0
         phase_class[plus_90_idx] = 90 * factor
         phase_class[minus_90_idx] = -90 * factor
@@ -2100,7 +2125,14 @@ class VTCAVDisplay(Display):
         self.handle_log("Train R²: {:.2f} %".format(r2_score(Iz_train_scaled.ravel(), pred_train_scaled.ravel()) * 100))
         self.handle_log("Test R²: {:.2f} %".format(r2_score(Iz_test_scaled.ravel(), pred_test_scaled.ravel()) * 100))
         time_stamp = time.strftime("%Y%m%d_%H%M%S")
-
+        if self.do_syag_alignment:
+            syag_alignment_data = self.create_alignment_data(data_struct, dataloc, lps_idx, LPSimg)
+        else:
+            syag_alignment_data = {
+                'scale': 6,
+                'offset': -100,
+                'correlation': 1
+            }
         data_to_save = {
             'varNames': bsaVarNames_cleaned,
             'bsaVarNames': bsaVars,
@@ -2116,7 +2148,7 @@ class VTCAVDisplay(Display):
                 'yrange': yrange,
                 'type': 'CVAE Random Forest v2025.12'
             },
-            'syag_alignment_data' : self.create_alignment_data(data_struct, dataloc, lps_idx, LPSimg)
+            'syag_alignment_data' : syag_alignment_data
         }
         data_file = output_file_path
         with open(data_file, 'wb') as f:
@@ -2395,7 +2427,14 @@ class VTCAVDisplay(Display):
         self.handle_log("Test R²: {:.2f} %".format(r2_score(Y_test, Y_test_pred_musig) * 100))
         
         time_stamp = time.strftime("%Y%m%d_%H%M%S")
-
+        if self.do_syag_alignment:
+            syag_alignment_data = self.create_alignment_data(data_struct, dataloc, lps_idx, LPSimg)
+        else:
+            syag_alignment_data = {
+                'scale': 6,
+                'offset': -100,
+                'correlation': 1
+            }
         data_to_save = {
             'varNames': bsaVarNames_cleaned,
             'bsaVarNames': bsaVars,
@@ -2411,7 +2450,7 @@ class VTCAVDisplay(Display):
                 'yrange': yrange,
                 'type': 'Gaussian Slice Random Forest v2026.03'
             },
-            'syag_alignment_data' : self.create_alignment_data(data_struct, dataloc, lps_idx, LPSimg)
+            'syag_alignment_data' : syag_alignment_data
         }
         data_file = output_file_path
         with open(data_file, 'wb') as f:

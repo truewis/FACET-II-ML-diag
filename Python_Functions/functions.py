@@ -1695,3 +1695,103 @@ def apply_centroid_correction(xtcavImages, off_idx, steps_if_stepwise=None, do_r
 		LPSImage = None # Need actual flattened LPS
 		
 	return xtcavImages_ret, None, LPSImage, correction_return_value
+
+def get_fwhm(projection, peak_idx):
+    """Calculates the Full Width at Half Maximum (FWHM) in pixels using linear interpolation."""
+    peak_val = projection[peak_idx]
+    half_max = peak_val / 2.0
+    N = len(projection)
+    
+    # Trace left
+    left_idx = peak_idx
+    while left_idx > 0 and projection[left_idx] > half_max:
+        left_idx -= 1
+        
+    # Interpolate exact left crossing
+    if left_idx < peak_idx:
+        slope = projection[left_idx + 1] - projection[left_idx]
+        left_cross = left_idx + (half_max - projection[left_idx]) / slope if slope != 0 else left_idx
+    else:
+        left_cross = left_idx
+
+    # Trace right
+    right_idx = peak_idx
+    while right_idx < N - 1 and projection[right_idx] > half_max:
+        right_idx += 1
+        
+    # Interpolate exact right crossing
+    if right_idx > peak_idx:
+        slope = projection[right_idx] - projection[right_idx - 1]
+        right_cross = right_idx - 1 + (half_max - projection[right_idx - 1]) / slope if slope != 0 else right_idx
+    else:
+        right_cross = right_idx
+
+    return right_cross - left_cross
+
+def find_2d_mask_intervals(image_data, separation, ratio_bounds, max_fwhm_smaller, sep_tolerance=0):
+    """
+    Finds vertical slice intervals [a, b] and [c, end] such that the horizontal 
+    projection of the masked 2D image satisfies specific peak constraints.
+    """
+    H, W = image_data.shape
+    min_ratio, max_ratio = ratio_bounds
+    
+    # 1. Precompute cumulative sum along the horizontal axis (W) for O(1) summing.
+    # This turns a slow 2D slice sum into a fast 1D subtraction.
+    cumsum_img = np.cumsum(image_data, axis=1)
+    
+    def get_column_sum(start, end):
+        if start <= 0:
+            return cumsum_img[:, end]
+        return cumsum_img[:, end] - cumsum_img[:, start - 1]
+
+    # 2. Get the global vertical projection (Energy profile) to guide 'a'
+    w_proj = np.sum(image_data, axis=0)
+    
+    # 3. Scan the split point 'v' across the width of the image
+    for v in range(1, W - 1):
+        b = v
+        c = v + 1 # Gap of 1 pixel between the intervals
+        
+        # Define 'a': Walk left from the peak of the left region [0, b] 
+        # until the signal stops decreasing (finding the base of the peak)
+        left_peak_w = np.argmax(w_proj[0:b+1])
+        a = left_peak_w
+        while a > 0 and w_proj[a-1] <= w_proj[a]:
+            a -= 1
+            
+        # 4. Calculate the horizontal projections (Time profiles) for the two intervals
+        h_proj_1 = get_column_sum(a, b)
+        h_proj_2 = get_column_sum(c, W - 1)
+        
+        # The total masked horizontal projection
+        h_proj_combined = h_proj_1 + h_proj_2
+        
+        # 5. Find the peaks. Because [a, b] and [c, W-1] isolate the two bunches 
+        # horizontally, their individual maximums represent the two peaks vertically.
+        peak1_idx = np.argmax(h_proj_1)
+        peak2_idx = np.argmax(h_proj_2)
+        
+        # Condition 1: Check distance between peaks in the horizontal projection
+        dist = abs(peak1_idx - peak2_idx)
+        if abs(dist - separation) > sep_tolerance:
+            continue
+            
+        # Condition 2: Check Charge Ratio
+        charge1 = np.sum(h_proj_1)
+        charge2 = np.sum(h_proj_2)
+        if charge1 <= 0 or charge2 <= 0:
+            continue
+            
+        ratio = charge1 / charge2
+        if not (min_ratio <= ratio <= max_ratio or min_ratio <= (1/ratio) <= max_ratio):
+            continue
+            
+        # Condition 3: Check FWHM of the smaller peak
+        smaller_peak_idx = peak1_idx if charge1 < charge2 else peak2_idx
+        fwhm = get_fwhm(h_proj_combined, smaller_peak_idx)
+        
+        if fwhm <= max_fwhm_smaller:
+            return a, b, c
+            
+    return None
