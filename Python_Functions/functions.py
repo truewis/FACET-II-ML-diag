@@ -1185,7 +1185,7 @@ def extract_UVVisSpec(data_struct, step_list=None, directory_path = '/nas/nas-li
 	return np.array(xtcavImages)[:,:,:,0]
 
 def extract_processed_images(data_struct, experiment, xrange=100, yrange=100, hotPixThreshold=1e3, sigma=1, threshold=5, step_list=None,
-							 roi_xrange=None, roi_yrange=None, do_load_raw = False, directory_path = '/nas/nas-li20-pm00/', instrument = 'DTOTR2'
+							 roi_xrange=None, roi_yrange=None, do_load_raw = False, directory_path = '/nas/nas-li20-pm00/', instrument = 'DTOTR2', intermediate_datatype = np.uint16
 							 ):
 	"""
 	Processes DTOTR2 images from HDF5 files, applying module-defined cropping, 
@@ -1233,7 +1233,7 @@ def extract_processed_images(data_struct, experiment, xrange=100, yrange=100, ho
 
 			# --- Read and Prepare Data ---
 			with h5py.File(DTOTR2datalocation, 'r') as f:
-				data_raw = f['entry']['data']['data'][:].astype(np.uint8) # shape: (N, H, W)
+				data_raw = f['entry']['data']['data'][:].astype(intermediate_datatype) # shape: (N, H, W)
 				pid_list = f["entry/instrument/NDAttributes/NDArrayUniqueId"][:].astype(np.int64)  # shape: (N,)
 			
 			# Transpose to shape: (H, W, N) - Height, Width, Shots
@@ -1241,7 +1241,7 @@ def extract_processed_images(data_struct, experiment, xrange=100, yrange=100, ho
 			# Subtract background (H, W) from all shots (H, W, N)
 			try:
 				# If there is background data
-				xtcavImages_step = DTOTR2data_step - data_struct.backgrounds[instrument][:,:,np.newaxis].astype(np.uint8)
+				xtcavImages_step = DTOTR2data_step - data_struct.backgrounds[instrument][:,:,np.newaxis].astype(intermediate_datatype)
 			except:
 				xtcavImages_step = DTOTR2data_step
 			step_size = DTOTR2data_step.shape[2]
@@ -1736,62 +1736,69 @@ def find_2d_mask_intervals(image_data, separation, ratio_bounds, max_fwhm_smalle
     H, W = image_data.shape
     min_ratio, max_ratio = ratio_bounds
     
-    # 1. Precompute cumulative sum along the horizontal axis (W) for O(1) summing.
-    # This turns a slow 2D slice sum into a fast 1D subtraction.
-    cumsum_img = np.cumsum(image_data, axis=1)
+ 
+    # 1. Precompute projections
+    w_proj = np.sum(image_data, axis=0) # Vertical projection (Width)
+    total_charge = np.sum(w_proj)
+    cumsum_w = np.cumsum(w_proj)
     
-    def get_column_sum(start, end):
-        if start <= 0:
-            return cumsum_img[:, end]
+    # Precompute for O(1) horizontal projection (Time) sums
+    cumsum_img = np.cumsum(image_data, axis=1)
+    def get_h_proj(start, end):
+        if start <= 0: return cumsum_img[:, end]
         return cumsum_img[:, end] - cumsum_img[:, start - 1]
 
-    # 2. Get the global vertical projection (Energy profile) to guide 'a'
-    w_proj = np.sum(image_data, axis=0)
-    
-    # 3. Scan the split point 'v' across the width of the image
-    for v in range(1, W - 1):
-        b = v
-        c = v + 1 # Gap of 1 pixel between the intervals
+    # 2. Find 'c' such that [c, W-1] contains 70% of the total charge
+    # Search from the right to find the leftmost index that captures 70%
+    target_charge = 0.70 * total_charge
+    c = W - 1
+    while c > 0 and (total_charge - (cumsum_w[c-1] if c > 0 else 0)) < target_charge:
+        c -= 1
+    print("c found:", c)
         
-        # Define 'a': Walk left from the peak of the left region [0, b] 
-        # until the signal stops decreasing (finding the base of the peak)
-        left_peak_w = np.argmax(w_proj[0:b+1])
-        a = left_peak_w
-        while a > 0 and w_proj[a-1] <= w_proj[a]:
-            a -= 1
-            
-        # 4. Calculate the horizontal projections (Time profiles) for the two intervals
-        h_proj_1 = get_column_sum(a, b)
-        h_proj_2 = get_column_sum(c, W - 1)
+    h_proj_right = get_h_proj(c, W - 1)
+    peak_right_idx = np.argmax(h_proj_right)
+    print("peak right:", peak_right_idx)
+    charge_right = np.sum(h_proj_right)
+    while (charge_right > 0.4):
         
-        # The total masked horizontal projection
-        h_proj_combined = h_proj_1 + h_proj_2
-        
-        # 5. Find the peaks. Because [a, b] and [c, W-1] isolate the two bunches 
-        # horizontally, their individual maximums represent the two peaks vertically.
-        peak1_idx = np.argmax(h_proj_1)
-        peak2_idx = np.argmax(h_proj_2)
-        
-        # Condition 1: Check distance between peaks in the horizontal projection
-        dist = abs(peak1_idx - peak2_idx)
-        if abs(dist - separation) > sep_tolerance:
-            continue
-            
-        # Condition 2: Check Charge Ratio
-        charge1 = np.sum(h_proj_1)
-        charge2 = np.sum(h_proj_2)
-        if charge1 <= 0 or charge2 <= 0:
-            continue
-            
-        ratio = charge1 / charge2
-        if not (min_ratio <= ratio <= max_ratio or min_ratio <= (1/ratio) <= max_ratio):
-            continue
-            
-        # Condition 3: Check FWHM of the smaller peak
-        smaller_peak_idx = peak1_idx if charge1 < charge2 else peak2_idx
-        fwhm = get_fwhm(h_proj_combined, smaller_peak_idx)
-        
-        if fwhm <= max_fwhm_smaller:
-            return a, b, c
-            
+        h_proj_right = get_h_proj(c, W - 1)
+        peak_right_idx = np.argmax(h_proj_right)
+        print("peak right:", peak_right_idx)
+        charge_right = np.sum(h_proj_right)
+        # 3. Scan 'b' to satisfy the peak separation requirement
+        # We look for a peak in [0, b] that is 'separation' away from peak_right_idx
+        for b in range(1, c):
+                h_proj_left_temp = get_h_proj(0, b)
+                peak_left_idx = np.argmax(h_proj_left_temp)
+                print("peak left:", peak_left_idx)
+                dist = abs(peak_left_idx - peak_right_idx)
+                print("dist:", dist)
+                print("target sep:", separation)
+                if abs(dist - separation) > sep_tolerance:
+                        continue
+                print("b found:", b)
+                # 4. Scan 'a' to satisfy ratio and FWHM (Bunch Length)
+                # We narrow the left window [a, b] to refine the "bunch"
+                for a in range(0, b):
+                        h_proj_left = get_h_proj(a, b)
+                        charge_left = np.sum(h_proj_left)
+                        
+                        if charge_left <= 0: continue
+                        
+                        # Check Charge Ratio
+                        ratio = charge_left / charge_right
+                        if not (min_ratio <= ratio <= max_ratio or min_ratio <= (1/ratio) <= max_ratio):
+                                continue
+                        
+                        # Check FWHM (Maximal bunch length)
+                        # Use the smaller peak for the FWHM constraint
+                        h_proj_combined = h_proj_left + h_proj_right
+                        smaller_peak_idx = peak_left_idx if charge_left < charge_right else peak_right_idx
+                        
+                        fwhm = get_fwhm(h_proj_combined, smaller_peak_idx)
+                        if fwhm <= max_fwhm_smaller:
+                                return a, b, c
+        c -= 3
+
     return None

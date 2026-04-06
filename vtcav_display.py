@@ -448,6 +448,7 @@ class VTCAVDisplay(Display):
         self.unit = "um"
         self.do_syag_alignment = False
         self.do_collimator_study = False
+        self.separations_um = [75, 100, 125, 150, 175]
 
         # 1. Setup UI Elements
         self.setup_model_ui()
@@ -915,11 +916,8 @@ class VTCAVDisplay(Display):
         if (self.worker.n_eslice != 0 | self.worker.manual_SYAG):
             mat = loadmat(dataloc,struct_as_record=False, squeeze_me=True)
             data_struct = mat['data_struct']
-            hotPixThreshold = 1e3
-            sigma = 1
-            threshold = 5
             file_path_obj = pathlib.Path(dataloc)
-            _, syagImages_raw, _, _ = extract_processed_images(data_struct, '', 100, 100, hotPixThreshold, sigma, threshold, None, None, None, do_load_raw=True, directory_path=str(file_path_obj.parent), instrument="SYAG")
+            syagImages_raw, _, _, _ = extract_processed_images(data_struct, '', xrange = None, yrange = None, hotPixThreshold = 1e4, sigma = 1, threshold = 5, step_list = None, roi_xrange = None, roi_yrange = None, do_load_raw=False, directory_path=str(file_path_obj.parent), instrument="SYAG", intermediate_datatype=np.uint8)
             # Dimensions of syagImages_raw should be (num_shots, width, height), but it is (height, width, num_shots) due to how MATLAB saves arrays. We need to transpose it to align with the shot indexing.
             syagImages_raw = np.transpose(syagImages_raw, (2, 1, 0))
             self.SYAG_daq_images = syagImages_raw
@@ -1453,7 +1451,7 @@ class VTCAVDisplay(Display):
         target_img_view.setImage(image_data.T, autoRange=False, autoLevels=False)
         
         if self.do_collimator_study:
-            separations_um = [75, 100, 125, 150, 175]
+            separations_um = self.separations_um
             tolerance_um = 5
             fwhm_um = 25
             syag_scale = self.worker.alignment_data['scale']
@@ -1462,13 +1460,15 @@ class VTCAVDisplay(Display):
                 separation_pix = separation / (self.worker.xtcalibrationfactor_fs * 0.299792458) # Convert um to pixels using calibration (um/pix)
                 tolerance_pix = tolerance_um / (self.worker.xtcalibrationfactor_fs * 0.299792458) # Convert um to pixels
                 fwhm_pix = fwhm_um / (self.worker.xtcalibrationfactor_fs * 0.299792458) # Convert um to pixels
-                a,b,c = find_2d_mask_intervals(image_data, separation = separation_pix, ratio_bounds = (0.05, 0.3), max_fwhm_smaller = fwhm_pix, sep_tolerance=tolerance_pix)
-                # Convert a,b,c back to SYAG positions using scaling and offset.
-                a_syag = a * syag_scale + syag_offset
-                b_syag = b * syag_scale + syag_offset
-                c_syag = c * syag_scale + syag_offset
-                self.handle_log(f"Collimator Study - Separation: {separation} um -> Found intervals (a, b, c): ({a_syag}, {b_syag}, {c_syag})")
-
+                try:
+                    (a,b,c) = find_2d_mask_intervals(image_data, separation = separation_pix, ratio_bounds = (0.05, 0.3), max_fwhm_smaller = fwhm_pix, sep_tolerance=tolerance_pix)
+                    # Convert a,b,c back to SYAG positions using scaling and offset.
+                    a_syag = a * syag_scale + syag_offset
+                    b_syag = b * syag_scale + syag_offset
+                    c_syag = c * syag_scale + syag_offset
+                    self.handle_log(f"Collimator Study - Separation: {separation} um -> Found intervals (a, b, c): ({a_syag}, {b_syag}, {c_syag})")
+                except:
+                    self.handle_log(f"Collimator Study: Cannot find intervals for {separation} um")
         # 2. Update Projections
         try:
             # image_data shape is (Rows, Cols) -> (Y, X)
@@ -2463,7 +2463,7 @@ class VTCAVDisplay(Display):
         sigma = 1
         threshold = 5
         # Do not specify xrange and yrange for SYAG, we don't need to zoom it, and we want the full image for alignment.
-        SYAGImages_raw, _, _, _ = extract_processed_images(data_struct, '', None, None, hotPixThreshold, sigma, threshold, step_list=None, roi_xrange=None, roi_yrange=None, do_load_raw=False, directory_path=str(pathlib.Path(dataloc).parent), instrument = 'SYAG')# do_load_raw = False by default.
+        SYAGImages_raw, _, _, _ = extract_processed_images(data_struct, '', None, None, hotPixThreshold, sigma, threshold, step_list=None, roi_xrange=None, roi_yrange=None, do_load_raw=False, directory_path=str(pathlib.Path(dataloc).parent), instrument = 'SYAG', intermediate_datetype = np.uint8)# do_load_raw = False by default.
         # Crop to the top quadrant and compute projection. this is due to SYAG camera geometry.
         self.handle_log(f"SYAG Raw Loaded:{SYAGImages_raw.shape}")
         SYAGImages_cropped = SYAGImages_raw[:, (3*SYAGImages_raw.shape[1]//4):, lps_idx]
