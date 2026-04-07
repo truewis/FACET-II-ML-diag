@@ -82,6 +82,142 @@ def find_experiment_file(experiment: str, runname: str, base_nas_path: str = '/n
 	except Exception as e:
 		print(f"An unexpected error occurred during search: {e}")
 		return None
+import os
+import re
+
+def get_min_max_daq(date_path, experiment):
+    """
+    Helper function to find the minimum and maximum daq_num 
+    currently existing in a given date directory.
+    """
+    print(f"  [DEBUG] get_min_max_daq: Checking directory -> {date_path}")
+    if not os.path.exists(date_path):
+        print(f"  [DEBUG] get_min_max_daq: Path does not exist. Returning None, None.")
+        return None, None
+    
+    items = os.listdir(date_path)
+    daq_nums = []
+    # Pattern to match exactly: {experiment}_{daq_num}
+    pattern = re.compile(rf"^{re.escape(experiment)}_(\d+)$")
+    
+    for item in items:
+        match = pattern.match(item)
+        if match:
+            daq_nums.append(int(match.group(1)))
+            
+    if not daq_nums:
+        print(f"  [DEBUG] get_min_max_daq: No matching files found. Returning None, None.")
+        return None, None
+        
+    min_val, max_val = min(daq_nums), max(daq_nums)
+    print(f"  [DEBUG] get_min_max_daq: Found {len(daq_nums)} items. Min DAQ = {min_val}, Max DAQ = {max_val}")
+    return min_val, max_val
+
+def facet_daq_path(experiment, daq_num, base_path='/nas/nas-li20-pm00/'):
+    """
+    Finds the path for a specific experiment and daq_num.
+    Searches the 4 most recent dates first, then uses binary search.
+    Expects structure: {base_path}/{experiment}/YYYY/YYYYMMDD/
+    """
+    print(f"\n[DEBUG] --- Starting path_fun ---")
+    print(f"[DEBUG] Inputs: base_path='{base_path}', experiment='{experiment}', daq_num='{daq_num}'")
+    
+    exp_path = os.path.join(base_path, experiment)
+    if not os.path.exists(exp_path):
+        print(f"[DEBUG] Experiment path '{exp_path}' does not exist. Returning None.")
+        return None
+        
+    # 1. Gather all date directories by checking YYYY then YYYYMMDD
+    date_dirs = []
+    
+    print(f"[DEBUG] Scanning for YYYY and YYYYMMDD directories in '{exp_path}'...")
+    for year_dir in os.listdir(exp_path):
+        year_path = os.path.join(exp_path, year_dir)
+        
+        # Check if the item is a 4-digit directory (YYYY)
+        if re.match(r"^\d{4}$", year_dir) and os.path.isdir(year_path):
+            for date_dir in os.listdir(year_path):
+                # Check if the item is an 8-digit directory (YYYYMMDD) and starts with the year
+                if re.match(r"^\d{8}$", date_dir) and date_dir.startswith(year_dir):
+                    if os.path.isdir(os.path.join(year_path, date_dir)):
+                        date_dirs.append(date_dir)
+            
+    # Sort descending so the most recent dates are at the beginning
+    date_dirs.sort(reverse=True)
+    print(f"[DEBUG] Found {len(date_dirs)} date directories (sorted newest to oldest): {date_dirs}")
+    
+    target_name = f"{experiment}_{daq_num}"
+    target_daq = int(daq_num) 
+    
+    # 2. Linear search on the 4 most recent dates
+    print(f"\n[DEBUG] --- Phase 1: Linear search on up to 4 most recent dates ---")
+    for date_dir in date_dirs[:4]:
+        year_dir = date_dir[:4] # Extract YYYY from YYYYMMDD
+        target_path = os.path.join(exp_path, year_dir, date_dir, target_name)
+        print(f"[DEBUG] Checking path: {target_path}")
+        if os.path.exists(target_path):
+            print(f"[DEBUG] SUCCESS: File found during linear search! Returning path.")
+            return target_path+f'/{experiment}_{daq_num}.mat'
+    # 3. Binary search on the remaining dates
+    remaining_dates = date_dirs[4:]
+    if not remaining_dates:
+        print(f"[DEBUG] No remaining older dates to search. Returning None.")
+        return None
+        
+    # Sort remaining dates ascending (oldest to newest) for standard binary search
+    remaining_dates.sort()
+    print(f"\n[DEBUG] --- Phase 2: Binary search on remaining older dates ---")
+    print(f"[DEBUG] Dates for binary search (oldest to newest): {remaining_dates}")
+    
+    low = 0
+    high = len(remaining_dates) - 1
+    
+    step = 1
+    while low <= high:
+        mid = (low + high) // 2
+        mid_date = remaining_dates[mid]
+        year_dir = mid_date[:4] # Extract YYYY from YYYYMMDD
+        mid_date_path = os.path.join(exp_path, year_dir, mid_date)
+        
+        print(f"\n[DEBUG] Binary Search Step {step}:")
+        print(f"[DEBUG]   low_index={low}, high_index={high}, mid_index={mid}")
+        print(f"[DEBUG]   Evaluating mid_date -> {mid_date} (Path: {mid_date_path})")
+        
+        # Check if the specific target exists in this mid_date directory
+        target_path = os.path.join(mid_date_path, target_name)
+        print(f"[DEBUG]   Checking direct path: {target_path}")
+        
+        if os.path.exists(target_path):
+            print(f"[DEBUG]   SUCCESS: File found during binary search! Returning path.")
+            return target_path+f'/{experiment}_{daq_num}.mat'
+            
+        # If it doesn't exist, figure out whether to go left (older) or right (newer)
+        min_daq, max_daq = get_min_max_daq(mid_date_path, experiment)
+        
+        if min_daq is None or max_daq is None:
+            print(f"[DEBUG]   Directory is empty. Shifting search to older dates (high = mid - 1).")
+            high = mid - 1
+            step += 1
+            continue
+            
+        print(f"[DEBUG]   Comparing target_daq ({target_daq}) against bounds [{min_daq}, {max_daq}]")
+        
+        if target_daq < min_daq:
+            print(f"[DEBUG]   Target ({target_daq}) < Min ({min_daq}). Shifting search to OLDER dates (high = {mid - 1}).")
+            high = mid - 1
+        elif target_daq > max_daq:
+            print(f"[DEBUG]   Target ({target_daq}) > Max ({max_daq}). Shifting search to NEWER dates (low = {mid + 1}).")
+            low = mid + 1
+        else:
+            print(f"[DEBUG]   Target ({target_daq}) is between Min ({min_daq}) and Max ({max_daq}), but file is missing.")
+            print(f"[DEBUG]   This implies the file does not exist in the expected sequence. Returning None.")
+            return None
+            
+        step += 1
+            
+    # File was not found anywhere
+    print(f"\n[DEBUG] --- Search Complete: File not found anywhere. Returning None. ---")
+    return None
 
 def analyze_eos_and_cher(data_struct, experiment='', runname='', 
 						 EOS2ymin=200, EOS2ymax=None,

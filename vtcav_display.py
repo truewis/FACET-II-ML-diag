@@ -276,29 +276,7 @@ class InferenceWorker(QThread):
             pred_params = pred_full.flatten()
             image_data = self.image_model.params_to_image(pred_params, total_charge)
             if self.manual_SYAG:
-                syag_projection = self.get_SYAG_projection(n_eslice=image_data.shape[1], offline_syag_array=offline_syag_array, offline_syag_width=offline_syag_width)
-                
-                # 1. Calculate the maximum of the projection
-                max_proj = np.max(syag_projection)
-                
-                # 2. Create the mask (1 if >= 10% of median, else 0)
-                mask = (syag_projection >= self.manual_SYAG_masking_threshold * max_proj).astype(image_data.dtype)
-                
-                # 3. Store the original total sum for normalization later
-                original_sum = np.sum(image_data)
-                
-                # 4. Apply the mask to the image.
-                # Assuming syag_projection corresponds to the vertical (Y) axis (shape[0]),
-                # we use [:, np.newaxis] to broadcast the 1D mask across all horizontal slices.
-                # Note: If syag_projection aligns with the X axis instead, use [np.newaxis, :]
-                image_data = image_data * mask[:, np.newaxis]
-                
-                # 5. Normalize the image so the new sum matches the original sum
-                masked_sum = np.sum(image_data)
-                
-                # Prevent division by zero in case the mask wipes out the entire image
-                if masked_sum > 0:
-                    image_data = image_data * (original_sum / masked_sum)
+                image_data = self.apply_manual_SYAG_cut(image_data, offline_syag_array, offline_syag_width)
             # Figuring out orientation sucks. Seems to work without a T, but sometimes with a T.
             if self.display_images_rt or not real_time: 
                 self.new_prediction_signal.emit(image_data)
@@ -312,6 +290,32 @@ class InferenceWorker(QThread):
             raise e
             self._log(f"Prediction Error: {e}")
             
+    def apply_manual_SYAG_cut(self, image_data, offline_syag_array, offline_syag_width):
+        syag_projection = self.get_SYAG_projection(n_eslice=image_data.shape[1], offline_syag_array=offline_syag_array, offline_syag_width=offline_syag_width)
+                
+        # 1. Calculate the maximum of the projection
+        max_proj = np.max(syag_projection)
+        
+        # 2. Create the mask (1 if >= 10% of median, else 0)
+        mask = (syag_projection >= self.manual_SYAG_masking_threshold * max_proj).astype(image_data.dtype)
+        
+        # 3. Store the original total sum for normalization later
+        original_sum = np.sum(image_data)
+        
+        # 4. Apply the mask to the image.
+        # Assuming syag_projection corresponds to the vertical (Y) axis (shape[0]),
+        # we use [:, np.newaxis] to broadcast the 1D mask across all horizontal slices.
+        # Note: If syag_projection aligns with the X axis instead, use [np.newaxis, :]
+        image_data = image_data * mask[:, np.newaxis]
+        
+        # 5. Normalize the image so the new sum matches the original sum
+        masked_sum = np.sum(image_data)
+        
+        # Prevent division by zero in case the mask wipes out the entire image
+        if masked_sum > 0:
+            image_data = image_data * (original_sum / masked_sum)
+        return image_data
+    
     def get_SYAG_projection(self, n_eslice, offline_syag_array=None, offline_syag_width=None):
         # import matplotlib.pyplot as plt
         # Get array from EPICS PV
@@ -743,6 +747,8 @@ class VTCAVDisplay(Display):
             pred_full = self.worker.iz_scaler.inverse_transform(z_pred_full)
             pred_params = pred_full.flatten()
             pred_img = self.worker.image_model.params_to_image(pred_params, total_charge)
+            if self.manual_SYAG:
+                pred_img = self.worker.apply_manual_SYAG_cut(pred_img, offline_syag_array = self.SYAG_daq_images[i], offline_syag_width = self.SYAG_daq_images[i].shape[1])
             pred_img = np.sum(pred_img, axis = 0)/ self.worker.xtcalibrationfactor_fs * 1.602e-4 # 1.602e-19 [C]/1e-15 [s]
             all_pred_imgs.append(pred_img)
         # Convert to numpy arrays for export
@@ -2463,7 +2469,7 @@ class VTCAVDisplay(Display):
         sigma = 1
         threshold = 5
         # Do not specify xrange and yrange for SYAG, we don't need to zoom it, and we want the full image for alignment.
-        SYAGImages_raw, _, _, _ = extract_processed_images(data_struct, '', None, None, hotPixThreshold, sigma, threshold, step_list=None, roi_xrange=None, roi_yrange=None, do_load_raw=False, directory_path=str(pathlib.Path(dataloc).parent), instrument = 'SYAG', intermediate_datetype = np.uint8)# do_load_raw = False by default.
+        SYAGImages_raw, _, _, _ = extract_processed_images(data_struct, '', None, None, hotPixThreshold, sigma, threshold, step_list=None, roi_xrange=None, roi_yrange=None, do_load_raw=False, directory_path=str(pathlib.Path(dataloc).parent), instrument = 'SYAG', intermediate_datatype = np.uint8)# do_load_raw = False by default.
         # Crop to the top quadrant and compute projection. this is due to SYAG camera geometry.
         self.handle_log(f"SYAG Raw Loaded:{SYAGImages_raw.shape}")
         SYAGImages_cropped = SYAGImages_raw[:, (3*SYAGImages_raw.shape[1]//4):, lps_idx]
