@@ -228,7 +228,7 @@ def analyze_eos_and_cher(data_struct, experiment='', runname='',
 						 skipEOSanalysis=True,
 						 goosing=False,
 						 debug = True,
-						 EOS_cal=17.94e-15):
+						 EOS_cal=17.94e-15, directory_path=None):
 	"""
 	Port of the Claudio Emma's MATLAB EOS/CHER analysis.
 	args:
@@ -274,80 +274,11 @@ def analyze_eos_and_cher(data_struct, experiment='', runname='',
 		raise ValueError("BLEN_LI14_888_BRAW not found among BSA PVs.")
 	# bsaScalarData shape is (N_vars, N_samples)
 	bc14BLEN = bsaScalarData[pvidx, :].copy()
-
-	# --- Load/concatenate EOS2 HDF5 data across steps ---
-	stepsAll = data_struct.params.stepsAll
-	if stepsAll is None or len(np.atleast_1d(stepsAll)) == 0:
-		stepsAll = [1]
-
-	EOSdata = None
-	# Handle loc being list-like or single
-	locs = data_struct.images.EOS2.loc
-	# ensure iterable
-	if not isinstance(locs, (list, tuple, np.ndarray)):
-		locs = [locs]
-
-	for a in range(len(stepsAll)):
-		# pick appropriate location entry
-		try:
-			loc_entry = locs[a]
-		except Exception:
-			loc_entry = locs[0]
-		raw_path = loc_entry
-		# Search for the expected file name pattern
-		match = re.search(rf'({experiment}_\d+/images/EOS2/EOS2_data_step\d+\.h5)', raw_path)
-		if not match:
-			raise ValueError(f"Path format invalid or not matched: {raw_path}")
-
-		loc_entry = '../../data/raw/' + experiment + '/' + match.group(0)
-		# try to open directly, otherwise attempt fallback construction similar to other functions
-		print(f"Loading EOS2 data from {loc_entry} ...")
-		try:
-			with h5py.File(loc_entry, 'r') as f:
-				stepdata = f['entry']['data']['data'][:].astype(np.float64)
-				print(f"Loaded stepdata from {loc_entry}")
-				print(f"stepdata shape: {stepdata.shape}")
-		except Exception:
-			# fallback: attempt to extract a trailing path fragment containing experiment and build relative path
-			m = re.search(rf'({experiment}_\d+/images/EOS2/EOS2_data_step\d+\.h5)', str(loc_entry))
-			if m:
-				candidate = '../../data/raw/' + experiment + '/' + m.group(0)
-				with h5py.File(candidate, 'r') as f:
-					stepdata = f['entry']['data']['data'][:].astype(np.float64)
-			else:
-				raise
-
-		# concatenate along 3rd axis (MATLAB's 3rd dim is shots)
-		if EOSdata is None:
-			EOSdata = stepdata.copy()
-		else:
-			# stepdata shape (H, W, Nstep); append along third axis
-			EOSdata = np.concatenate([EOSdata, stepdata], axis=2)
-
-	if EOSdata is None:
-		raise RuntimeError("No EOS data loaded.")
-
-	# --- Keep only shots with common index and subtract background ---
-	# common_index in data_struct likely 1-based
-	eos_common = data_struct.images.EOS2.common_index
-	eos_common_idx = [int(i) - 1 for i in eos_common]
-	EOSdata = EOSdata.transpose(2, 1, 0)[:, :, eos_common_idx]  # to (H, W, Shots)
-
-	# subtract background if available (convert to float)
-	try:
-		bg = np.array(data_struct.backgrounds.EOS2).astype(np.float64)
-		# MATLAB code used double and a - -background pattern; here subtract background
-		EOSdata = EOSdata - bg[:, :]
-	except Exception:
-		# if background missing, proceed without subtraction
-		pass
-	print(f"EOSdata shape after loading and bg subtraction: {EOSdata.shape}")
-
+	EOSdata, _, _, _ = extract_processed_images(data_struct, experiment, xrange=None, yrange=None, hotPixThreshold=1e4, sigma=1, threshold=5, step_list=None, roi_xrange=None, roi_yrange=None, do_load_raw = False, instrument = 'EOS2', directory_path = directory_path, intermediate_datatype = np.uint16)
 	nshots = EOSdata.shape[2]
 	# prepare projection matrix (rows x shots)
 	EOS2horzProj = np.zeros((EOSdata.shape[0], nshots), dtype=float)
 	shotROIs = np.zeros((EOSdata.shape[0], EOSdata.shape[1], nshots), dtype=float)
-
 	dels = np.zeros(nshots, dtype=float)
 	print("Starting EOS2 analysis...")
 	plot_frequency = 20 if not goosing else 21
@@ -371,50 +302,115 @@ def analyze_eos_and_cher(data_struct, experiment='', runname='',
 			# find peaks on the projection
 			# height and prominence thresholds may need adjustment based on signal levels
 			log_proj = np.log(1+proj)
-			peaks, props = find_peaks(gaussian_filter(log_proj, sigma=0.8), height=9.2, prominence=0.05)
-			if peaks.size < 2:
-				dels[a] = 0.0
-				continue
-
+			# Zero out all points below 9.5
+			log_proj[log_proj < 9.5] = 0.0
+			# 1. Smooth the data to stabilize gradient and peak finding
+			smoothed = gaussian_filter(log_proj, sigma=0.8)
+			peaks, props = find_peaks(smoothed, height=9.2, prominence=0.03)
+			
+			if peaks.size == 0:
+			    dels[a] = 0.0
+			    continue
+			
 			#%% ######################################################################################
-			# Option: Extra bigaussian fit to refine peak positions
-			try:
-				x_coords = np.arange(len(proj))
-				# Initial guess for bigaussian fit: [amp1, sigma1, mean1, amp2, sigma2, mean2]
-				# Sigma is chosen as 10 pixels arbitrarily. Amplitudes are peak heights.
-				p0_x = [x_coords[peaks[0]], 10 ,log_proj[peaks[0]], x_coords[peaks[1]], 10 ,log_proj[peaks[1]]]
-				popt_x, _ = curve_fit(bigaussian_1d, x_coords, log_proj, p0=p0_x, maxfev=5000)
-				peak_sep_pix = popt_x[3] - popt_x[0]
-			except Exception as e:
-				peak_sep_pix = abs(peaks[0] - peaks[1])
-
-
-			# Plot projection and peaks for debugging
+			# Step 1: Find the Separation/Split Point
+			split_idx = None
+			
+			if peaks.size >= 2:
+			    # We found at least 2 distinct peaks. Take the top 2 by height.
+			    top2_idx = np.argsort(props['peak_heights'])[-2:]
+			    p1, p2 = np.sort(peaks[top2_idx])
+			    
+			    # Split the domain exactly between the two peaks
+			    split_idx = int((p1 + p2) / 2)
+			
+			elif peaks.size == 1:
+			    # Only 1 peak found. The peaks have merged. 
+			    # We need to find the "shoulder" using the minimal absolute gradient.
+			    main_peak = peaks[0]
+			    main_peak_height = smoothed[main_peak]
+			    
+			    # Calculate absolute gradient
+			    abs_grad = np.abs(np.gradient(smoothed))
+			    
+			    # Find local minima (valleys) in the gradient
+			    valleys, _ = find_peaks(-abs_grad)
+			    
+			    # Filter out valleys that are part of the main peak's flat top (below 90% of peak height)
+			    valid_valleys = [v for v in valleys if smoothed[v] < (0.90 * main_peak_height)]
+			    
+			    if valid_valleys:
+			        # Pick the gradient minimum closest to the main peak
+			        split_idx = min(valid_valleys, key=lambda v: abs(v - main_peak))
+			    else:
+			        # Fallback if no distinct shoulder is found
+			        dels[a] = 0.0 
+			        continue
+			
+			#%% ######################################################################################
+			# Step 2: Calculate Weighted Centroids based on 80% Threshold
+			x_coords = np.arange(len(log_proj))
+			left_mask = x_coords < split_idx
+			right_mask = x_coords >= split_idx
+			
+			# Isolate the two regions (using smoothed data to find the stable 80% boundary)
+			left_proj_smooth = smoothed[left_mask]
+			right_proj_smooth = smoothed[right_mask]
+			
+			# Ensure neither region is empty
+			if len(left_proj_smooth) == 0 or len(right_proj_smooth) == 0:
+			    dels[a] = 0.0
+			    continue
+			
+			# --- Left Peak Weighted Centroid ---
+			left_max = np.max(left_proj_smooth)
+			left_thresh = 0.8 * left_max
+			
+			# Find indices where smoothed data is above threshold
+			left_above_thresh_mask = left_proj_smooth >= left_thresh
+			left_x_coords = x_coords[left_mask][left_above_thresh_mask]
+			
+			# Use the raw log_proj values as the weights for the centroid
+			left_weights = log_proj[left_mask][left_above_thresh_mask]
+			centroid_left = np.average(left_x_coords, weights=left_weights)
+			
+			# --- Right Peak Weighted Centroid ---
+			right_max = np.max(right_proj_smooth)
+			right_thresh = 0.8 * right_max
+			
+			# Find indices where smoothed data is above threshold
+			right_above_thresh_mask = right_proj_smooth >= right_thresh
+			right_x_coords = x_coords[right_mask][right_above_thresh_mask]
+			
+			# Use the raw log_proj values as the weights for the centroid
+			right_weights = log_proj[right_mask][right_above_thresh_mask]
+			centroid_right = np.average(right_x_coords, weights=right_weights)
+			
+			# Step 3: Calculate final separation
+			peak_sep_pix = abs(centroid_right - centroid_left)
+			
+			#%% ######################################################################################
+			# Step 4: Debug Plotting
 			if debug and a % plot_frequency == 1:
-				plt.plot(log_proj)
-				plt.plot(peaks, log_proj[peaks], "x")
-				plt.show()
-			peak_vals = props['peak_heights']
-			#%% ######################################################################################
-			# Option: Just take the top 2 peaks by height
-			top2 = np.argsort(peak_vals)[-2:]
-			# map to actual peak positions
-			pos = peaks[top2]
-			# pick heights in descending order
-			heights_sorted = peak_vals[top2][np.argsort(peak_vals[top2])[::-1]]
-			# compute separation in pixels
-			#peak_sep_pix = abs(int(pos[0]) - int(pos[1]))
-			#%% ######################################################################################
-			# Transpose horizontal projection by peak position.
-			# EOS2horzProj[:, a] = np.roll(EOS2horzProj[:, a], -int(pos[1]))
-			# reliability check: if largest*0.08 > second then unreliable
-			# if heights_sorted[0] * 0.08 > heights_sorted[1]:
-			#     dels[a] = 0.0
-			# another reliability check: if tallest peak < 10000 counts, likely no signal
-			# if heights_sorted[0] < 10000:
-			#     dels[a] = 0.0
-			# else:
-			#%%
+			    plt.figure(figsize=(8, 4))
+			    plt.plot(x_coords, log_proj, label='Raw Log Proj', alpha=0.5)
+			    plt.plot(x_coords, smoothed, label='Smoothed', linewidth=2)
+			    
+			    # Mark the split point
+			    plt.axvline(split_idx, color='r', linestyle='--', label='Separation Point')
+			    
+			    # Mark the 80% regions
+			    plt.axvspan(left_x_coords.min(), left_x_coords.max(), color='g', alpha=0.2, label='Left 80% Region')
+			    plt.axvspan(right_x_coords.min(), right_x_coords.max(), color='m', alpha=0.2, label='Right 80% Region')
+			    
+			    # Mark the calculated Weighted Centroids
+			    plt.axvline(centroid_left, color='g', linestyle='-', label=f'W-Centroid 1: {centroid_left:.1f}')
+			    plt.axvline(centroid_right, color='m', linestyle='-', label=f'W-Centroid 2: {centroid_right:.1f}')
+			    
+			    plt.title("80% Weighted Centroid Separation")
+			    plt.legend()
+			    plt.grid(True, alpha=0.3)
+			    plt.show()
 			dels[a] = peak_sep_pix * EOS_cal * c
 		print("Done with EOS2 analysis!")
 	else:

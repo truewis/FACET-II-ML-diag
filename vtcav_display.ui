@@ -71,7 +71,7 @@
          </sizepolicy>
         </property>
         <property name="currentIndex">
-         <number>2</number>
+         <number>3</number>
         </property>
         <widget class="QWidget" name="tab">
          <attribute name="title">
@@ -645,11 +645,16 @@
            </sizepolicy>
           </property>
           <property name="currentIndex">
-           <number>0</number>
+           <number>1</number>
           </property>
           <item>
            <property name="text">
             <string>CVAE16+RF</string>
+           </property>
+          </item>
+          <item>
+           <property name="text">
+            <string>CVAE16+WRF</string>
            </property>
           </item>
           <item>
@@ -852,7 +857,7 @@
          </sizepolicy>
         </property>
         <property name="currentIndex">
-         <number>3</number>
+         <number>0</number>
         </property>
         <widget class="QWidget" name="tab_3">
          <attribute name="title">
@@ -971,8 +976,12 @@
           <item row="0" column="0">
            <widget class="QPlainTextEdit" name="scriptInput">
             <property name="plainText">
-             <string>plt.matshow(np.sum(self.SYAG_daq_images[:, 700:900, :] - self.SYAG_daq_images[:, 0:200, :], axis = 1))
-plt.show()</string>
+             <string># Plot SYAG
+# plt.matshow(np.sum(self.SYAG_daq_images[:, 700:900, :] - self.SYAG_daq_images[:, 0:200, :], axis = 1))
+# plt.show()
+
+# Manual SYAG-DTOTR2 alignment data input
+# self.worker.alignment_data = {&quot;scale&quot;: 5.0, &quot;offset&quot;: 117.0, &quot;correlation&quot;: 0.95}</string>
             </property>
            </widget>
           </item>
@@ -1017,17 +1026,17 @@ plt.show()</string>
             </item>
            </widget>
           </item>
-          <item row="1" column="0" colspan="2">
+          <item row="1" column="0">
            <widget class="QCheckBox" name="doManualSYAG">
             <property name="text">
-             <string>Manual SYAG Cut</string>
+             <string>Manual SYAG Cut (requires reloading the DAQ)</string>
             </property>
             <property name="checked">
              <bool>false</bool>
             </property>
            </widget>
           </item>
-          <item row="2" column="0" colspan="2">
+          <item row="2" column="0">
            <widget class="QCheckBox" name="doManualCollimator">
             <property name="text">
              <string>Collimator Study</string>
@@ -1044,6 +1053,16 @@ plt.show()</string>
             </property>
             <property name="checked">
              <bool>false</bool>
+            </property>
+           </widget>
+          </item>
+          <item row="4" column="0" colspan="2">
+           <widget class="QCheckBox" name="doIncludeNonbsa">
+            <property name="text">
+             <string>Include Non BSA Variables</string>
+            </property>
+            <property name="checked">
+             <bool>true</bool>
             </property>
            </widget>
           </item>
