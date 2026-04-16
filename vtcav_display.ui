@@ -47,6 +47,16 @@
          </widget>
         </item>
         <item>
+         <widget class="PyDMPushButton" name="modelLoadButton_dialog">
+          <property name="toolTip">
+           <string/>
+          </property>
+          <property name="text">
+           <string>...</string>
+          </property>
+         </widget>
+        </item>
+        <item>
          <widget class="QLabel" name="label_4">
           <property name="text">
            <string>Status:</string>

@@ -905,6 +905,8 @@ def extractDAQBSAScalars(data_struct, step_list=None, filter_index= True):
 			varData = np.array(bsaList[varName]).squeeze()
 			if varData.size == 0:
 				continue
+			if varData.ndim != 1:
+				continue
 			if filter_index:
 				varData = varData[idx]  # apply common index
 			varData = np.nan_to_num(varData)  # replace NaN with 0
@@ -923,62 +925,97 @@ def extractDAQBSAScalars(data_struct, step_list=None, filter_index= True):
 
 	bsaScalarData = np.array(bsaScalarData)
 	return bsaScalarData, bsaVarPVNames
+	
+def extractDAQNonBSAScalars(data_struct, step_list=None, filter_index=True, debug=False, s20=False):
+    """
+    Extracts nonBSA scalar data from the provided data structure, filtered with scalar common index.
+    Ensures final output is a homogeneous 2D numpy array shaped (N_vars, N_samples).
+    """
+    data_struct = matstruct_to_dict(data_struct)
+    dataScalars = data_struct['scalars']
+    
+    if step_list is not None:
+        idx = [i for i in dataScalars['common_index'].astype(int).flatten() - 1
+               if dataScalars['steps'][i] in step_list]
+    else:
+        idx = dataScalars['common_index'].astype(int).flatten() - 1
 
-def extractDAQNonBSAScalars(data_struct, step_list=None, filter_index= True, debug=False, s20 = True):
-	"""
-	Extracts nonBSA scalar data from the provided data structure, filtered with scalar common index, and also with step list if provided.
-	Args:
-		data_struct: Data structure containing scalar information.
-		step_list: List of steps to filter the data. If None, all steps are used. Starts from 1.
-		filter_index: If True, apply common index filtering.
-	"""
-	data_struct = matstruct_to_dict(data_struct)
-	dataScalars = data_struct['scalars']
-	if step_list is not None:
-		idx = [i for i in dataScalars['common_index'].astype(int).flatten() - 1
-			   if dataScalars['steps'][i] in step_list ]
-	else:
-		idx = dataScalars['common_index'].astype(int).flatten() - 1
+    fNames = list(dataScalars.keys())
+    if s20:
+        isBSA = [name for name in fNames if name.startswith('nonBSA_List_S20')]
+    else:
+        isBSA = [name for name in fNames if name.startswith('nonBSA_List_')]
 
-	fNames = list(dataScalars.keys())
-	if s20:
-		isBSA = [name for name in fNames if name.startswith('nonBSA_List_S20')]
-	else:
-		isBSA = [name for name in fNames if name.startswith('nonBSA_List_')]
+    nonBsaScalarData = []
+    nonBsaVarPVNames = []
 
-	nonBsaScalarData = []
-	nonBsaVarPVNames = []
+    for nonbsaListName in isBSA:
+        bsaList = dataScalars[nonbsaListName]
+        varNames = list(bsaList.keys())
+        bsaListData = []
 
-	for nonbsaListName in isBSA:
-		bsaList = dataScalars[nonbsaListName]
-		varNames = list(bsaList.keys())
-		bsaListData = []
+        for varName in varNames:
+            varData = np.array(bsaList[varName]).squeeze()
+            
+            # FIXED: Do not flatten 2D arrays. Slice the primary dimension instead.
+            if varData.ndim > 1:
+                # If shape is (2, N_samples) take the first row. 
+                # If (N_samples, 2) take the first column.
+                if varData.shape[0] < varData.shape[1]:
+                    varData = varData[0, :]
+                else:
+                    varData = varData[:, 0]
+                    
+            varData = np.atleast_1d(varData)
+            
+            if varData.size == 0:
+                continue
+                
+            if filter_index:
+                valid_idx = [i for i in idx if i < len(varData)]
+                varData = varData[valid_idx]  
+                
+            varData = np.nan_to_num(varData)
+            # Dither by a small random value to avoid overfitting.
+            # Suppose by 0.1% of the average value of the variable.
+            avg_val = np.mean(varData)
+            if avg_val != 0:
+                dither_amplitude = 0.001 * abs(avg_val)
+                varData = varData + np.random.uniform(-dither_amplitude, dither_amplitude, size=varData.shape)
+            bsaListData.append(varData)
 
-		for varName in varNames:
-			varData = np.array(bsaList[varName]).squeeze()
-			if varData.size == 0:
-				continue
-			if filter_index:
-				varData = varData[idx]  # apply common index
-			varData = np.nan_to_num(varData)  # replace NaN with 0
-			bsaListData.append(varData)
+        nonBsaVarPVNames.extend([vn for vn in varNames if bsaList[vn].size != 0])
+        if bsaListData:
+            nonBsaScalarData.extend(bsaListData)
 
-		# Add to output arrays
-		nonBsaVarPVNames.extend([vn for vn in varNames if bsaList[vn].size != 0])
-		if bsaListData:
-			nonBsaScalarData.extend(bsaListData)
-	# nonBsaScalarData shape must be (N_vars, N_samples), but it could be inhomogeneous if some lists are empty.
-	# print the shape of each variable data for debugging
-	if debug:
-		for i, varData in enumerate(nonBsaScalarData):
-			print(f"NonBSA variable {nonBsaVarPVNames[i]} has shape {varData.shape}")
-			if varData.ndim != 1:
-				print(f"Warning: NonBSA variable {nonBsaVarPVNames[i]} is not 1D.")
-		# print the total number of variables and samples
-		print(f"Total NonBSA variables: {len(nonBsaVarPVNames)}")
-		print(nonBsaScalarData)
-	nonBsaScalarData = np.array(nonBsaScalarData)
-	return nonBsaScalarData, nonBsaVarPVNames
+    # ==========================================
+    # FIXED: Enforce Homogeneity safely
+    # ==========================================
+    if nonBsaScalarData:
+        # 1. Find the most common length among all variables (the true N_samples)
+        lengths = [len(arr) for arr in nonBsaScalarData]
+        target_len = max(set(lengths), key=lengths.count) 
+        
+        cleaned_data = []
+        for arr in nonBsaScalarData:
+            if len(arr) > target_len:
+                # Truncate oversampled arrays (e.g. 120Hz data or unflattened arrays)
+                cleaned_data.append(arr[:target_len])
+            elif len(arr) < target_len:
+                # Pad undersampled arrays (dropped packets)
+                cleaned_data.append(np.pad(arr, (0, target_len - len(arr)), mode='constant', constant_values=0))
+            else:
+                cleaned_data.append(arr)
+                
+        nonBsaScalarData = cleaned_data
+        
+    nonBsaScalarData = np.array(nonBsaScalarData)
+
+    if debug:
+        print(f"Target N_samples (mode length): {target_len if nonBsaScalarData.size else 0}")
+        print(f"Final output matrix shape: {nonBsaScalarData.shape}")
+
+    return nonBsaScalarData, nonBsaVarPVNames
 
 def exclude_bsa_vars(bsaVars):
 	"""
@@ -992,6 +1029,12 @@ def exclude_bsa_vars(bsaVars):
 	exclude_bsa_vars = [
 		'TCAV_LI20_2400_A',  # XTCAV Amplitude
 		'TCAV_LI20_2400_P',  # XTCAV Phase
+        'TCAV_LI20_2400_ADES',  # XTCAV
+		'TCAV_LI20_2400_PDES',  # XTCAV
+        'TCAV_LI20_2400_C_1_TCTL',  # XTCAV
+		'TCAV_LI20_2400_S_AV',  # XTCAV
+        'TCAV_LI20_2400_S_PV',  # XTCAV
+        'PMT_LI20_3070_QDCRAW', # Unknown position PMT, exclude it for now.
 		'SIOC_SYS1_ML00_AO542',
 		'SIOC_SYS1_ML00_AO543',
 		'SIOC_SYS1_ML00_AO544', #Outputs of this program
@@ -1008,10 +1051,19 @@ def exclude_bsa_vars(bsaVars):
 		# skip variables starting with 'SIOC', as they are unphysical
 		if var.startswith('SIOC'):
 			exclude_bsa_vars.append(var)
+        # skip variables ending with 'BDES', as they are accompanied with BACT
+		if var.endswith('BDES'):
+			exclude_bsa_vars.append(var)
+		if var.endswith('PDES'):
+			exclude_bsa_vars.append(var)
+		if var.endswith('ADES'):
+			exclude_bsa_vars.append(var)
+		if var.endswith('BCON'):
+			exclude_bsa_vars.append(var)
 
-	print("Excluding BSA Variables:", exclude_bsa_vars)
+	#print("Excluding BSA Variables:", exclude_bsa_vars)
 	excluded_var_idx = [i for i, var in enumerate(bsaVars) if var in exclude_bsa_vars]
-	print("Excluded variable indices:", excluded_var_idx)
+	#print("Excluded variable indices:", excluded_var_idx)
 	return excluded_var_idx
 def apply_tcav_zeroing_filter(bsaScalarData, bsaVarPVs):
 	"""

@@ -51,9 +51,11 @@ sys.path.append("/usr/local/facet/tools/python")
 from F2_pytools.f2bsaBuffer import f2BeamSynchronousBuffer
 from F2_pytools.controls_jurisdiction import is_SLC
 
+HOME_DIR = pathlib.Path(__file__).parent
+
 class InferenceWorker(QThread):
     new_prediction_signal = Signal(np.ndarray)
-    new_pv_values = Signal(np.ndarray, np.ndarray)
+    new_pv_values = Signal(np.ndarray, np.ndarray, str)
     new_log_signal = Signal(str)
     
     def __init__(self, model_path):
@@ -242,7 +244,7 @@ class InferenceWorker(QThread):
 
                 # Convert to numpy array
                 input_array = np.array(ordered_input).reshape(1, -1)
-                self.new_pv_values.emit(input_array[0], np.array(self.is_pv_bypassed))
+                self.new_pv_values.emit(input_array[0], np.array(self.is_pv_bypassed), "RT")
                 # --- Phase 3: Scale & Force Zeros ---
                 # 1. Transform raw inputs
                 input_scaled = self.x_scaler.transform(input_array)
@@ -460,7 +462,7 @@ class VTCAVDisplay(Display):
     def __init__(self, parent=None, args=None):
         super().__init__(parent=parent, args=args)
         
-        self.model_folder = pathlib.Path(__file__).parent / "models"
+        self.model_folder = HOME_DIR / "models"
         self.current_model_path = ""
         
         # Initialize state variables
@@ -514,6 +516,7 @@ class VTCAVDisplay(Display):
     def setup_connections(self):
         # Model Loading
         self.ui.modelLoadButton.clicked.connect(self.load_selected_model)
+        self.ui.modelLoadButton_dialog.clicked.connect(self.load_selected_model_dialog)
         
         # DAQ Interaction
         self.ui.daqLoadButton.clicked.connect(self.handle_daq_load)
@@ -867,13 +870,67 @@ class VTCAVDisplay(Display):
             self.worker.emit_prediction(scaled_predictor, total_charge, real_time=False, offline_syag_array=offline_syag_array, offline_syag_width=offline_syag_width)
         else:
             self.worker.emit_prediction(scaled_predictor, total_charge)
-        self.update_pv_values(filtered_predictor[0], np.array(self.worker.is_pv_bypassed))
+        self.update_pv_values(filtered_predictor[0], np.array(self.worker.is_pv_bypassed), display_name)
 
     def init_plots(self):
         # Configure initial plot settings if necessary
         # PyDMEventPlot uses pyqtgraph's PlotItem internally
         pass
+    
+    @Slot()
+    def load_selected_model_dialog(self):
+        """
+        Opens a file dialog to select a DAQ file. 
+        If selected, updates the text field and triggers loading.
+        """
+        # Open File Dialog starting at DAQPATH
+        file_path, _ = QFileDialog.getOpenFileName(
+            self, 
+            "Select Model Data File", 
+            str(HOME_DIR), 
+            "All Files (*)"
+        )
 
+        if file_path:
+            """Loads the selected model and creates the worker immediately."""
+            filename = file_path
+            
+            full_path = os.path.join(self.model_folder, filename)
+            
+            self.updateStatus(f"Loading Model...")
+            # 1. Clean up existing worker if it exists
+            if self.worker is not None:
+                self.handle_log("Cleaning up previous worker...")
+                self.worker.stop()
+                try:
+                    self.worker.new_prediction_signal.disconnect()
+                except Exception:
+                    pass
+                self.worker.new_pv_values.disconnect()
+            # Ensure the start button is reset
+            self.ui.startPauseButton.setText("Start")
+            
+            self.current_model_path = full_path
+            self.handle_log(f"Loading Model & Initializing Sync Buffer: {filename}")
+            
+            try:
+                # 2. Instantiate worker immediately (this triggers load_model_resources)
+                self.worker = InferenceWorker(self.current_model_path)
+                # 3. Connect signals
+                self.worker.new_pv_values.connect(self.update_pv_values)
+                # Re-enable this if you uncomment the emit in InferenceWorker
+                # self.worker.new_log_signal.connect(self.handle_log)
+                # 4. Populate the PV table
+                self.setup_pv_table()
+                
+                self.handle_log("Worker ready. Press 'Start' to begin acquisition.")
+            except Exception as e:
+                self.handle_log(f"Failed to initialize worker: {e}")
+                self.worker = None
+                    
+            self.ui.doManualSYAG.setChecked(self.worker.manual_SYAG)
+            self.updateStatus("Ready")
+                    
     @Slot()
     def handle_daq_load(self):
         """
@@ -913,7 +970,7 @@ class VTCAVDisplay(Display):
         bsaScalarData, bsaVars = extractDAQBSAScalars(data_struct, filter_index=False)
         bsaScalarData = apply_tcav_zeroing_filter(bsaScalarData, bsaVars)
         # 3. Extract non BSA scalars the same way
-        nonBsaScalarData, nonBsaVars = extractDAQNonBSAScalars(data_struct, filter_index=False, debug=False, s20=True)
+        nonBsaScalarData, nonBsaVars = extractDAQNonBSAScalars(data_struct, filter_index=False, debug=False, s20=False)
         nonBsaScalarData = apply_tcav_zeroing_filter(nonBsaScalarData, nonBsaVars)
 
         if self.include_nonBSA:
@@ -982,9 +1039,9 @@ class VTCAVDisplay(Display):
         n_features = len(var_names)
         # Configure Table
         self.ui.pvTable.setRowCount(n_features)
-        self.ui.pvTable.setColumnCount(6) # Name, Min, Max, Value, Bypassed, Bypass Val
+        self.ui.pvTable.setColumnCount(8) # Name, Min, Max, Value, Bypassed, Bypass Val
         self.ui.pvTable.setHorizontalHeaderLabels([
-            "PV Name", "Model Min", "Model Max", "Current Value", "Bypassed", "Bypass Val"
+            "PV Name", "Model Min", "Model Max", "Current Value", "Bypassed", "Bypass Val", "DAQ Value", "RT Value"
         ])
 
         # Populate Static Data
@@ -1010,6 +1067,8 @@ class VTCAVDisplay(Display):
             self.ui.pvTable.setItem(row, 3, QTableWidgetItem("-"))
             self.ui.pvTable.setItem(row, 4, QTableWidgetItem("No"))
             self.ui.pvTable.setItem(row, 5, QTableWidgetItem(f"{self.worker.model_min[row]:.4e}"))
+            self.ui.pvTable.setItem(row, 6, QTableWidgetItem("-"))
+            self.ui.pvTable.setItem(row, 7, QTableWidgetItem("-"))
 
         # Optional: Resize columns to content
         self.ui.pvTable.resizeColumnsToContents()
@@ -1104,11 +1163,11 @@ class VTCAVDisplay(Display):
             return
 
         # 3. Open Save Dialog
-        filename = pathlib.Path(thedaq_file_path).name.replace(".mat", "_preprocessed.pkl") # Suggest a filename
+        filename = HOME_DIR / pathlib.Path(thedaq_file_path).name.replace(".mat", "_preprocessed.pkl") # Suggest a filename
         theoutput_file_path, _ = QFileDialog.getSaveFileName(
             self,
             "Save Preprocessed Data",
-            filename,
+            str(filename),
             "Pickle Files (*.pkl)"
         )
 
@@ -1140,7 +1199,7 @@ class VTCAVDisplay(Display):
         file_paths, _ = QFileDialog.getOpenFileNames(
             self, 
             "Select Preprocessed Data Files", 
-            ".", 
+            str(HOME_DIR), 
             "Pickle Files (*.pkl)"
         )
 
@@ -1165,7 +1224,7 @@ class VTCAVDisplay(Display):
         file_path, _ = QFileDialog.getOpenFileName(
             self, 
             "Select Preprocessed Data File", 
-            ".", 
+            str(HOME_DIR), 
             "Pickle Files (*.pkl)"
         )
 
@@ -1197,7 +1256,7 @@ class VTCAVDisplay(Display):
         first_path_obj = pathlib.Path(preprocess_paths[0])
         arch = self.ui.archComboBox.currentText()
         name_place = first_path_obj.name.replace('.pkl', f'_{arch}_data.pkl')
-        default_save_name = f"./models/{name_place}"
+        default_save_name = str(HOME_DIR / f"models/{name_place}")
         
         output_file_path, _ = QFileDialog.getSaveFileName(
             self,
@@ -1290,7 +1349,7 @@ class VTCAVDisplay(Display):
         self.ui.doManualSYAG.setChecked(self.worker.manual_SYAG)
         self.updateStatus("Ready")
 
-    def update_pv_values(self, latest_inputs, bypass_flags):
+    def update_pv_values(self, latest_inputs, bypass_flags, display_name):
         """
         Updates the 'Current Value' and 'Bypassed' columns of the PV table.
         
@@ -1312,6 +1371,12 @@ class VTCAVDisplay(Display):
                 # 1. Update Current Value
                 val = latest_inputs[row]
                 item_val = self.ui.pvTable.item(row, 3)
+                if ((display_name == "DAQ") | (display_name == "cmp_pred")):
+                    item_val_2 = self.ui.pvTable.item(row, 6)
+                    item_val_2.setText(f"{val:.4e}")
+                if (display_name == "RT"):
+                    item_val_2 = self.ui.pvTable.item(row, 7)
+                    item_val_2.setText(f"{val:.4e}")
                 if not item_val:
                     item_val = QTableWidgetItem()
                     self.ui.pvTable.setItem(row, 3, item_val)
@@ -1928,7 +1993,7 @@ class VTCAVDisplay(Display):
             bsaScalarData = apply_tcav_zeroing_filter(bsaScalarData, bsaVars)
 
             # 3. Extract non BSA scalars the same way
-            nonBsaScalarData, nonBsaVars = extractDAQNonBSAScalars(data_struct, filter_index=False, debug=False, s20=True)
+            nonBsaScalarData, nonBsaVars = extractDAQNonBSAScalars(data_struct, filter_index=False, debug=False, s20=False)
             nonBsaScalarData = apply_tcav_zeroing_filter(nonBsaScalarData, nonBsaVars)
 
             if self.include_nonBSA:
@@ -2019,7 +2084,7 @@ class VTCAVDisplay(Display):
 
         from Python_Functions.functions import exclude_bsa_vars
         excluded_var_idx = exclude_bsa_vars(sorted_common_features)
-        bsaVarNames_cleaned = [var for i, var in enumerate(allVars) if i not in excluded_var_idx]
+        bsaVarNames_cleaned = [var for i, var in enumerate(sorted_common_features) if i not in excluded_var_idx]
         predictor_tmp_cleaned = np.delete(predictor_tmp, excluded_var_idx, axis=1)[lps_idx, :]
         self.handle_log(f"Predictor shape after excluding variables: {predictor_tmp_cleaned.shape}")
 
@@ -2148,20 +2213,28 @@ class VTCAVDisplay(Display):
         # --- 2. Determining Sample Weights ---
         
         # Strategy Selection: Set to 'density' or 'importance_weighted'
-        weight_strategy = 'density' 
+        weight_strategy = 'importance_weighted' 
         
         if weight_strategy == 'density':
             self.handle_log("Calculating weights using naive local density estimation...")
-            # Use Kernel Density Estimation to find the density of each training sample
-            # High density regions will receive lower weights to reduce their dominance
-            kde = KernelDensity(kernel='gaussian', bandwidth=0.1).fit(x_train_scaled)
-            log_density = kde.score_samples(x_train_scaled)
-            density = np.exp(log_density)
-            # Weights are inversely proportional to density
+            x_train_weighted = x_train_scaled
+            kde = KernelDensity(kernel='gaussian', bandwidth=0.1).fit(x_train_weighted)
+
+            # 1. Calculate log densities
+            log_densities = kde.score_samples(x_train_weighted)
+
+            # 2. Offset by the maximum log density to prevent overflow
+            # (The largest exponentiated value will now be np.exp(0) = 1.0)
+            log_densities_shifted = log_densities - np.max(log_densities)
+
+            # 3. Calculate relative density
+            density = np.exp(log_densities_shifted)
+
+            # 4. Calculate sample weights
             sample_weights = 1.0 / (density + 1e-6)
+            
             self.handle_log(f"Max sample weight: {np.max(sample_weights)}")
             self.handle_log(f"Min sample weight: {np.min(sample_weights)}")
-            
         elif weight_strategy == 'importance_weighted':
             self.handle_log("Calculating weights using a first-pass feature importance...")
             # Step 1: Run a first-pass RF to determine feature importance
@@ -2173,8 +2246,22 @@ class VTCAVDisplay(Display):
             # This ensures density is calculated based on dimensions that actually drive the target
             x_train_weighted = x_train_scaled * importances
             kde = KernelDensity(kernel='gaussian', bandwidth=0.1).fit(x_train_weighted)
-            density = np.exp(kde.score_samples(x_train_weighted))
+
+            # 1. Calculate log densities
+            log_densities = kde.score_samples(x_train_weighted)
+
+            # 2. Offset by the maximum log density to prevent overflow
+            # (The largest exponentiated value will now be np.exp(0) = 1.0)
+            log_densities_shifted = log_densities - np.max(log_densities)
+
+            # 3. Calculate relative density
+            density = np.exp(log_densities_shifted)
+
+            # 4. Calculate sample weights
             sample_weights = 1.0 / (density + 1e-6)
+            
+            self.handle_log(f"Max sample weight: {np.max(sample_weights)}")
+            self.handle_log(f"Min sample weight: {np.min(sample_weights)}")
             
         # Normalize weights so they average to 1.0
         sample_weights = sample_weights / np.mean(sample_weights)
@@ -2321,7 +2408,7 @@ class VTCAVDisplay(Display):
             bsaScalarData = apply_tcav_zeroing_filter(bsaScalarData, bsaVars)
 
             # 3. Extract non BSA scalars the same way
-            nonBsaScalarData, nonBsaVars = extractDAQNonBSAScalars(data_struct, filter_index=False, debug=False, s20=True)
+            nonBsaScalarData, nonBsaVars = extractDAQNonBSAScalars(data_struct, filter_index=False, debug=False, s20=False)
             nonBsaScalarData = apply_tcav_zeroing_filter(nonBsaScalarData, nonBsaVars)
             if self.include_nonBSA:
                 # 4. Combine BSA and non-BSA scalar data
@@ -2666,7 +2753,7 @@ class VTCAVDisplay(Display):
             bsaScalarData = apply_tcav_zeroing_filter(bsaScalarData, bsaVars)
 
             # 3. Extract non BSA scalars the same way
-            nonBsaScalarData, nonBsaVars = extractDAQNonBSAScalars(data_struct, filter_index=False, debug=False, s20=True)
+            nonBsaScalarData, nonBsaVars = extractDAQNonBSAScalars(data_struct, filter_index=False, debug=False, s20=False)
             nonBsaScalarData = apply_tcav_zeroing_filter(nonBsaScalarData, nonBsaVars)
 
             if self.include_nonBSA:
