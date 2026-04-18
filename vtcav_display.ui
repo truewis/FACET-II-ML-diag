@@ -81,7 +81,7 @@
          </sizepolicy>
         </property>
         <property name="currentIndex">
-         <number>3</number>
+         <number>0</number>
         </property>
         <widget class="QWidget" name="tab">
          <attribute name="title">
@@ -120,14 +120,7 @@
               <verstretch>3</verstretch>
              </sizepolicy>
             </property>
-            <layout class="QGridLayout" name="gridLayout" rowstretch="1,0" columnstretch="1,0">
-             <item row="1" column="0">
-              <widget class="QLabel" name="label_5">
-               <property name="text">
-                <string>&lt;html&gt;&lt;head/&gt;&lt;body&gt;&lt;p&gt;1. Load model from top dropdown.&lt;/p&gt;&lt;p&gt;2. Click Start.&lt;/p&gt;&lt;p&gt;&lt;span style=&quot; font-style:italic;&quot;&gt;3. Hmm...Crisp and Flaky Beam...&lt;/span&gt;&lt;/p&gt;&lt;p&gt;&lt;span style=&quot; font-style:italic;&quot;&gt;--Head ----&amp;gt; Tail --&lt;/span&gt;&lt;/p&gt;&lt;p&gt;&lt;span style=&quot; font-style:italic;&quot;&gt;--JP--&lt;/span&gt;&lt;/p&gt;&lt;p&gt;&lt;br/&gt;&lt;/p&gt;&lt;/body&gt;&lt;/html&gt;</string>
-               </property>
-              </widget>
-             </item>
+            <layout class="QGridLayout" name="gridLayout">
              <item row="0" column="0">
               <widget class="QWidget" name="energyProfile_1" native="true">
                <property name="sizePolicy">
@@ -137,9 +130,6 @@
                 </sizepolicy>
                </property>
               </widget>
-             </item>
-             <item row="1" column="1">
-              <widget class="QWidget" name="currentProfile_1" native="true"/>
              </item>
              <item row="0" column="1">
               <widget class="QWidget" name="imageContainer_1" native="true">
@@ -151,11 +141,46 @@
                </property>
               </widget>
              </item>
+             <item row="1" column="0">
+              <widget class="QWidget" name="widget" native="true">
+               <property name="sizePolicy">
+                <sizepolicy hsizetype="Minimum" vsizetype="Preferred">
+                 <horstretch>0</horstretch>
+                 <verstretch>0</verstretch>
+                </sizepolicy>
+               </property>
+               <layout class="QVBoxLayout" name="verticalLayout_4">
+                <item>
+                 <widget class="QLabel" name="label_2">
+                  <property name="text">
+                   <string>&lt;html&gt;&lt;head/&gt;&lt;body&gt;&lt;p&gt;&lt;span style=&quot; font-style:italic;&quot;&gt;--Head ----&amp;gt; Tail --&lt;/span&gt;&lt;/p&gt;&lt;p&gt;&lt;span style=&quot; font-size:14pt;&quot;&gt;Confidence:&lt;/span&gt;&lt;/p&gt;&lt;/body&gt;&lt;/html&gt;</string>
+                  </property>
+                  <property name="textFormat">
+                   <enum>Qt::MarkdownText</enum>
+                  </property>
+                 </widget>
+                </item>
+                <item>
+                 <widget class="QLabel" name="confidenceLabel">
+                  <property name="text">
+                   <string>&lt;html&gt;&lt;head/&gt;&lt;body&gt;&lt;p&gt;&lt;span style=&quot; font-size:48pt; font-weight:600;&quot;&gt;100 %&lt;/span&gt;&lt;/p&gt;&lt;/body&gt;&lt;/html&gt;</string>
+                  </property>
+                  <property name="textFormat">
+                   <enum>Qt::MarkdownText</enum>
+                  </property>
+                 </widget>
+                </item>
+               </layout>
+              </widget>
+             </item>
+             <item row="1" column="1">
+              <widget class="QWidget" name="currentProfile_1" native="true"/>
+             </item>
             </layout>
             <zorder>currentProfile_1</zorder>
             <zorder>energyProfile_1</zorder>
             <zorder>imageContainer_1</zorder>
-            <zorder>label_5</zorder>
+            <zorder>widget</zorder>
            </widget>
           </item>
          </layout>

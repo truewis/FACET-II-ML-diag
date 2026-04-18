@@ -766,7 +766,7 @@ def map_xtcav_to_syag(syag_waterfall, xtcav_waterfall):
 	# Scale: assume XTCAV is anywhere from 25x smaller to 1x larger than SYAG
 	# Offset: assume the shift could be up to the size of the SYAG screen
 	bounds = [
-		(5.0, 10.0), 
+		(5.0, 12.0), 
 		(-n_syag_pix/2, n_syag_pix/2)
 	]
 	# Define the initial guess based on typical ROI
@@ -908,7 +908,7 @@ def extractDAQBSAScalars(data_struct, step_list=None, filter_index= True):
 			if varData.ndim != 1:
 				continue
 			if filter_index:
-				varData = varData[idx]  # apply common index
+				varData = varData[idx]  # apply common index. If this fails, this variable is not recorded in some of the steps.
 			varData = np.nan_to_num(varData)  # replace NaN with 0
 			# Dither by a small random value to avoid overfitting.
 			# Suppose by 0.1% of the average value of the variable.
@@ -978,9 +978,10 @@ def extractDAQNonBSAScalars(data_struct, step_list=None, filter_index=True, debu
             varData = np.nan_to_num(varData)
             # Dither by a small random value to avoid overfitting.
             # Suppose by 0.1% of the average value of the variable.
+            # But don't do dithering, sbst reading of -10000 implies error, should not dither
             avg_val = np.mean(varData)
             if avg_val != 0:
-                dither_amplitude = 0.001 * abs(avg_val)
+                dither_amplitude = 0 # 0.001 * abs(avg_val)
                 varData = varData + np.random.uniform(-dither_amplitude, dither_amplitude, size=varData.shape)
             bsaListData.append(varData)
 
@@ -1065,6 +1066,85 @@ def exclude_bsa_vars(bsaVars):
 	excluded_var_idx = [i for i, var in enumerate(bsaVars) if var in exclude_bsa_vars]
 	#print("Excluded variable indices:", excluded_var_idx)
 	return excluded_var_idx
+
+import numpy as np
+
+def sanitize_FACET_input(predictor, var_names):
+    """
+    Sanitizes the predictor matrix by handling -10000 read failures in LIXX:SBST:1:PHAS variables.
+    
+    Args:
+        predictor (np.ndarray): The 2D array of predictor values (samples x features).
+        var_names (list): The list of feature names corresponding to the columns.
+        
+    Returns:
+        np.ndarray: The sanitized predictor matrix.
+    """
+    # Create a copy to avoid unintended side effects on the original array
+    sanitized_predictor = predictor.copy()
+    n_samples, n_features = sanitized_predictor.shape
+    
+    # 1. Identify indices for target variables in L2 and L3 groups
+    l2_names = ['LI12:SBST:1:PHAS', 'LI13:SBST:1:PHAS', 'LI14:SBST:1:PHAS']
+    l3_names = ['LI15:SBST:1:PHAS', 'LI16:SBST:1:PHAS', 'LI17:SBST:1:PHAS', 
+                'LI18:SBST:1:PHAS', 'LI19:SBST:1:PHAS']
+    
+    # Safely get column indices if the variables exist in the cleaned dataset
+    l2_indices = [var_names.index(name) for name in l2_names if name in var_names]
+    l3_indices = [var_names.index(name) for name in l3_names if name in var_names]
+    
+    # Include LI11 if it exists, primarily for the multi-sample forward fill
+    all_target_indices = l2_indices + l3_indices
+    if 'LI11:SBST:1:PHAS' in var_names:
+        all_target_indices.append(var_names.index('LI11:SBST:1:PHAS'))
+
+    # ---------------------------------------------------------
+    # Scenario 1: Multiple Samples (Forward Fill / "Scroll Up")
+    # ---------------------------------------------------------
+    if n_samples > 1:
+        for col_idx in all_target_indices:
+            for row_idx in range(1, n_samples):
+                if sanitized_predictor[row_idx, col_idx] == -10000:
+                    # Replace with the value from the previous row
+                    sanitized_predictor[row_idx, col_idx] = sanitized_predictor[row_idx - 1, col_idx]
+
+    # ---------------------------------------------------------
+    # Scenario 2: Single Sample (Adjacent Fallback within Sections)
+    # ---------------------------------------------------------
+    elif n_samples == 1:
+        
+        def fill_adjacent(indices):
+            if not indices: 
+                return
+            
+            vals = sanitized_predictor[0, indices]
+            # If the whole section is missing (-10000) or perfectly fine, do nothing
+            if np.all(vals == -10000) or np.all(vals != -10000):
+                return
+            
+            # Fill missing values with the closest adjacent valid phase
+            for i, col_idx in enumerate(indices):
+                if sanitized_predictor[0, col_idx] == -10000:
+                    min_distance = float('inf')
+                    best_replacement_val = -10000
+                    
+                    # Search for the nearest valid neighbor within this section
+                    for j, other_col_idx in enumerate(indices):
+                        if sanitized_predictor[0, other_col_idx] != -10000:
+                            distance = abs(i - j)
+                            if distance < min_distance:
+                                min_distance = distance
+                                best_replacement_val = sanitized_predictor[0, other_col_idx]
+                    
+                    sanitized_predictor[0, col_idx] = best_replacement_val
+
+        # Apply the logic to L2 and L3 sections independently
+        fill_adjacent(l2_indices)
+        fill_adjacent(l3_indices)
+
+    return sanitized_predictor
+
+
 def apply_tcav_zeroing_filter(bsaScalarData, bsaVarPVs):
 	"""
 	Modifies the bsaScalarData array in-place by zeroing out the 

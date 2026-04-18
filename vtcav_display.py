@@ -13,7 +13,7 @@ import pathlib
 import importlib
 
 from sklearn.ensemble import RandomForestRegressor
-from sklearn.metrics import mean_squared_error
+from sklearn.metrics import mean_squared_error, pairwise_distances
 from sklearn.preprocessing import MinMaxScaler
 from sklearn.model_selection import train_test_split
 from sklearn.neighbors import KernelDensity
@@ -23,7 +23,7 @@ from scipy.io import loadmat, savemat
 from scipy.optimize import curve_fit
 from scipy.ndimage import center_of_mass, shift, zoom
 
-from Python_Functions.functions import cropProfmonImg, find_2d_mask_intervals, map_xtcav_to_syag, matstruct_to_dict, extractDAQBSAScalars, extractDAQNonBSAScalars, segment_centroids_and_com, apply_tcav_zeroing_filter, apply_centroid_correction, extract_processed_images
+from Python_Functions.functions import cropProfmonImg, find_2d_mask_intervals, map_xtcav_to_syag, matstruct_to_dict, extractDAQBSAScalars, extractDAQNonBSAScalars, segment_centroids_and_com, apply_tcav_zeroing_filter, apply_centroid_correction, extract_processed_images, sanitize_FACET_input
 from Python_Functions.cvae import CVAE, vae_loss, smooth_cvae_output
 from Python_Functions.gmm_slice import GeometricSliceScaler, SliceGMM, SliceRegressorWrapper, gaussian_1d
 
@@ -57,6 +57,7 @@ class InferenceWorker(QThread):
     new_prediction_signal = Signal(np.ndarray)
     new_pv_values = Signal(np.ndarray, np.ndarray, str)
     new_log_signal = Signal(str)
+    new_confidence_signal = Signal(np.float64)
     
     def __init__(self, model_path):
         print("Initializing Inference Worker at "+model_path)
@@ -130,7 +131,10 @@ class InferenceWorker(QThread):
             self.bypass_val = self.x_scaler.inverse_transform(zeros)[0]
             arch = data.get('architecture', {})
             self.ncomp = arch.get('ncomp', 1)
-
+            self.raw_training_set = data.get('raw_training_set', {})
+            self.var_importance = data.get('var_importance', {})
+            self.scaled_training_set = self.x_scaler.transform(self.raw_training_set)
+            self._setup_distance_metrics()
             # Create Sync Buffer for the first time.
             self.create_sync_buffer()
             
@@ -235,20 +239,44 @@ class InferenceWorker(QThread):
 
                     # Check for Validity
                     if val is None or np.isnan(val):
-                        if not self.is_pv_bypassed[i]:
+                        # Only auto-bypass non bsa pvs. BSA pvs does not timeout, so no need to bypass to run Real Time Prediction.
+                        if not self.is_pv_bypassed[i] and name not in self.bsa_names:
                             self._log(f"Recommend Bypassing PV: {name} (Value: {val})")
                             self.is_pv_bypassed[i] = 1 # Set flag
-                        ordered_input.append(self.bypass_val[i]) # Placeholder for raw data
+                        ordered_input.append(self.bypass_val[i])
                     else:
                         ordered_input.append(val)
 
                 # Convert to numpy array
                 input_array = np.array(ordered_input).reshape(1, -1)
+                
+                input_array = sanitize_FACET_input(input_array, self.var_names)
                 self.new_pv_values.emit(input_array[0], np.array(self.is_pv_bypassed), "RT")
                 # --- Phase 3: Scale & Force Zeros ---
                 # 1. Transform raw inputs
                 input_scaled = self.x_scaler.transform(input_array)
+                # 2. Apply importance weights to the single input
+                weighted_input = input_scaled * self.sqrt_weights
                 
+                # 3. Calculate distances from this single input to ALL training points
+                distances_to_train = pairwise_distances(
+                    weighted_input, 
+                    self.weighted_training_set, 
+                    metric='euclidean'
+                )
+                
+                # 4. Calculate the importance-averaged distance from the training set
+                avg_distance_to_train = np.min(distances_to_train)
+                
+                # 5. Divide by the precomputed median nearest-neighbor distance
+                distance_ratio = avg_distance_to_train / self.median_nn_distance
+                self._log(f"distance_ratio: {distance_ratio}")
+                if distance_ratio < 1:
+                    confidence = 100
+                else:
+                    confidence = 100 / distance_ratio
+                self.new_confidence_signal.emit(confidence)
+
                 # 2. Force bypassed indices to exactly 0.0 in the SCALED vector.
                 for i, is_bypassed in enumerate(self.is_pv_bypassed):
                     if is_bypassed:
@@ -297,6 +325,21 @@ class InferenceWorker(QThread):
             pred_full = self.iz_scaler.inverse_transform(z_pred_full)
             pred_params = pred_full.flatten()
             image_data = self.image_model.params_to_image(pred_params, total_charge)
+            # 1. Get height and width
+            h, w = image_data.shape[0], image_data.shape[1]
+            
+            # 2. Calculate the 5% boundary thickness (convert to int for slicing)
+            h_margin = int(h * 0.05)
+            w_margin = int(w * 0.05)
+            
+            # 3. Zero out the boundaries using slicing
+            if h_margin > 0:
+                image_data[:h_margin, ...] = 0      # Top boundary
+                image_data[-h_margin:, ...] = 0     # Bottom boundary
+            
+            if w_margin > 0:
+                image_data[:, :w_margin, ...] = 0   # Left boundary
+                image_data[:, -w_margin:, ...] = 0  # Right boundary
             if self.manual_SYAG:
                 image_data = self.apply_manual_SYAG_cut(image_data, offline_syag_array, offline_syag_width)
             # Figuring out orientation sucks. Seems to work without a T, but sometimes with a T.
@@ -451,6 +494,41 @@ class InferenceWorker(QThread):
         except RuntimeError:
             self._log("Warning: Double Gaussian curve fit failed to converge.")
             return 0.0, 0.0, 0.0  # Return 0 or None if the fit fails to find peaks
+
+    def _setup_distance_metrics(self):
+        """
+        Precomputes the median nearest-neighbor distance within the training set
+        """
+        weights = self.var_importance
+        
+        # Normalize weights so they sum to 1 (standard practice for "averaging")
+        weights = weights / np.sum(weights)
+        self.sqrt_weights = np.sqrt(weights)
+        
+        # 2. Pre-weight the training set for fast Euclidean computation
+        self.weighted_training_set = self.scaled_training_set * self.sqrt_weights
+        
+        # 3. Calculate median distance to the nearest point within the training set
+        # Calculate all pairwise distances in the training set
+        train_distances = pairwise_distances(self.weighted_training_set, metric='euclidean')
+        
+        # Fill the diagonal with infinity so a point isn't counted as its own nearest neighbor
+        np.fill_diagonal(train_distances, np.inf)
+        
+        # Find the distance to the nearest neighbor for each point, then take the median
+        nearest_neighbor_distances = np.min(train_distances, axis=1)
+        # Partition trick to find kth closest neighbor: Partition each row so the 10th smallest value is at index 9
+        # the ks chosen here are quite heuristic.
+        k = 10
+        tenth_neighbor_distances = np.partition(train_distances, k - 1, axis=1)[:, k - 1]
+        k = 50
+        fiftyth_neighbor_distances = np.partition(train_distances, k - 1, axis=1)[:, k - 1]
+
+        self.median_nn_distance = max(np.median(tenth_neighbor_distances)*5, np.median(fiftyth_neighbor_distances))
+        
+        # Safeguard against division by zero in case of identical training points
+        if self.median_nn_distance == 0:
+            self.median_nn_distance = 1e-10
 
 
     def stop(self):
@@ -903,7 +981,8 @@ class VTCAVDisplay(Display):
                 self.handle_log("Cleaning up previous worker...")
                 self.worker.stop()
                 try:
-                    self.worker.new_prediction_signal.disconnect()
+                    self.worker.new_prediction_signal.disconnect()     
+                    self.worker.new_confidence_signal.disconnect()
                 except Exception:
                     pass
                 self.worker.new_pv_values.disconnect()
@@ -1039,9 +1118,9 @@ class VTCAVDisplay(Display):
         n_features = len(var_names)
         # Configure Table
         self.ui.pvTable.setRowCount(n_features)
-        self.ui.pvTable.setColumnCount(8) # Name, Min, Max, Value, Bypassed, Bypass Val
+        self.ui.pvTable.setColumnCount(9) # Name, Min, Max, Value, Bypassed, Bypass Val
         self.ui.pvTable.setHorizontalHeaderLabels([
-            "PV Name", "Model Min", "Model Max", "Current Value", "Bypassed", "Bypass Val", "DAQ Value", "RT Value"
+            "PV Name", "Model Min", "Model Max", "Current Value", "Bypassed", "Bypass Val", "DAQ Value", "RT Value", "Importance"
         ])
 
         # Populate Static Data
@@ -1069,7 +1148,7 @@ class VTCAVDisplay(Display):
             self.ui.pvTable.setItem(row, 5, QTableWidgetItem(f"{self.worker.model_min[row]:.4e}"))
             self.ui.pvTable.setItem(row, 6, QTableWidgetItem("-"))
             self.ui.pvTable.setItem(row, 7, QTableWidgetItem("-"))
-
+            self.ui.pvTable.setItem(row, 8, QTableWidgetItem(f"{self.worker.var_importance[row]:.4f}"))
         # Optional: Resize columns to content
         self.ui.pvTable.resizeColumnsToContents()
 
@@ -1275,30 +1354,11 @@ class VTCAVDisplay(Display):
         # 3. Train Model
         # Pass the list of paths directly to run_pairs
         self.updateStatus("Training Model...")
-        if(arch == "CVAE16+RF"):
-            NCOMP = 16 # Example default
-            self.train_model_cvae_rf(
-                run_pairs=preprocess_paths,
-                n_comp=NCOMP,
-                output_file_path=output_file_path
-            )
-        elif(arch == "CVAE20+RF"):
-            NCOMP = 20
-            self.train_model_cvae_rf(
-                run_pairs=preprocess_paths,
-                n_comp=NCOMP,
-                output_file_path=output_file_path
-            )
-        elif(arch == "CVAE16+WRF"):
+        if(arch == "CVAE16+WRF"):
             NCOMP = 16 # Example default
             self.train_model_cvae_wrf(
                 run_pairs=preprocess_paths,
                 n_comp=NCOMP,
-                output_file_path=output_file_path
-            )
-        elif(arch == "GaussianESlice+RF"):
-            self.train_model_slice_rf(
-                run_pairs=preprocess_paths,
                 output_file_path=output_file_path
             )
         self.handle_log("Model data written successfully.")
@@ -1322,6 +1382,7 @@ class VTCAVDisplay(Display):
             self.worker.stop()
             try:
                 self.worker.new_prediction_signal.disconnect()
+                self.worker.new_confidence_signal.disconnect()
             except Exception:
                 pass
             self.worker.new_pv_values.disconnect()
@@ -1432,12 +1493,22 @@ class VTCAVDisplay(Display):
             self.handle_log("Acquisition Started")
             try:
                 self.worker.new_prediction_signal.disconnect()
+                self.worker.new_confidence_signal.disconnect()
             except Exception:
                 pass
             self.worker.new_prediction_signal.connect(
                 lambda data: self.update_image_display(data, display_name='RT')
             )
+            self.worker.new_confidence_signal.connect(
+                self.update_confidence
+            )
             self.worker.start()
+
+    def update_confidence(self, data):
+        color_style = "color:#ff0000;" if data < 50 else ""
+        html = f'<html><head/><body><p><span style="font-size:48pt; font-weight:600; {color_style}">{int(data)} %</span></p></body></html>'
+        self.ui.confidenceLabel.setText(html)
+
     @Slot(int)
     def toggle_doImage(self, state):
         if self.worker is None:
@@ -1738,34 +1809,47 @@ class VTCAVDisplay(Display):
         isChargePV = [bool(re.search(CHARGE_PV_U, pv)) for pv in bsaVars]
         pvidx = [i for i, val in enumerate(isChargePV) if val]
         charge = bsaScalarData[pvidx, :] * 1.6e-19  # in C 
-
+        # 1. Define the clustering logic as a reusable helper function
+        def filter_clustered_indices(idx_array, max_dist=5):
+            """Filters an index array to only keep points that have a neighbor within max_dist."""
+            if len(idx_array) > 1:
+                # Calculate distance to the right and to the left
+                diff_right = np.diff(idx_array)
+                diff_left = np.insert(diff_right, 0, diff_right[0])   # Align with idx_array
+                diff_right = np.append(diff_right, diff_right[-1])  # Align with idx_array
+                
+                # A point is "near" if either its left or right neighbor is within max_dist
+                has_neighbor = (diff_left <= max_dist) | (diff_right <= max_dist)
+                
+                # Keep only clustered points
+                return idx_array[has_neighbor]
+            else:
+                # If there's only 1 or 0 points, they have no neighbors by definition
+                return np.array([], dtype=int)
+        
+        
+        # 2. Find and cluster the +/- 90 degree phase indices
         minus_90_idx = np.where((xtcavPhase >= -91) & (xtcavPhase <= -89))[0]
+        minus_90_idx = filter_clustered_indices(minus_90_idx)
+        
         plus_90_idx = np.where((xtcavPhase >= 89) & (xtcavPhase <= 91))[0]
-        if (self.ui.auto_off_idx.isChecked() == False):
+        plus_90_idx = filter_clustered_indices(plus_90_idx)
+        
+        # 3. Handle the off_idx logic
+        if not self.ui.auto_off_idx.isChecked():
             off_idx = np.where(xtcavPhase == 0)[0]
+            
             # If there are too few off shots, something is wrong.
-            if off_idx.shape[0] < plus_90_idx.shape[0]*0.25:
-                # Try the new hardware logic where the off shots are slightly off angle in phase, not zero phase.
-                off_idx = np.where(((xtcavPhase >= 87) & (xtcavPhase <= 89)) | (xtcavPhase >= -89) & (xtcavPhase <= -87))[0]
-                # 2. Define your "nearness" threshold
-                # If the next index is > max_dist away, it's not a cluster
-                max_dist = 5 
+            if off_idx.shape[0] < plus_90_idx.shape[0] * 0.25:
+                # Try the new hardware logic where the off shots are slightly off angle in phase
+                off_idx = np.where(((xtcavPhase >= 87) & (xtcavPhase <= 89)) | 
+                                   ((xtcavPhase >= -89) & (xtcavPhase <= -87)))[0]
+                
+                # Apply the same clustering algorithm to off_idx
+                off_idx = filter_clustered_indices(off_idx)
+        
+        all_idx = np.append(minus_90_idx, plus_90_idx)
 
-                if len(off_idx) > 1:
-                    # Calculate distance to the right and to the left
-                    diff_right = np.diff(off_idx)
-                    diff_left = np.insert(diff_right, 0, diff_right[0]) # Align with off_idx
-                    diff_right = np.append(diff_right, diff_right[-1]) # Align with off_idx
-                    
-                    # A point is "near" if either its left or right neighbor is within max_dist
-                    has_neighbor = (diff_left <= max_dist) | (diff_right <= max_dist)
-                    
-                    # Update off_idx to keep only clustered points
-                    off_idx = off_idx[has_neighbor]
-                else:
-                    # If there's only 1 or 0 points, they have no neighbors by definition
-                    off_idx = np.array([], dtype=int)
-        all_idx = np.append(minus_90_idx,plus_90_idx)
         # Extract current profiles and 2D LPS images 
         xtcavImages_list = []
         xtcavImages_list_raw = []
@@ -1915,9 +1999,15 @@ class VTCAVDisplay(Display):
         phase_class[plus_90_idx] = 90 * factor
         phase_class[minus_90_idx] = -90 * factor
         phase_class_good = phase_class[goodShots]
-
         # ----------------------------------------------------------------
-
+        if self.do_syag_alignment:
+            syag_alignment_data = self.create_alignment_data(data_struct, dataloc, goodShots, xtcavImages_good.transpose(2, 0, 1))
+        else:
+            syag_alignment_data = {
+                'scale': 6,
+                'offset': -100,
+                'correlation': 1
+            }
         # 1. Define the filename
         filename = output_file_path
 
@@ -1930,6 +2020,7 @@ class VTCAVDisplay(Display):
             'xtcalibrationfactor': _xtcalibrationfactor,
             'phase_class': phase_class_good,
             'umPerDeg': np.abs(umPerDeg),
+            'syag_alignment_data': syag_alignment_data,
             'description': '2D LPS Images (flattened) for good shots only, filtered by all_idx and then goodShots.'
         }
 
@@ -1951,6 +2042,7 @@ class VTCAVDisplay(Display):
         all_indices = []
         all_phase_classifications = []
         all_umPerDeg = []
+        all_syag_alignment_data = []
 
         self.handle_log("Starting multi-run data loading and concatenation...")
 
@@ -2017,6 +2109,7 @@ class VTCAVDisplay(Display):
             predictor_current = np.vstack(bsaScalarData_filtered).T
             phase_classifications = data['phase_class']
             umPerDeg = np.full(phase_classifications.shape[0], np.abs(data['umPerDeg']))
+            syag_alignment_data = data['syag_alignment_data']
             # C. Append to master lists
             all_images.append(LPSImage_good)
             all_predictors.append(predictor_current)
@@ -2024,18 +2117,83 @@ class VTCAVDisplay(Display):
             charge_merged.append(charge_filtered)
             all_phase_classifications.append(phase_classifications)
             all_umPerDeg.append(umPerDeg)
+            all_syag_alignment_data.append(syag_alignment_data)
             
         # ----------------------------------------------------------------------
-        # 4. Concatenate and finalize arrays
+        # 4. Process, Pad, Stretch, and Concatenate Arrays
         # ----------------------------------------------------------------------
+        self.handle_log("Padding and stretching images for concatenation...")
 
+        umPerDeg_tmp = np.concatenate(all_umPerDeg, axis=0)
+        cal = umPerDeg_tmp[0] # um/deg  http://physics-elog.slac.stanford.edu/facetelog/show.jsp?dir=/2025/11/13.03&pos=2025-$
+        # --- A. Determine global X-padding (Symmetrical) ---
+        # Find the maximum width (xrange) across all runs (axis=1)
+        max_x = max([int(img.shape[1] / umPerDeg_tmp[0] * umPerDeg_tmp[i]) for i, img in enumerate(all_images)])
 
-        # Combine all data arrays from the runs
-        images_tmp = np.concatenate(all_images, axis=2)
-        self.handle_log(f"TMP Shape: {images_tmp.shape}")
-        # Set image half dimensions (should match preprocessing)
-        yrange = images_tmp.shape[0]//2
-        xrange = images_tmp.shape[1]//2
+        processed_images = []
+        
+        # --- B. Apply X-padding and Y-stretching per run ---
+        for i, img in enumerate(all_images):
+            alignment_data = all_syag_alignment_data[i]
+            
+            # 'scale' represents the stretch factor, 'offset' is the vertical offset.
+            reference_scale = 8.0
+            y_scale = reference_scale / alignment_data.get('scale', 8.0)
+            y_shift = alignment_data.get('offset', 0) / alignment_data.get('scale', 8.0)
+            x_scale = umPerDeg_tmp[0] / umPerDeg_tmp[i]
+            # 1. Stretch vertically (Y-axis = axis 0)
+            img_stretched = zoom(img, (y_scale, x_scale, 1), order=1)
+            # 2. Pad horizontally (Symmetrically on X-axis = axis 1)
+            diff_x = max_x - img_stretched.shape[1]
+            pad_left = diff_x // 2
+            pad_right = diff_x - pad_left
+            
+            img_x_padded = np.pad(
+                img_stretched, 
+                ((0, 0), (pad_left, pad_right), (0, 0)), 
+                mode='constant', 
+                constant_values=0
+            )
+
+            # Store the interim image and its vertical shift mapping
+            processed_images.append({
+                'img': img_x_padded,
+                'y_shift': int(y_shift)
+            })
+
+        # --- C. Determine global Y-canvas bounds to prevent cutting ---
+        # Find the highest upper bound and lowest lower bound based on shifted heights
+        min_y_start = min([p['y_shift'] for p in processed_images])
+        max_y_end = max([p['y_shift'] + p['img'].shape[0] for p in processed_images])
+
+        # --- D. Apply Y-padding based on alignment ---
+        final_aligned_images = []
+        for p in processed_images:
+            img = p['img']
+            shift = p['y_shift']
+            
+            # Calculate top and bottom padding so all images sit perfectly in the global canvas
+            pad_bottom = shift - min_y_start
+            pad_top = max_y_end - (shift + img.shape[0])
+            
+            # Pad vertically (Y-axis = axis 0)
+            img_final = np.pad(
+                img, 
+                ((pad_top, pad_bottom), (0, 0), (0, 0)), 
+                mode='constant', 
+                constant_values=0
+            )
+            final_aligned_images.append(img_final)
+
+        # --- E. Concatenate ---
+        # Now all images share the exact same X and Y dimensions
+        images_tmp = np.concatenate(final_aligned_images, axis=2)
+        self.handle_log(f"TMP Shape after alignment and concatenation: {images_tmp.shape}")
+
+        # Set image half dimensions (matches preprocessed universal canvas bounds)
+        yrange = images_tmp.shape[0] // 2
+        xrange = images_tmp.shape[1] // 2
+        
         images_tmp = images_tmp.transpose(2, 0, 1)
 
         # all_predictors = [np_array1, np_array2, ...] (2D arrays: n_samples x n_features)
@@ -2066,7 +2224,6 @@ class VTCAVDisplay(Display):
         predictor_tmp = np.concatenate(realigned_predictors, axis=0)
         charge = np.concatenate(charge_merged, axis=0)
         phase_class_tmp = np.concatenate(all_phase_classifications, axis=0)
-        umPerDeg_tmp = np.concatenate(all_umPerDeg, axis=0)
 
 
         self.handle_log("\n--- Final Concatenated Data Shapes ---")
@@ -2087,7 +2244,7 @@ class VTCAVDisplay(Display):
         bsaVarNames_cleaned = [var for i, var in enumerate(sorted_common_features) if i not in excluded_var_idx]
         predictor_tmp_cleaned = np.delete(predictor_tmp, excluded_var_idx, axis=1)[lps_idx, :]
         self.handle_log(f"Predictor shape after excluding variables: {predictor_tmp_cleaned.shape}")
-
+        predictor_tmp_cleaned = sanitize_FACET_input(predictor_tmp_cleaned, bsaVarNames_cleaned)
         LPSimg_prezoom = images_flipped[lps_idx]
         charge_filtered = charge[lps_idx]
         self.handle_log(f"LPS Image shape after filtering: {LPSimg_prezoom.shape}")
@@ -2096,7 +2253,6 @@ class VTCAVDisplay(Display):
         # Calibration
         # Define XTCAV calibration
         krf = 239.26
-        cal = umPerDeg_tmp[0] # um/deg  http://physics-elog.slac.stanford.edu/facetelog/show.jsp?dir=/2025/11/13.03&pos=2025-$
         streakFromGUI = cal*krf*180/np.pi*1e-6#um/um
         _xtcalibrationfactor = data_struct.metadata.DTOTR2.RESOLUTION*1e-6/streakFromGUI/3e8
         # Flags
@@ -2106,13 +2262,7 @@ class VTCAVDisplay(Display):
         # Interpolate LPS images to square pixels for CVAE training.
         # 2* yrange, 2* xrange to 200x200
         # CVAE model assumes square images with 200x200 pixels, forced by convolutional layers
-        LPSimg_resized = np.zeros((LPSimg_prezoom.shape[0], 200, 200), dtype=LPSimg_prezoom.dtype)
-        for i in range(LPSimg_prezoom.shape[0]):
-            tmpImage = zoom(LPSimg_prezoom[i], (1, umPerDeg_tmp[i] / cal), order=1)
-            # In case umPerDeg is different than the value here, stretch the image in x direction.
-            tmpImage = zoom(tmpImage, (200/tmpImage.shape[0], 200/tmpImage.shape[1]), order=1)
-            # The final width must remain the same.
-            LPSimg_resized[i] = tmpImage
+        LPSimg_resized = zoom(LPSimg_prezoom, (1, 200/LPSimg_prezoom.shape[1], 200/LPSimg_prezoom.shape[2]), order=1)
             
         LPSimg = LPSimg_resized
 
@@ -2328,16 +2478,15 @@ class VTCAVDisplay(Display):
         self.handle_log("Train R²: {:.2f} %".format(r2_score(Iz_train_scaled.ravel(), pred_train_scaled.ravel()) * 100))
         self.handle_log("Test R²: {:.2f} %".format(r2_score(Iz_test_scaled.ravel(), pred_test_scaled.ravel()) * 100))
         time_stamp = time.strftime("%Y%m%d_%H%M%S")
-        if self.do_syag_alignment:
-            syag_alignment_data = self.create_alignment_data(data_struct, dataloc, lps_idx, LPSimg)
-        else:
-            syag_alignment_data = {
-                'scale': 6,
-                'offset': -100,
-                'correlation': 1
-            }
+        syag_alignment_data = {
+            'scale': 8,
+            'offset': min_y_start,
+            'correlation': 1
+        }
         data_to_save = {
             'varNames': bsaVarNames_cleaned,
+            'raw_training_set': predictor_filtered,
+            'var_importance': model.feature_importances_,
             'bsaVarNames': bsaVars,
             'nonBsaVarNames': nonBsaVars,
             'model': model,
@@ -2356,656 +2505,7 @@ class VTCAVDisplay(Display):
         data_file = output_file_path
         with open(data_file, 'wb') as f:
             pickle.dump(data_to_save, f)
-            
-    def train_model_cvae_rf(self, run_pairs, n_comp, output_file_path):
-        # ----------------------------------------------------------------------
-        # 2. Initialize lists for concatenation
-        # ----------------------------------------------------------------------
-        all_images = []
-        all_predictors = []
-        all_indices = []
-        all_phase_classifications = []
-        all_umPerDeg = []
-
-        self.handle_log("Starting multi-run data loading and concatenation...")
-
-        # ----------------------------------------------------------------------
-        # 3. Loop through runs, load data, and concatenate
-        # ----------------------------------------------------------------------
-        charge_merged = []
-        for pickle_filename in run_pairs:
-            
-            # --- A. Load Processed LPSImage Data and Good Shots Index ---
-
-            try:
-                with open(pickle_filename, 'rb') as f:
-                    data = pickle.load(f)
-                
-                LPSImage_good = data['LPSImage'] # Filtered LPS images
-                # This 'goodShots' index is relative to the phase-filtered data (all_idx).
-                goodShots_scal_common_index = data['scalarCommonIndex']
-                
-                self.handle_log(f"Loaded pickle_filename: LPSImage shape {LPSImage_good.shape}")
-                
-            except FileNotFoundError:
-                self.handle_log(f"Skipping pickle_filename: Pickle file not found at {pickle_filename}")
-                continue
-            
-            # --- B. Load and Filter Predictor Data (BSA Scalars) ---
-            
-            # 1. Load data_struct
-            dataloc = data['daqPath']  # Assuming the path to the .mat file is stored in the pickle
-            try:
-                mat = loadmat(dataloc,struct_as_record=False, squeeze_me=True)
-                data_struct = mat['data_struct']
-            except FileNotFoundError:
-                self.handle_log(f"Skipping pickle_filename: .mat file not found at {dataloc}")
-                continue
-
-            # 2. Extract full BSA scalars (filtered by step_list if needed)
-            # Don't filter by common index here, we'll do it with the goodShots scalar common index loaded from the file
-            bsaScalarData, bsaVars = extractDAQBSAScalars(data_struct, filter_index=False)
-            bsaScalarData = apply_tcav_zeroing_filter(bsaScalarData, bsaVars)
-
-            # 3. Extract non BSA scalars the same way
-            nonBsaScalarData, nonBsaVars = extractDAQNonBSAScalars(data_struct, filter_index=False, debug=False, s20=False)
-            nonBsaScalarData = apply_tcav_zeroing_filter(nonBsaScalarData, nonBsaVars)
-            if self.include_nonBSA:
-                # 4. Combine BSA and non-BSA scalar data
-                bsaScalarData = np.vstack((bsaScalarData, nonBsaScalarData))
-                allVars = bsaVars + nonBsaVars
-            else:
-                allVars = bsaVars
-            
-            # 5. Filter BSA data using the final index
-            # goodShots_scal_common_index is 1 based indexing from MATLAB, convert to 0 based
-            bsaScalarData_filtered = bsaScalarData[:, goodShots_scal_common_index - 1]
-            
-            isChargePV = [bool(re.search(CHARGE_PV_U, pv)) for pv in bsaVars]
-            if isChargePV:
-                # Extract charge data
-                pvidx = [i for i, val in enumerate(isChargePV) if val]
-                charge = bsaScalarData[pvidx, :][0] * 1.6e-19  # in C 
-                charge_filtered = charge[goodShots_scal_common_index - 1]
-            # 6. Construct the predictor array
-            predictor_current = np.vstack(bsaScalarData_filtered).T
-            phase_classifications = data['phase_class']
-            umPerDeg = np.full(phase_classifications.shape[0], np.abs(data['umPerDeg']))
-            # C. Append to master lists
-            all_images.append(LPSImage_good)
-            all_predictors.append(predictor_current)
-            charge_merged.append(charge_filtered)
-            all_phase_classifications.append(phase_classifications)
-            all_umPerDeg.append(umPerDeg)
-            
-        # ----------------------------------------------------------------------
-        # 4. Concatenate and finalize arrays
-        # ----------------------------------------------------------------------
-
-
-        # Combine all data arrays from the runs
-        images_tmp = np.concatenate(all_images, axis=2)
-        self.handle_log(f"TMP Shape: {images_tmp.shape}")
-        # Set image half dimensions (should match preprocessing)
-        yrange = images_tmp.shape[0]//2
-        xrange = images_tmp.shape[1]//2
-        images_tmp = images_tmp.transpose(2, 0, 1)
-        predictor_tmp = np.concatenate(all_predictors, axis=0)
-        charge = np.concatenate(charge_merged, axis=0)
-        phase_class_tmp = np.concatenate(all_phase_classifications, axis=0)
-        umPerDeg_tmp = np.concatenate(all_umPerDeg, axis=0)
-
-
-        self.handle_log("\n--- Final Concatenated Data Shapes ---")
-        self.handle_log(f"Total LPS Images (images): {images_tmp.shape}")
-        self.handle_log(f"Total Predictors (predictor): {predictor_tmp.shape}")
-        self.handle_log(f"Final Phase Class: {phase_class_tmp.shape}")
-        self.update_image_display(np.average(images_tmp, axis = 0), display_name='Prep')
-
-        near_minus_90_idx = np.where(phase_class_tmp == -90)[0]
-        near_plus_90_idx = np.where(phase_class_tmp == 90)[0]
-        lps_idx = near_minus_90_idx.tolist() + near_plus_90_idx.tolist()
-        # Flip image horizontally for -90 deg phase
-        images_flipped = images_tmp.copy()
-        images_flipped[near_minus_90_idx, :, :] = np.flip(images_tmp[near_minus_90_idx, :, :], axis=2)
-
-        from Python_Functions.functions import exclude_bsa_vars
-        excluded_var_idx = exclude_bsa_vars(allVars)
-        bsaVarNames_cleaned = [var for i, var in enumerate(allVars) if i not in excluded_var_idx]
-        predictor_tmp_cleaned = np.delete(predictor_tmp, excluded_var_idx, axis=1)[lps_idx, :]
-        self.handle_log(f"Predictor shape after excluding variables: {predictor_tmp_cleaned.shape}")
-
-        LPSimg_prezoom = images_flipped[lps_idx]
-        charge_filtered = charge[lps_idx]
-        self.handle_log(f"LPS Image shape after filtering: {LPSimg_prezoom.shape}")
-
-
-        # Calibration
-        # Define XTCAV calibration
-        krf = 239.26
-        cal = umPerDeg_tmp[0] # um/deg  http://physics-elog.slac.stanford.edu/facetelog/show.jsp?dir=/2025/11/13.03&pos=2025-$
-        streakFromGUI = cal*krf*180/np.pi*1e-6#um/um
-        _xtcalibrationfactor = data_struct.metadata.DTOTR2.RESOLUTION*1e-6/streakFromGUI/3e8
-        # Flags
-        # If enabled, GMM fit is weighted to predict better current profile rather than overall image fit
-        do_current_profile = True
-
-        # Interpolate LPS images to square pixels for CVAE training.
-        # 2* yrange, 2* xrange to 200x200
-        # CVAE model assumes square images with 200x200 pixels, forced by convolutional layers
-        LPSimg_resized = np.zeros((LPSimg_prezoom.shape[0], 200, 200), dtype=LPSimg_prezoom.dtype)
-        for i in range(LPSimg_prezoom.shape[0]):
-            tmpImage = zoom(LPSimg_prezoom[i], (1, umPerDeg_tmp[i] / cal), order=1)
-            # In case umPerDeg is different than the value here, stretch the image in x direction.
-            tmpImage = zoom(tmpImage, (200/tmpImage.shape[0], 200/tmpImage.shape[1]), order=1)
-            # The final width must remain the same.
-            LPSimg_resized[i] = tmpImage
-            
-        LPSimg = LPSimg_resized
-
-        
-        # Number of components for the CVAE.
-        # Too low, the model will not capture the complexity of the data.
-        # Too high, the prediction task becomes too difficult.
-        NCOMP = n_comp
-
-        INPUT_CHANNELS = 1 # Assuming LPSimg is grayscale/single-channel data
-        # 1. Setup Device
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.handle_log(f"Using device: {device}")
-        # 2. Initialize Model and Optimizer
-        model_cvae = CVAE(latent_dim=NCOMP).to(device)
-        optimizer = torch.optim.Adam(model_cvae.parameters(), lr=1e-3)
-
-        # LPSimg is a numpy array of shape [n_samples, 200, 200].
-        BATCH_SIZE = 16
-        # ---------------------------------------------------
-
-        # Convert numpy data to PyTorch Tensor, add the Channel dimension (C=1)
-        LPSimg_tensor = torch.from_numpy(LPSimg).unsqueeze(1).float()
-        LPSimg_tensor /= LPSimg_tensor.max()
-        # Create a simple DataLoader for the data
-        from torch.utils.data import TensorDataset, DataLoader
-
-        from Python_Functions.cvae import proj_vae_loss
-        dataset = TensorDataset(LPSimg_tensor)
-        data_loader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True)
-
-        # 4. Training Loop
-        N_EPOCHS = 8
-        self.handle_log("\nStarting training loop ({} epochs)...".format(N_EPOCHS))
-
-        for epoch in range(1, N_EPOCHS + 1):
-            total_loss = 0
-            for batch_idx, (data,) in enumerate(data_loader):
-                data = data.to(device)
-                
-                # Forward pass
-                reconstruction, mu, logvar = model_cvae(data)
-                # reconstruction /= reconstruction.max()
-                data = data.clamp(min = 0)
-                # Calculate loss
-                # Like normal loss, vae_loss is not great for predicting LPS with small isolated features.
-                # Using projection loss to improve reconstruction of small features, which are enhanced logarithmically in the projection.
-                loss = proj_vae_loss(reconstruction, data, mu, logvar, strength=self.cvae_loss_strength, log_strength = self.cvae_proj_log_strength)
-                
-                # Backpropagation
-                optimizer.zero_grad()
-                loss.backward()
-                optimizer.step()
-                
-                total_loss += loss.item()
-
-            avg_loss = total_loss / len(dataset)
-            self.handle_log(f"Epoch {epoch}/{N_EPOCHS}, Average VAE Loss: {avg_loss:.4f}")
-
-        # Encode all LPS images to latent z parameters.
-        latent_z_array = np.zeros((LPSimg.shape[0], NCOMP )) 
-        for i in range(LPSimg.shape[0]):
-            mu_tensor = model_cvae.generate_latent_mu(torch.from_numpy(LPSimg[i]/LPSimg[i].max()).unsqueeze(0).unsqueeze(0).float().to(device))
-            latent_z_array[i] = mu_tensor.cpu().detach().numpy()
-
-        # Random Forest Regression to predict each latent parameter from the predictor variables
-
-        # All rows are valid in this mock example
-        valid_rows = [True for i in range(latent_z_array.shape[0])]
-        predictor_filtered = predictor_tmp_cleaned[valid_rows]
-        biGaussian_params_array_filtered = latent_z_array[valid_rows]
-        self.handle_log(f"After removing invalid rows, dataset shape: Predictors {predictor_filtered.shape}, Bi-Gaussian Params {biGaussian_params_array_filtered.shape}")
-
-        # --- Original scaling and splitting logic follows ---
-
-        x_scaler = MinMaxScaler()
-        iz_scaler = MinMaxScaler()
-        x_scaled = x_scaler.fit_transform(predictor_filtered)
-        Iz_scaled = iz_scaler.fit_transform(biGaussian_params_array_filtered)
-
-
-
-        # 80/20 train-test split
-        x_train_scaled, x_test_scaled, Iz_train_scaled, Iz_test_scaled, ntrain, ntest = train_test_split(
-            x_scaled, Iz_scaled, np.arange(Iz_scaled.shape[0]), test_size=0.2, random_state = 42)
-
-        # Convert to PyTorch tensors
-        X_train = torch.tensor(x_train_scaled, dtype=torch.float32)
-        X_test = torch.tensor(x_test_scaled, dtype=torch.float32)
-        Y_train = torch.tensor(Iz_train_scaled, dtype=torch.float32)
-        Y_test = torch.tensor(Iz_test_scaled, dtype=torch.float32)
-
-        train_ds = TensorDataset(X_train, Y_train)
-        train_dl = DataLoader(train_ds, batch_size=24, shuffle=True)
-
-        self.handle_log(f"X_train shape: {X_train.shape}")
-        self.handle_log(f"Y_train shape: {Y_train.shape}")
-
-        # --- 2. Model and Hyperparameter Setup ---
-        # The Random Forest is initialized with its structure (number of trees, depth, etc.)
-        # This replaces the PyTorch MLP class definition.
-
-        self.handle_log("\n--- Initializing Model ---")
-        # Equivalent to: model = MLP(X_train.shape[1], Y_train.shape[1])
-        # n_estimators is equivalent to the overall model complexity/capacity
-        # max_depth controls the depth, similar to the number of layers/nodes.
-        model = RandomForestRegressor(
-            n_estimators=500,        # Number of trees (like epochs/steps, higher = more complex)
-            max_depth=15,            # Max depth of trees (limits complexity)
-            min_samples_leaf=5,      # Regularization/pruning parameter
-            random_state=42,
-            n_jobs=-1                # Use all available cores
-        )
-
-        # Note: In Random Forest, there is no separate 'optimizer' or 'learning rate'
-        # as the training is done via deterministic tree growing (not gradient descent).
-
-
-        # --- 4. Training and Evaluation (Equivalent to the Training Loop) ---
-        # Random Forest is trained in a single 'fit' call, not in epochs.
-        # We mimic the training block structure and calculate loss/metrics.
-
-        t0 = time.time()
-        self.handle_log("\n--- Starting Model Fitting (One Shot) ---")
-
-        # Fit the model (This is the entire 'training loop' for RF)
-        model.fit(X_train, Y_train)
-
-        t1 = time.time()
-
-        # --- Evaluation ---
-
-        # 1. Training Set Evaluation
-        Y_train_pred = model.predict(X_train)
-        train_mse = mean_squared_error(Y_train, Y_train_pred)
-
-        # 2. Validation Set Evaluation
-        Y_test_pred = model.predict(X_test)
-        test_mse = mean_squared_error(Y_test, Y_test_pred)
-
-        # To see the importance of the input features:
-        self.handle_log("\n--- Feature Importance ---")
-        for i, importance in enumerate(model.feature_importances_):
-            self.handle_log(f"{bsaVarNames_cleaned[i]} importance: {importance:.4f}")
-
-        self.handle_log("\n--- Training Results ---")
-        self.handle_log(f"Total Fitting Time: {t1 - t0:.2f} seconds")
-        self.handle_log(f"Final Train MSE: {train_mse:.6f}")
-        self.handle_log(f"Final Test MSE: {test_mse:.6f}")
-
-        # Evaluate model
-        pred_train_scaled = model.predict(X_train)
-        pred_test_scaled = model.predict(X_test)
-
-        # Inverse transform predictions
-        pred_train_full = iz_scaler.inverse_transform(pred_train_scaled)
-        pred_test_full = iz_scaler.inverse_transform(pred_test_scaled)
-        Iz_train_true = iz_scaler.inverse_transform(Iz_train_scaled)
-        Iz_test_true = iz_scaler.inverse_transform(Iz_test_scaled)
-        elapsed = time.time() - t0
-        self.handle_log("Elapsed time [mins] = {:.1f} ".format(elapsed/60))
-
-        # Compute R² score
-        def r2_score(true, pred):
-            RSS = np.sum((true - pred)**2)
-            TSS = np.sum((true - np.mean(true))**2)
-            return 1 - RSS / TSS if TSS != 0 else 0
-
-        # Compute R² on scaled data, instead of the actual bi-Gaussian parameters, to avoid distortion from different scales
-        self.handle_log("Train R²: {:.2f} %".format(r2_score(Iz_train_scaled.ravel(), pred_train_scaled.ravel()) * 100))
-        self.handle_log("Test R²: {:.2f} %".format(r2_score(Iz_test_scaled.ravel(), pred_test_scaled.ravel()) * 100))
-        time_stamp = time.strftime("%Y%m%d_%H%M%S")
-        if self.do_syag_alignment:
-            syag_alignment_data = self.create_alignment_data(data_struct, dataloc, lps_idx, LPSimg)
-        else:
-            syag_alignment_data = {
-                'scale': 6,
-                'offset': -100,
-                'correlation': 1
-            }
-        data_to_save = {
-            'varNames': bsaVarNames_cleaned,
-            'bsaVarNames': bsaVars,
-            'nonBsaVarNames': nonBsaVars,
-            'model': model,
-            'iz_scaler': iz_scaler,
-            'x_scaler': x_scaler,
-            'xtcalibrationfactor': _xtcalibrationfactor * (xrange/100), #We Stretched the image in this function.
-            'image_model' : model_cvae,
-            'architecture': {
-                'ncomp': NCOMP,
-                'xrange': xrange,
-                'yrange': yrange,
-                'type': 'CVAE Random Forest v2025.12'
-            },
-            'syag_alignment_data' : syag_alignment_data
-        }
-        data_file = output_file_path
-        with open(data_file, 'wb') as f:
-            pickle.dump(data_to_save, f)
-
-   
-    def train_model_slice_rf(self, run_pairs, output_file_path):
-        # ----------------------------------------------------------------------
-        # 2. Initialize lists for concatenation
-        # ----------------------------------------------------------------------
-        all_images = []
-        all_predictors = []
-        all_indices = []
-        all_phase_classifications = []
-        all_umPerDeg = []
-
-        self.handle_log("Starting multi-run data loading and concatenation...")
-
-        # ----------------------------------------------------------------------
-        # 3. Loop through runs, load data, and concatenate
-        # ----------------------------------------------------------------------
-        charge_merged = []
-        for pickle_filename in run_pairs:
-            
-            # --- A. Load Processed LPSImage Data and Good Shots Index ---
-
-            try:
-                with open(pickle_filename, 'rb') as f:
-                    data = pickle.load(f)
-                
-                LPSImage_good = data['LPSImage'] # Filtered LPS images
-                # This 'goodShots' index is relative to the phase-filtered data (all_idx).
-                goodShots_scal_common_index = data['scalarCommonIndex']
-                
-                self.handle_log(f"Loaded pickle_filename: LPSImage shape {LPSImage_good.shape}")
-                
-            except FileNotFoundError:
-                self.handle_log(f"Skipping pickle_filename: Pickle file not found at {pickle_filename}")
-                continue
-            
-            # --- B. Load and Filter Predictor Data (BSA Scalars) ---
-            
-            # 1. Load data_struct
-            dataloc = data['daqPath']  # Assuming the path to the .mat file is stored in the pickle
-            try:
-                mat = loadmat(dataloc,struct_as_record=False, squeeze_me=True)
-                data_struct = mat['data_struct']
-            except FileNotFoundError:
-                self.handle_log(f"Skipping pickle_filename: .mat file not found at {dataloc}")
-                continue
-
-            # 2. Extract full BSA scalars (filtered by step_list if needed)
-            # Don't filter by common index here, we'll do it with the goodShots scalar common index loaded from the file
-            bsaScalarData, bsaVars = extractDAQBSAScalars(data_struct, filter_index=False)
-            bsaScalarData = apply_tcav_zeroing_filter(bsaScalarData, bsaVars)
-
-            # 3. Extract non BSA scalars the same way
-            nonBsaScalarData, nonBsaVars = extractDAQNonBSAScalars(data_struct, filter_index=False, debug=False, s20=False)
-            nonBsaScalarData = apply_tcav_zeroing_filter(nonBsaScalarData, nonBsaVars)
-
-            if self.include_nonBSA:
-                # 4. Combine BSA and non-BSA scalar data
-                bsaScalarData = np.vstack((bsaScalarData, nonBsaScalarData))
-                allVars = bsaVars + nonBsaVars
-            else:
-                allVars = bsaVars
-            
-            # 5. Filter BSA data using the final index
-            # goodShots_scal_common_index is 1 based indexing from MATLAB, convert to 0 based
-            bsaScalarData_filtered = bsaScalarData[:, goodShots_scal_common_index - 1]
-            
-            isChargePV = [bool(re.search(CHARGE_PV_U, pv)) for pv in bsaVars]
-            if isChargePV:
-                # Extract charge data
-                pvidx = [i for i, val in enumerate(isChargePV) if val]
-                charge = bsaScalarData[pvidx, :][0] * 1.6e-19  # in C 
-                charge_filtered = charge[goodShots_scal_common_index - 1]
-            # 6. Construct the predictor array
-            predictor_current = np.vstack(bsaScalarData_filtered).T
-            phase_classifications = data['phase_class']
-            umPerDeg = np.full(phase_classifications.shape[0], np.abs(data['umPerDeg']))
-            # C. Append to master lists
-            all_images.append(LPSImage_good)
-            all_predictors.append(predictor_current)
-            charge_merged.append(charge_filtered)
-            all_phase_classifications.append(phase_classifications)
-            all_umPerDeg.append(umPerDeg)
-            
-        # ----------------------------------------------------------------------
-        # 4. Concatenate and finalize arrays
-        # ----------------------------------------------------------------------
-
-
-        # Combine all data arrays from the runs
-        images_tmp = np.concatenate(all_images, axis=2)
-        self.handle_log(f"TMP Shape: {images_tmp.shape}")
-        # Set image half dimensions (should match preprocessing)
-        yrange = images_tmp.shape[0]//2
-        xrange = images_tmp.shape[1]//2
-        images_tmp = images_tmp.transpose(2, 0, 1)
-        predictor_tmp = np.concatenate(all_predictors, axis=0)
-        charge = np.concatenate(charge_merged, axis=0)
-        phase_class_tmp = np.concatenate(all_phase_classifications, axis=0)
-        umPerDeg_tmp = np.concatenate(all_umPerDeg, axis=0)
-
-
-        self.handle_log("\n--- Final Concatenated Data Shapes ---")
-        self.handle_log(f"Total LPS Images (images): {images_tmp.shape}")
-        self.handle_log(f"Total Predictors (predictor): {predictor_tmp.shape}")
-        self.handle_log(f"Final Phase Class: {phase_class_tmp.shape}")
-        self.update_image_display(np.average(images_tmp, axis = 0), display_name='Prep')
-
-        near_minus_90_idx = np.where(phase_class_tmp == -90)[0]
-        near_plus_90_idx = np.where(phase_class_tmp == 90)[0]
-        lps_idx = near_minus_90_idx.tolist() + near_plus_90_idx.tolist()
-        # Flip image horizontally for -90 deg phase
-        images_flipped = images_tmp.copy()
-        images_flipped[near_minus_90_idx, :, :] = np.flip(images_tmp[near_minus_90_idx, :, :], axis=2)
-
-        from Python_Functions.functions import exclude_bsa_vars
-        excluded_var_idx = exclude_bsa_vars(allVars)
-        bsaVarNames_cleaned = [var for i, var in enumerate(allVars) if i not in excluded_var_idx]
-        predictor_tmp_cleaned = np.delete(predictor_tmp, excluded_var_idx, axis=1)[lps_idx, :]
-        self.handle_log(f"Predictor shape after excluding variables: {predictor_tmp_cleaned.shape}")
-
-        LPSimg_prezoom = images_flipped[lps_idx]
-        charge_filtered = charge[lps_idx]
-        self.handle_log(f"LPS Image shape after filtering: {LPSimg_prezoom.shape}")
-
-
-        # Calibration
-        # Define XTCAV calibration
-        krf = 239.26
-        cal = umPerDeg_tmp[0] # um/deg  http://physics-elog.slac.stanford.edu/facetelog/show.jsp?dir=/2025/11/13.03&pos=2025-$
-        streakFromGUI = cal*krf*180/np.pi*1e-6#um/um
-        _xtcalibrationfactor = data_struct.metadata.DTOTR2.RESOLUTION*1e-6/streakFromGUI/3e8
-        # Flags
-        # If enabled, GMM fit is weighted to predict better current profile rather than overall image fit
-        do_current_profile = True
-
-        # Interpolate LPS images to square pixels for CVAE training.
-        # 2* yrange, 2* xrange to 200x200
-        # CVAE model assumes square images with 200x200 pixels, forced by convolutional layers
-        LPSimg_resized = np.zeros((LPSimg_prezoom.shape[0], 200, 200), dtype=LPSimg_prezoom.dtype)
-        for i in range(LPSimg_prezoom.shape[0]):
-            tmpImage = zoom(LPSimg_prezoom[i], (1, umPerDeg_tmp[i] / cal), order=1)
-            # In case umPerDeg is different than the value here, stretch the image in x direction.
-            tmpImage = zoom(tmpImage, (200/tmpImage.shape[0], 200/tmpImage.shape[1]), order=1)
-            # The final width must remain the same.
-            LPSimg_resized[i] = tmpImage
-            
-        LPSimg = LPSimg_resized
-        
-        NESLICE = 50
-        INPUT_CHANNELS = 1
-
-        # 1. Setup Device
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.handle_log(f"Using device: {device}")
-
-        # --- 2. Image Slicing & Feature Extraction ---
-        # Zoom the slicing axis (assumed axis 1) down to exactly NESLICE
-        # Assuming LPSimg shape is (n_samples, 200, profile_height)
-        zoom_factors = (1.0, NESLICE / LPSimg.shape[1], 1.0) 
-        LPSimg_zoomed = zoom(LPSimg, zoom_factors, order=1)
-
-        # Initialize array for 3 parameters per slice: (mu, sigma, charge/amp)
-        latent_z_array = np.zeros((LPSimg.shape[0], NESLICE * 3))
-
-        for i in range(LPSimg_zoomed.shape[0]):
-            for j in range(NESLICE):
-                # The slice is natively extracted via the zoomed dimension
-                slice_data = LPSimg_zoomed[i, j, :] 
-                x = np.arange(slice_data.shape[0])
-                try:
-                    popt, _ = curve_fit(gaussian_1d, x, slice_data, p0=[slice_data.argmax(), 10, slice_data.max()])
-                    mu, sigma, amp = popt
-                    #self.handle_log(f"mu: {mu}, sigma:{sigma}, eslice: {j}")
-                except RuntimeError:
-                    amp, mu, sigma = 0, 0, 1 # Default fallback
-                    
-                # Store as (mu, sigma, amp) triplet
-                latent_z_array[i, j*3] = mu
-                latent_z_array[i, j*3 + 1] = sigma
-                latent_z_array[i, j*3 + 2] = amp
-
-        # Filter logic
-        valid_rows = [True for _ in range(latent_z_array.shape[0])]
-        predictor_filtered = predictor_tmp_cleaned[valid_rows]
-        biGaussian_params_array_filtered = latent_z_array[valid_rows]
-
-        # --- 3. Scaling ---
-        x_scaler = MinMaxScaler()
-        iz_scaler = GeometricSliceScaler(xrange=100, yrange=100) # Ensure ranges match your data
-
-        x_scaled = x_scaler.fit_transform(predictor_filtered)
-        Iz_scaled = iz_scaler.fit_transform(biGaussian_params_array_filtered)
-
-        # --- 4. Prepare Flattened Dataset for the Wrapper ---
-        # Extract charges so they can be appended to X, leaving only (mu, sigma) for Y
-        Iz_scaled_reshaped = Iz_scaled.reshape(-1, NESLICE, 3)
-
-        # Y targets: only mu and sigma, shape (n_samples, 2 * NESLICE)
-        Y_targets = Iz_scaled_reshaped[:, :, :2].reshape(-1, NESLICE * 2)
-
-        # X inputs: predictors + charges
-        charges_scaled = Iz_scaled_reshaped[:, :, 2]
-        # Calculate the sum of charges along the slice dimension (axis=1)
-        charge_sums = np.sum(charges_scaled, axis=1, keepdims=True)
-
-        # Prevent division by zero for samples that might have failed curve_fit completely
-        charge_sums[charge_sums == 0] = 1.0 
-
-        # Broadcast the division to normalize
-        charges_scaled_normalized = charges_scaled / charge_sums
-        X_combined = np.hstack((x_scaled, charges_scaled_normalized))
-
-        # --- 5. Train / Test Split ---
-        X_train, X_test, Y_train, Y_test, ntrain, ntest = train_test_split(
-            X_combined, Y_targets, np.arange(X_combined.shape[0]), test_size=0.2, random_state=42)
-
-        # --- 6. Model Initialization ---
-        self.handle_log("\n--- Initializing Model ---")
-        rf_model = RandomForestRegressor(
-            n_estimators=500,        
-            max_depth=15,            
-            min_samples_leaf=5,      
-            random_state=42,
-            n_jobs=-1                
-        )
-
-        # Initialize wrapper (ensure n_eslice is explicitly passed)
-        model = SliceRegressorWrapper(rf_model, n_eslice=NESLICE)
-
-        # --- 7. Training ---
-        t0 = time.time()
-        self.handle_log("\n--- Starting Model Fitting (One Shot) ---")
-        # The wrapper internally expands this to N * NESLICE rows
-        model.fit(X_train, Y_train)
-        t1 = time.time()
-
-        # --- 8. Evaluation ---
-        # predict() returns (mu, sigma, charge) for all slices -> shape (n_samples, 3 * n_eslice)
-        Y_train_pred_full = model.predict(X_train)
-        Y_test_pred_full = model.predict(X_test)
-
-        # To calculate MSE fairly, we extract just the mu/sigma predictions to compare against our Y_train
-        Y_train_pred_musig = Y_train_pred_full.reshape(-1, NESLICE, 3)[:, :, :2].reshape(-1, NESLICE * 2)
-        Y_test_pred_musig = Y_test_pred_full.reshape(-1, NESLICE, 3)[:, :, :2].reshape(-1, NESLICE * 2)
-
-        train_mse = mean_squared_error(Y_train, Y_train_pred_musig)
-        test_mse = mean_squared_error(Y_test, Y_test_pred_musig)
-
-        self.handle_log("\n--- Feature Importance ---")
-        for i, importance in enumerate(model.model.feature_importances_):
-            if (i<len(bsaVarNames_cleaned)):
-                self.handle_log(f"{bsaVarNames_cleaned[i]} importance: {importance:.4f}")
-            else:
-                self.handle_log(f"energy importance: {importance:.4f}")
-
-        self.handle_log("\n--- Training Results ---")
-        self.handle_log(f"Total Fitting Time: {t1 - t0:.2f} seconds")
-        self.handle_log(f"Final Train MSE (mu, sigma only): {train_mse:.6f}")
-        self.handle_log(f"Final Test MSE (mu, sigma only): {test_mse:.6f}")
-        # Inverse transform predictions for final output testing
-        pred_test_scaled_full = model.predict(X_test)
-        pred_test_full = iz_scaler.inverse_transform(pred_test_scaled_full)
-
-        elapsed = time.time() - t0
-        self.handle_log("Elapsed time [mins] = {:.1f} ".format(elapsed/60))
-
-        # Compute R² score
-        def r2_score(true, pred):
-            RSS = np.sum((true - pred)**2)
-            TSS = np.sum((true - np.mean(true))**2)
-            return 1 - RSS / TSS if TSS != 0 else 0
-
-        # Compute R² on scaled data, instead of the actual bi-Gaussian parameters, to avoid distortion from different scales
-        self.handle_log("Train R²: {:.2f} %".format(r2_score(Y_train, Y_train_pred_musig) * 100))
-        self.handle_log("Test R²: {:.2f} %".format(r2_score(Y_test, Y_test_pred_musig) * 100))
-        
-        time_stamp = time.strftime("%Y%m%d_%H%M%S")
-        if self.do_syag_alignment:
-            syag_alignment_data = self.create_alignment_data(data_struct, dataloc, lps_idx, LPSimg)
-        else:
-            syag_alignment_data = {
-                'scale': 6,
-                'offset': -100,
-                'correlation': 1
-            }
-        data_to_save = {
-            'varNames': bsaVarNames_cleaned,
-            'bsaVarNames': bsaVars,
-            'nonBsaVarNames': nonBsaVars,
-            'model': model,
-            'iz_scaler': iz_scaler,
-            'x_scaler': x_scaler,
-            'xtcalibrationfactor': _xtcalibrationfactor * (xrange/100), #We Stretched the image in this function.
-            'image_model' : SliceGMM(xrange, yrange),
-            'architecture': {
-                'n_eslice': NESLICE,
-                'xrange': xrange,
-                'yrange': yrange,
-                'type': 'Gaussian Slice Random Forest v2026.03'
-            },
-            'syag_alignment_data' : syag_alignment_data
-        }
-        data_file = output_file_path
-        with open(data_file, 'wb') as f:
-            pickle.dump(data_to_save, f)
+             
     def create_alignment_data(self, data_struct, dataloc, lps_idx, LPSimg):
         self.handle_log("\n--- SYAG - LPS Alignment ---")
         # Optionally, compute SYAG and XTCAV alignment and also store it.
