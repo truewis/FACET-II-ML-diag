@@ -549,6 +549,7 @@ class VTCAVDisplay(Display):
         self.predictor_vars = None
         self.SYAG_daq_images= None
         self.compare_truth_data = None # Will hold preprocessed images in the compare function
+        self.shotNumber_cmp = None
         self.unit = "um"
         self.do_syag_alignment = False
         self.do_collimator_study = False
@@ -629,7 +630,7 @@ class VTCAVDisplay(Display):
         # Connect buttons
         self.ui.prevShotButton_cmp.clicked.connect(self.prev_compare_image)
         self.ui.nextShotButton_cmp.clicked.connect(self.next_compare_image)
-        self.ui.cpExportButton_cmp.clicked.connect(lambda: self.export_current_profile(mode="cmp"))
+        self.ui.cpExportButton_cmp.clicked.connect(self.export_compare)
         
         # Connect slider (triggers when user drags or clicks)
         self.ui.shotNumberSlider_cmp.valueChanged.connect(self.on_compare_slider_change)
@@ -646,7 +647,12 @@ class VTCAVDisplay(Display):
         self.ui.doSYAGAlignment.toggled.connect(self.set_do_syag_alignment)
         self.ui.doIncludeNonbsa.toggled.connect(self.set_do_include_nonBSA)
         self.ui.unitComboBox.currentTextChanged.connect(self.set_current_profile_unit)
-
+        
+    def export_compare(self):
+        if self.worker is not None:
+            self.export_current_profile(mode="cmp")
+        self.export_current_profile(mode="cmp_truth")
+        
     def set_manual_SYAG(self, checked):
         self.worker.manual_SYAG = checked
     def set_manual_Collimator(self, checked):
@@ -672,9 +678,11 @@ class VTCAVDisplay(Display):
                 data = pickle.load(f)
                 
             self.compare_truth_data = data['LPSImage'].transpose(2, 0, 1)
-
+            self.shotNumber_cmp = data['shotIndex']
+            self.compare_truth_phase_class = data['phase_class']
+            self.xtcalibrationfactor_cmp_truth = data['xtcalibrationfactor']*1e15
             # This is a 1 based index from MATLAB, which directly corresponds to the shot numbers in the DAQ data. We will use this to align the truth images with the correct DAQ rows for prediction.
-            self.goodShots_scal_common_index_cmp = data['scalarCommonIndex']
+            self.goodShots_scal_common_idx_cmp = data['scalarCommonIndex']
             self.load_daq_data(data['daqPath'])
             # Configure slider based on data length
             num_frames = len(self.compare_truth_data)
@@ -740,7 +748,7 @@ class VTCAVDisplay(Display):
 
             # --- 2. Process Prediction Image ---
             # Get the exact DAQ index corresponding to this truth shot
-            daq_idx = self.goodShots_scal_common_index_cmp[i] - 1
+            daq_idx = self.goodShots_scal_common_idx_cmp[i] - 1
             
             # Extract total charge
             total_charge = None
@@ -802,9 +810,6 @@ class VTCAVDisplay(Display):
         Iterates through compare shots, generates predictions, 
         and exports truth and predicted images to .pkl and .mat formats.
         """
-        if not hasattr(self, 'compare_truth_data') or self.predictors is None:
-            self.handle_log("Error: Compare data or DAQ data is not fully loaded.")
-            return
 
         # 1. Open File Dialogue
         file_path, _ = QFileDialog.getSaveFileName(
@@ -819,14 +824,17 @@ class VTCAVDisplay(Display):
             scal_common_idx = self.goodShots_scal_common_idx
         elif (mode == "cmp"):
             scal_common_idx = self.goodShots_scal_common_idx_cmp
+        elif (mode == "cmp_truth"):
+            scal_common_idx = self.goodShots_scal_common_idx_cmp
         num_frames = len(scal_common_idx)
         # Initialize lists to store the image data
         all_pred_imgs = []
 
         # Setup predictor indices (same as correlation logic)
-        if self.worker is None or not hasattr(self.worker, 'var_names'):
-            self.handle_log("Error: Worker or var_names not initialized.")
-            return
+        if (mode != "cmp_truth"):
+            if self.worker is None or not hasattr(self.worker, 'var_names'):
+                self.handle_log("Error: Worker or var_names not initialized.")
+                return
 
         if hasattr(self, 'updateStatus'):
             self.updateStatus(f"Exporting {num_frames} shots...")
@@ -836,32 +844,42 @@ class VTCAVDisplay(Display):
             daq_idx = scal_common_idx[i] - 1
 
             total_charge = None
-            if 'CHARGE_PV_C' in self.predictor_vars: # Assuming the constant name
-                charge_idx = self.predictor_vars.index('CHARGE_PV_C')
+            if CHARGE_PV_C in self.predictor_vars: # Assuming the constant name
+                charge_idx = self.predictor_vars.index(CHARGE_PV_C)
                 total_charge = self.predictors[daq_idx, charge_idx]
 
-            
-            scaled_predictor, filtered_predictor = self.get_scaled_predictor(daq_idx)
-            X_test = torch.tensor(scaled_predictor, dtype=torch.float32)
-
-            if hasattr(self.worker.model, 'eval'): 
-                self.worker.model.eval()
-
-            with torch.no_grad():
-                z_pred_full = self.worker.model.predict(X_test)
-
-            pred_full = self.worker.iz_scaler.inverse_transform(z_pred_full)
-            pred_params = pred_full.flatten()
-            pred_img = self.worker.image_model.params_to_image(pred_params, total_charge)
-            if self.worker.manual_SYAG:
-                pred_img = self.worker.apply_manual_SYAG_cut(pred_img, offline_syag_array = self.SYAG_daq_images[i], offline_syag_width = self.SYAG_daq_images[i].shape[1])
-            pred_img = np.sum(pred_img, axis = 0)/ self.worker.xtcalibrationfactor_fs * 1.602e-4 # 1.602e-19 [C]/1e-15 [s]
+            if (mode == "cmp_truth"):
+                xtcalibrationfactor = self.xtcalibrationfactor_cmp_truth * 200 / self.compare_truth_data.shape[2] # Scale it by stretch, since image_data is always 200*200.
+                if (self.compare_truth_phase_class[i]==90):
+                    pred_img = self.compare_truth_data[i] / np.sum(self.compare_truth_data[i])*total_charge
+                elif (self.compare_truth_phase_class[i]==-90):
+                    pred_img = np.flip(self.compare_truth_data[i], axis = 1) / np.sum(self.compare_truth_data[i])*total_charge # Flip the image to match streaking direction
+                else:
+                    pred_img = np.zeros_like(self.compare_truth_data[i]) # No streaking image, zero it to avoid confusion.
+            else:
+                xtcalibrationfactor = self.worker.xtcalibrationfactor_fs
+                scaled_predictor, filtered_predictor = self.get_scaled_predictor(daq_idx)
+                X_test = torch.tensor(scaled_predictor, dtype=torch.float32)
+                
+                if hasattr(self.worker.model, 'eval'): 
+                    self.worker.model.eval()
+                    
+                with torch.no_grad():
+                    z_pred_full = self.worker.model.predict(X_test)
+                    
+                pred_full = self.worker.iz_scaler.inverse_transform(z_pred_full)
+                pred_params = pred_full.flatten()
+                pred_img = self.worker.image_model.params_to_image(pred_params, total_charge)
+                if self.worker.manual_SYAG:
+                    pred_img = self.worker.apply_manual_SYAG_cut(pred_img, offline_syag_array = self.SYAG_daq_images[i], offline_syag_width = self.SYAG_daq_images[i].shape[1])
+            pred_img = np.sum(pred_img, axis = 0)/ xtcalibrationfactor * 1.602e-4 # 1.602e-19 [C]/1e-15 [s]
             all_pred_imgs.append(pred_img)
         # Convert to numpy arrays for export
         data_dict = {
             'current_profile': np.array(all_pred_imgs),
-            'fs_per_px': self.worker.xtcalibrationfactor_fs,
-            'num_frames': num_frames
+            'fs_per_px': xtcalibrationfactor,
+            'num_frames': num_frames,
+            'shotIndex': self.shotNumber_cmp
         }
 
         # --- 3. Export to Pickle ---
@@ -895,10 +913,10 @@ class VTCAVDisplay(Display):
         total_charge = self.predictors[index, self.predictor_vars.index(CHARGE_PV_C)] if CHARGE_PV_C in self.predictor_vars else 1
         truth_image = truth_image / np.sum(truth_image)*total_charge
         self.update_image_display(truth_image, 'cmp_truth')
-        
-        # 2. Trigger Prediction
-        self.emit_daq_image(index = index, common_index = self.goodShots_scal_common_index_cmp[index] - 1, display_name = 'cmp_pred')
-        self.ui.shotNumberCI_cmp.setText(f"Shot#:{self.goodShots_scal_common_index_cmp[index]}")
+        if (self.worker is not None):
+            # 2. Trigger Prediction
+            self.emit_daq_image(index = index, common_index = self.goodShots_scal_common_idx_cmp[index] - 1, display_name = 'cmp_pred')
+        self.ui.shotNumberCI_cmp.setText(f"Shot #: {self.shotNumber_cmp[index]}, Matlab Scalar #:{self.goodShots_scal_common_idx_cmp[index]}")
     
 
     @Slot()
@@ -1063,7 +1081,10 @@ class VTCAVDisplay(Display):
         allVars = [re.sub(r'(?<!^FAST)(?<!_FAST)_', ':', name) for name in allVars]
         # 5. Filter to keep only the variables specified in self.worker.var_names
         # Convert to a set for fast O(1) membership lookups
-        desired_vars_set = set(self.worker.var_names)
+        if (self.worker is not None):
+            desired_vars_set = set(self.worker.var_names)
+        else:
+            desired_vars_set = set(allVars)
         # Find the row indices of the variables we want to keep
         keep_indices = [i for i, var in enumerate(allVars) if var in desired_vars_set]
         
@@ -1088,17 +1109,17 @@ class VTCAVDisplay(Display):
         self.goodShots_scal_common_idx = data_struct.scalars.common_index
         self.ui.shotNumberSlider.setMaximum(len(self.goodShots_scal_common_idx)-1)
         self.ui.shotNumberSlider.setMinimum(0)
-
-        self.updateStatus(f"Loading SYAG Images...")
-        # Optional: load SYAG images if available for the SYAG projection feature
-        if (self.worker.n_eslice != 0 | self.worker.manual_SYAG):
-            mat = loadmat(dataloc,struct_as_record=False, squeeze_me=True)
-            data_struct = mat['data_struct']
-            file_path_obj = pathlib.Path(dataloc)
-            syagImages_raw, _, _, _ = extract_processed_images(data_struct, '', xrange = None, yrange = None, hotPixThreshold = 1e4, sigma = 1, threshold = 5, step_list = None, roi_xrange = None, roi_yrange = None, do_load_raw=False, directory_path=str(file_path_obj.parent), instrument="SYAG", intermediate_datatype=np.uint8)
-            # Dimensions of syagImages_raw should be (num_shots, width, height), but it is (height, width, num_shots) due to how MATLAB saves arrays. We need to transpose it to align with the shot indexing.
-            syagImages_raw = np.transpose(syagImages_raw, (2, 1, 0))
-            self.SYAG_daq_images = syagImages_raw
+        if self.worker is not None:
+            self.updateStatus(f"Loading SYAG Images...")
+            # Optional: load SYAG images if available for the SYAG projection feature
+            if (self.worker.n_eslice != 0 | self.worker.manual_SYAG):
+                mat = loadmat(dataloc,struct_as_record=False, squeeze_me=True)
+                data_struct = mat['data_struct']
+                file_path_obj = pathlib.Path(dataloc)
+                syagImages_raw, _, _, _ = extract_processed_images(data_struct, '', xrange = None, yrange = None, hotPixThreshold = 1e4, sigma = 1, threshold = 5, step_list = None, roi_xrange = None, roi_yrange = None, do_load_raw=False, directory_path=str(file_path_obj.parent), instrument="SYAG", intermediate_datatype=np.uint8)
+                # Dimensions of syagImages_raw should be (num_shots, width, height), but it is (height, width, num_shots) due to how MATLAB saves arrays. We need to transpose it to align with the shot indexing.
+                syagImages_raw = np.transpose(syagImages_raw, (2, 1, 0))
+                self.SYAG_daq_images = syagImages_raw
         self.updateStatus(f"Ready.")
 
     def setup_pv_table(self):
@@ -1610,6 +1631,8 @@ class VTCAVDisplay(Display):
         """
         Receives the numpy array from the worker and the target display name.
         Renders it into a Jet Heatmap and updates projections for that specific tab.
+
+        image_data shape is (Rows, Cols) -> (Y, X)
         """
         # Safety check: ensure the requested display name exists
         if not hasattr(self, 'img_views') or display_name not in self.img_views:
@@ -1643,6 +1666,10 @@ class VTCAVDisplay(Display):
                 except:
                     self.handle_log(f"Collimator Study: Cannot find intervals for {separation} um")
         # 2. Update Projections
+        if display_name == "cmp_truth":
+            xtcalibrationfactor = self.xtcalibrationfactor_cmp_truth * 200 / self.compare_truth_data.shape[2] # Scale it by stretch, since image_data is always 200*200.
+        else:
+            xtcalibrationfactor = self.worker.xtcalibrationfactor_fs
         try:
             # image_data shape is (Rows, Cols) -> (Y, X)
             y_proj = np.sum(image_data, axis=1) # Sum across columns -> (Rows,)
@@ -1655,11 +1682,11 @@ class VTCAVDisplay(Display):
 
             # Update Current Profile (Horizontal)
             if self.unit == "fs":
-                x_indices = np.arange(len(x_proj)) * self.worker.xtcalibrationfactor_fs
+                x_indices = np.arange(len(x_proj)) * xtcalibrationfactor
             else:
-                x_indices = np.arange(len(x_proj)) * self.worker.xtcalibrationfactor_fs * 0.299792458 # um/fs
+                x_indices = np.arange(len(x_proj)) * xtcalibrationfactor * 0.299792458 # um/fs
                 
-            x_proj = x_proj / self.worker.xtcalibrationfactor_fs * 1.602e-4 # 1.602e-19 [C]/1e-15 [s]
+            x_proj = x_proj / xtcalibrationfactor * 1.602e-4 # 1.602e-19 [C]/1e-15 [s]
 
             target_current_view.clear()
             target_current_view.plot(x_indices, x_proj)
