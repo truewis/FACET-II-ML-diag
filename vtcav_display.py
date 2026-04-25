@@ -555,7 +555,18 @@ class VTCAVDisplay(Display):
         self.do_collimator_study = False
         self.include_nonBSA = True
         self.separations_um = [75, 100, 125, 150, 175]
-
+        
+        # Mapping logical names to UI container names
+        # Format: 'Name': ('imageContainer', 'currentProfile', 'energyProfile')
+        # This allows a child class to override the mapping if the UI elements are named differently, without changing the core logic.
+        if self.display_mapping is None:
+            self.display_mapping = {
+                'RT':   ('imageContainer_1', 'currentProfile_1', 'energyProfile_1'),
+                'DAQ':  ('imageContainer_2', 'currentProfile_2', 'energyProfile_2'),
+                'Prep': ('imageContainer_3', 'currentProfile_3', 'energyProfile_3'),
+                'cmp_truth': ('imageContainer_4', 'currentProfile_4', 'energyProfile_4'),
+                'cmp_pred': ('imageContainer_5', 'currentProfile_5', 'energyProfile_5'),
+            }
         # 1. Setup UI Elements
         self.setup_model_ui()
         self.setup_daq_ui()
@@ -1553,15 +1564,6 @@ class VTCAVDisplay(Display):
         self.current_views = {}
         self.energy_views = {}
         
-        # Mapping logical names to UI container names
-        # Format: 'Name': ('imageContainer', 'currentProfile', 'energyProfile')
-        display_mapping = {
-            'RT':   ('imageContainer_1', 'currentProfile_1', 'energyProfile_1'),
-            'DAQ':  ('imageContainer_2', 'currentProfile_2', 'energyProfile_2'),
-            'Prep': ('imageContainer_3', 'currentProfile_3', 'energyProfile_3'),
-            'cmp_truth': ('imageContainer_4', 'currentProfile_4', 'energyProfile_4'),
-            'cmp_pred': ('imageContainer_5', 'currentProfile_5', 'energyProfile_5'),
-        }
         
         # Define the 'jet' colormap once to reuse
         pos = np.array([0.0, 0.33, 0.66, 1.0])
@@ -1574,7 +1576,7 @@ class VTCAVDisplay(Display):
         cmap = pg.ColorMap(pos, color)
 
         # Loop through mapping and create plots for each display
-        for display_name, (img_cnt, cur_cnt, eng_cnt) in display_mapping.items():
+        for display_name, (img_cnt, cur_cnt, eng_cnt) in self.display_mapping.items():
             
             # Ensure the containers actually exist in the UI file before creating things
             if not hasattr(self.ui, img_cnt):
@@ -1668,6 +1670,8 @@ class VTCAVDisplay(Display):
         # 2. Update Projections
         if display_name == "cmp_truth":
             xtcalibrationfactor = self.xtcalibrationfactor_cmp_truth * 200 / self.compare_truth_data.shape[2] # Scale it by stretch, since image_data is always 200*200.
+        elif display_name == "xleap":
+            xtcalibrationfactor = 4 # This is a hardcoded guess for the XLEAP data, since I don't have the metadata to determine it for now. Adjust as needed.
         else:
             xtcalibrationfactor = self.worker.xtcalibrationfactor_fs
         try:
