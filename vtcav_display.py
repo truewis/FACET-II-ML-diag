@@ -271,10 +271,72 @@ class InferenceWorker(QThread):
                 # 5. Divide by the precomputed median nearest-neighbor distance
                 distance_ratio = avg_distance_to_train / self.median_nn_distance
                 self._log(f"distance_ratio: {distance_ratio}")
-                if distance_ratio < 1:
+                                if distance_ratio < 1:
                     confidence = 100
                 else:
                     confidence = 100 / distance_ratio
+
+                # --- Phase 4: Low Confidence Recovery & Suggestion ---
+                if confidence < 50.0:
+                    self._log(f"Warning: Confidence is {confidence:.1f}%. Searching for nearby stable operating point...")
+                    
+                    # 1. Sort training set indices by distance to current operating point
+                    sorted_train_idx = np.argsort(distances_to_train[0])
+                    
+                    target_idx = None
+                    min_neighbors = 5
+                    min_neighbors_distance_factor = 0.5
+                    # Find the nearest training point that has at least `min_neighbors` nearby
+                    for idx in sorted_train_idx:
+                        candidate_pt = self.weighted_training_set[idx].reshape(1, -1)
+                        
+                        # Compute distances from this candidate to all other points in the training set
+                        dists_to_candidate = pairwise_distances(
+                            candidate_pt, 
+                            self.weighted_training_set, 
+                            metric='euclidean'
+                        )[0]
+                        
+                        # Count neighbors within some fraction of the median_nn_distance (subtract 1 to ignore the point itself)
+                        n_neighbors = np.sum(dists_to_candidate <= self.median_nn_distance * min_neighbors_distance_factor) - 1
+                        
+                        if n_neighbors >= min_neighbors:
+                            target_idx = idx
+                            break
+                            
+                    if target_idx is not None:
+                        # 2. Compute vector to that training point in the weighted space
+                        target_weighted = self.weighted_training_set[target_idx]
+                        diff_weighted = target_weighted - weighted_input[0]
+                        
+                        # Find all components whose absolute value is greater than some fraction of median_nn_distance
+                        sig_indices = np.where(np.abs(diff_weighted) > self.median_nn_distance * min_neighbors_distance_factor)[0]
+                        
+                        if len(sig_indices) > 0:
+                            # 3. Reverse transform the target point to get real physical variables
+                            # Un-weight (protect against division by zero if any weights are exactly 0)
+                            safe_weights = np.where(self.sqrt_weights == 0, 1e-10, self.sqrt_weights)
+                            target_scaled = target_weighted / safe_weights
+                            
+                            # Un-scale to get raw values
+                            target_raw = self.x_scaler.inverse_transform(target_scaled.reshape(1, -1))[0]
+                            
+                            # Compute the real difference (Target - Current)
+                            raw_diff = target_raw - input_array[0]
+                            
+                            self._log(">>> Suggested parameter adjustments to reach stable space:")
+                            for i in sig_indices:
+                                var_name = self.var_names[i]
+                                diff_val = raw_diff[i]
+                                current_val = input_array[0][i]
+                                target_val = target_raw[i]
+                                
+                                self._log(f"  {var_name}: Change by {diff_val:+.4g} (Current: {current_val:.4g} -> Target: {target_val:.4g})")
+                        else:
+                            self._log("Found a stable point, but no single parameter heavily dominates the distance.")
+                    else:
+                        self._log("Could not find any training point with the required neighborhood density.")
+
                 self.new_confidence_signal.emit(confidence)
 
                 # 2. Force bypassed indices to exactly 0.0 in the SCALED vector.
