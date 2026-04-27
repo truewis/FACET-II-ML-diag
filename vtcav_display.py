@@ -57,7 +57,7 @@ class InferenceWorker(QThread):
     new_prediction_signal = Signal(np.ndarray)
     new_pv_values = Signal(np.ndarray, np.ndarray, str)
     new_log_signal = Signal(str)
-    new_confidence_signal = Signal(np.float64)
+    new_confidence_signal = Signal(float, str)
     
     def __init__(self, model_path):
         print("Initializing Inference Worker at "+model_path)
@@ -271,11 +271,11 @@ class InferenceWorker(QThread):
                 # 5. Divide by the precomputed median nearest-neighbor distance
                 distance_ratio = avg_distance_to_train / self.median_nn_distance
                 self._log(f"distance_ratio: {distance_ratio}")
-                                if distance_ratio < 1:
-                    confidence = 100
+                if distance_ratio < 1:
+                    confidence = 100.0
                 else:
-                    confidence = 100 / distance_ratio
-
+                    confidence = 100.0 / distance_ratio
+                return_string = ""
                 # --- Phase 4: Low Confidence Recovery & Suggestion ---
                 if confidence < 50.0:
                     self._log(f"Warning: Confidence is {confidence:.1f}%. Searching for nearby stable operating point...")
@@ -330,14 +330,16 @@ class InferenceWorker(QThread):
                                 diff_val = raw_diff[i]
                                 current_val = input_array[0][i]
                                 target_val = target_raw[i]
+                                normalized_dist_percent = abs(diff_weighted[i])*100 / self.median_nn_distance
                                 
-                                self._log(f"  {var_name}: Change by {diff_val:+.4g} (Current: {current_val:.4g} -> Target: {target_val:.4g})")
+                                self._log(f"  ({normalized_dist_percent:.1f}){var_name}: Change by {diff_val:+.4g} (Current: {current_val:.4g} -> Target: {target_val:.4g})")
+                                return_string += f"({normalized_dist_percent:.1f}){var_name}: Change by {diff_val:+.4g} (Current: {current_val:.4g} -> Target: {target_val:.4g})\n"
                         else:
                             self._log("Found a stable point, but no single parameter heavily dominates the distance.")
                     else:
                         self._log("Could not find any training point with the required neighborhood density.")
 
-                self.new_confidence_signal.emit(confidence)
+                self.new_confidence_signal.emit(confidence, return_string)
 
                 # 2. Force bypassed indices to exactly 0.0 in the SCALED vector.
                 for i, is_bypassed in enumerate(self.is_pv_bypassed):
@@ -611,8 +613,10 @@ class VTCAVDisplay(Display):
         self.predictor_vars = None
         self.SYAG_daq_images= None
         self.compare_truth_data = None # Will hold preprocessed images in the compare function
-        self.shotNumber_cmp = None
+        self.shotIndex_cmp = None
         self.unit = "um"
+        self.origin_at_peak = True
+        self.flip_image_time = False
         self.do_syag_alignment = False
         self.do_collimator_study = False
         self.include_nonBSA = True
@@ -621,7 +625,7 @@ class VTCAVDisplay(Display):
         # Mapping logical names to UI container names
         # Format: 'Name': ('imageContainer', 'currentProfile', 'energyProfile')
         # This allows a child class to override the mapping if the UI elements are named differently, without changing the core logic.
-        if self.display_mapping is None:
+        if not hasattr(self, 'display_mapping'):
             self.display_mapping = {
                 'RT':   ('imageContainer_1', 'currentProfile_1', 'energyProfile_1'),
                 'DAQ':  ('imageContainer_2', 'currentProfile_2', 'energyProfile_2'),
@@ -720,6 +724,9 @@ class VTCAVDisplay(Display):
         self.ui.doSYAGAlignment.toggled.connect(self.set_do_syag_alignment)
         self.ui.doIncludeNonbsa.toggled.connect(self.set_do_include_nonBSA)
         self.ui.unitComboBox.currentTextChanged.connect(self.set_current_profile_unit)
+        self.ui.doOriginAtPeak.toggled.connect(self.set_origin_at_peak)
+        self.ui.doFlipImageTime.toggled.connect(self.set_flip_image_time)
+        
         
     def export_compare(self):
         if self.worker is not None:
@@ -734,7 +741,10 @@ class VTCAVDisplay(Display):
         self.do_syag_alignment = checked
     def set_do_include_nonBSA(self, checked):
         self.include_nonBSA = checked
-
+    def set_origin_at_peak(self, checked):
+        self.origin_at_peak = checked
+    def set_flip_image_time(self, checked):
+        self.flip_image_time = checked
     def set_current_profile_unit(self, unit):
         self.unit = unit
         for (current_name, current_view) in self.current_views.items():
@@ -751,7 +761,7 @@ class VTCAVDisplay(Display):
                 data = pickle.load(f)
                 
             self.compare_truth_data = data['LPSImage'].transpose(2, 0, 1)
-            self.shotNumber_cmp = data['shotIndex']
+            self.shotIndex_cmp = data['shotIndex']
             self.compare_truth_phase_class = data['phase_class']
             self.xtcalibrationfactor_cmp_truth = data['xtcalibrationfactor']*1e15
             # This is a 1 based index from MATLAB, which directly corresponds to the shot numbers in the DAQ data. We will use this to align the truth images with the correct DAQ rows for prediction.
@@ -948,12 +958,20 @@ class VTCAVDisplay(Display):
             pred_img = np.sum(pred_img, axis = 0)/ xtcalibrationfactor * 1.602e-4 # 1.602e-19 [C]/1e-15 [s]
             all_pred_imgs.append(pred_img)
         # Convert to numpy arrays for export
-        data_dict = {
-            'current_profile': np.array(all_pred_imgs),
-            'fs_per_px': xtcalibrationfactor,
-            'num_frames': num_frames,
-            'shotIndex': self.shotNumber_cmp
-        }
+        if self.shotIndex_cmp is not None:
+            data_dict = {
+                'current_profile': np.array(all_pred_imgs),
+                'fs_per_px': xtcalibrationfactor,
+                'num_frames': num_frames,
+                'shotIndex': self.shotIndex_cmp
+            }
+        else:
+            data_dict = {
+                'current_profile': np.array(all_pred_imgs),
+                'fs_per_px': xtcalibrationfactor,
+                'num_frames': num_frames,
+                'shotIndex': np.arange(num_frames)
+            }
 
         # --- 3. Export to Pickle ---
         with open(f"{base_path}.pkl", 'wb') as f:
@@ -989,7 +1007,7 @@ class VTCAVDisplay(Display):
         if (self.worker is not None):
             # 2. Trigger Prediction
             self.emit_daq_image(index = index, common_index = self.goodShots_scal_common_idx_cmp[index] - 1, display_name = 'cmp_pred')
-        self.ui.shotNumberCI_cmp.setText(f"Shot #: {self.shotNumber_cmp[index]}, Matlab Scalar #:{self.goodShots_scal_common_idx_cmp[index]}")
+        self.ui.shotNumberCI_cmp.setText(f"Shot #: {self.shotIndex_cmp[index]}, Matlab Scalar #:{self.goodShots_scal_common_idx_cmp[index]}")
     
 
     @Slot()
@@ -1598,10 +1616,11 @@ class VTCAVDisplay(Display):
             )
             self.worker.start()
 
-    def update_confidence(self, data):
+    def update_confidence(self, data, reason_string):
         color_style = "color:#ff0000;" if data < 50 else ""
         html = f'<html><head/><body><p><span style="font-size:48pt; font-weight:600; {color_style}">{int(data)} %</span></p></body></html>'
         self.ui.confidenceLabel.setText(html)
+        self.ui.confidenceReasonLabel.setText(reason_string)
 
     @Slot(int)
     def toggle_doImage(self, state):
@@ -1706,7 +1725,8 @@ class VTCAVDisplay(Display):
         target_img_view = self.img_views[display_name]
         target_current_view = self.current_views[display_name]
         target_energy_view = self.energy_views[display_name]
-
+        if self.flip_image_time:
+            image_data = np.flip(image_data, axis = 1)
         # 1. Update Image
         target_img_view.setImage(image_data.T, autoRange=False, autoLevels=False)
         
@@ -1753,7 +1773,10 @@ class VTCAVDisplay(Display):
                 x_indices = np.arange(len(x_proj)) * xtcalibrationfactor * 0.299792458 # um/fs
                 
             x_proj = x_proj / xtcalibrationfactor * 1.602e-4 # 1.602e-19 [C]/1e-15 [s]
-
+            if self.origin_at_peak:
+                # We want the first peak to have x = 0 for better visibility.
+                peak_idx = np.argmax(x_proj)
+                x_indices = x_indices - x_indices[peak_idx]
             target_current_view.clear()
             target_current_view.plot(x_indices, x_proj)
                 
@@ -2323,7 +2346,6 @@ class VTCAVDisplay(Display):
         self.handle_log(f"Total LPS Images (images): {images_tmp.shape}")
         self.handle_log(f"Total Predictors (predictor): {predictor_tmp.shape}")
         self.handle_log(f"Final Phase Class: {phase_class_tmp.shape}")
-        self.update_image_display(np.average(images_tmp, axis = 0), display_name='Prep')
 
         near_minus_90_idx = np.where(phase_class_tmp == -90)[0]
         near_plus_90_idx = np.where(phase_class_tmp == 90)[0]

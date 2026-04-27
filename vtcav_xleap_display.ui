@@ -81,7 +81,7 @@
          </sizepolicy>
         </property>
         <property name="currentIndex">
-         <number>0</number>
+         <number>1</number>
         </property>
         <widget class="QWidget" name="tab_10">
          <attribute name="title">
@@ -265,6 +265,13 @@
                   </property>
                   <property name="textFormat">
                    <enum>Qt::MarkdownText</enum>
+                  </property>
+                 </widget>
+                </item>
+                <item>
+                 <widget class="QLabel" name="confidenceReasonLabel">
+                  <property name="text">
+                   <string/>
                   </property>
                  </widget>
                 </item>
@@ -990,7 +997,7 @@
          </sizepolicy>
         </property>
         <property name="currentIndex">
-         <number>0</number>
+         <number>3</number>
         </property>
         <widget class="QWidget" name="tab_3">
          <attribute name="title">
@@ -1132,17 +1139,27 @@
           <string>Options</string>
          </attribute>
          <layout class="QGridLayout" name="gridLayout_11">
-          <item row="2" column="0">
-           <widget class="QCheckBox" name="doManualCollimator">
+          <item row="1" column="0" colspan="2">
+           <widget class="QCheckBox" name="doManualSYAG">
             <property name="text">
-             <string>Collimator Study</string>
+             <string>Manual SYAG Cut (requires reloading the DAQ)</string>
             </property>
             <property name="checked">
              <bool>false</bool>
             </property>
            </widget>
           </item>
-          <item row="6" column="0" colspan="2">
+          <item row="3" column="0" colspan="2">
+           <widget class="QCheckBox" name="doSYAGAlignment">
+            <property name="text">
+             <string>DTOTR2 - SYAG Alignment</string>
+            </property>
+            <property name="checked">
+             <bool>false</bool>
+            </property>
+           </widget>
+          </item>
+          <item row="4" column="0" rowspan="2" colspan="2">
            <widget class="QCheckBox" name="doIncludeNonbsa">
             <property name="text">
              <string>Include Non BSA Variables</string>
@@ -1152,14 +1169,7 @@
             </property>
            </widget>
           </item>
-          <item row="0" column="0">
-           <widget class="QLabel" name="label_10">
-            <property name="text">
-             <string>Current Profile Units:</string>
-            </property>
-           </widget>
-          </item>
-          <item row="0" column="1">
+          <item row="0" column="2">
            <widget class="QComboBox" name="unitComboBox">
             <property name="sizePolicy">
              <sizepolicy hsizetype="Expanding" vsizetype="Fixed">
@@ -1179,20 +1189,37 @@
             </item>
            </widget>
           </item>
-          <item row="1" column="0">
-           <widget class="QCheckBox" name="doManualSYAG">
+          <item row="2" column="0" colspan="2">
+           <widget class="QCheckBox" name="doManualCollimator">
             <property name="text">
-             <string>Manual SYAG Cut (requires reloading the DAQ)</string>
+             <string>Collimator Study</string>
             </property>
             <property name="checked">
              <bool>false</bool>
             </property>
            </widget>
           </item>
-          <item row="5" column="0" colspan="2">
-           <widget class="QCheckBox" name="doSYAGAlignment">
+          <item row="0" column="0" colspan="2">
+           <widget class="QLabel" name="label_10">
             <property name="text">
-             <string>DTOTR2 - SYAG Alignment</string>
+             <string>Current Profile Units:</string>
+            </property>
+           </widget>
+          </item>
+          <item row="6" column="0">
+           <widget class="QCheckBox" name="doOriginAtPeak">
+            <property name="text">
+             <string>z = 0 at Current Peak</string>
+            </property>
+            <property name="checked">
+             <bool>true</bool>
+            </property>
+           </widget>
+          </item>
+          <item row="7" column="0">
+           <widget class="QCheckBox" name="doFlipImageTime">
+            <property name="text">
+             <string>Flip z axis</string>
             </property>
             <property name="checked">
              <bool>false</bool>
