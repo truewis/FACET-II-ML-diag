@@ -44,8 +44,8 @@ class ProfMonWatcherWorker(QThread):
             # 2. Reshape and crop
             syag_image = np.array(syag_data).reshape(-1, self.syag_width)
             # 1. Background thresholding on a copy to preserve original image data for the crop
-            #np.flip(syag_image, axis = 0)
-            #np.flip(syag_image, axis = 1)
+            syag_image = np.flip(syag_image, axis = 0)
+            syag_image = np.flip(syag_image, axis = 1)
             temp_image = syag_image.copy()
             median_val = np.median(temp_image)
             temp_image[temp_image < median_val * 2] = 0
@@ -107,6 +107,11 @@ class ProfMonWatcherWorker(QThread):
             recovered_cp = np.sum(recovered_img, axis=0) 
             peak_pos = np.argmax(recovered_cp)
 
+            # If normalized peak current is too low, we are missing shot, so skip analysis
+            if recovered_cp[peak_pos] / np.sum(recovered_cp) < 3/recovered_cp.shape[0]:
+                self._log("Warning: Cannot find beam spot.")
+                continue
+            
             # 6. Compute Spread
             result = self.compute_weighted_y_variance_window(recovered_img, self.window_size)
 
@@ -120,11 +125,11 @@ class ProfMonWatcherWorker(QThread):
             if self.display_images_rt:
                self.image_processed.emit(recovered_img)
                
-            # Maintain requested update rate (10Hz)
+            # Maintain requested update rate (5Hz)
             elapsed = time.time() - start_time
-            if elapsed > 0.1:
-                self._log(f"Warning: Prediction Thread Cannot Catch up at 10 Hz. Time took for prediction: {elapsed}.")
-            time.sleep(max(0.01, 0.1 - elapsed))
+            if elapsed > 0.2:
+                self._log(f"Warning: Prediction Thread Cannot Catch up at 5 Hz. Time took for prediction: {elapsed}.")
+            time.sleep(max(0.01, 0.2 - elapsed))
 
     # --- Processing Methods ---
     def generate_anisotropic_psf(self, shape, sigma_x, sigma_y):
@@ -180,6 +185,7 @@ class ProfMonWatcherWorker(QThread):
 # ==========================================
 class VTCAVDisplay_XLEAP(VTCAVDisplay):
     def __init__(self, parent=None, args=None):
+        self.xtcalibrationfactor_fs_xleap = 12
         self.display_mapping = {
                 'RT':   ('imageContainer_1', 'currentProfile_1', 'energyProfile_1'),
                 'DAQ':  ('imageContainer_2', 'currentProfile_2', 'energyProfile_2'),

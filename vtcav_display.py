@@ -1755,7 +1755,7 @@ class VTCAVDisplay(Display):
         if display_name == "cmp_truth":
             xtcalibrationfactor = self.xtcalibrationfactor_cmp_truth * 200 / self.compare_truth_data.shape[2] # Scale it by stretch, since image_data is always 200*200.
         elif display_name == "xleap":
-            xtcalibrationfactor = 4 # This is a hardcoded guess for the XLEAP data, since I don't have the metadata to determine it for now. Adjust as needed.
+            xtcalibrationfactor = self.xtcalibrationfactor_fs_xleap # This is a hardcoded guess for the XLEAP data, since I don't have the metadata to determine it for now. Adjust as needed.
         else:
             xtcalibrationfactor = self.worker.xtcalibrationfactor_fs
         try:
