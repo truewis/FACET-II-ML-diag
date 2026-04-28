@@ -2,9 +2,10 @@ import numpy as np
 import time
 import epics
 from scipy.fft import fft2, ifft2, ifftshift
-from scipy.ndimage import label, center_of_mass, mean as nd_mean
+from scipy.ndimage import label, center_of_mass, mean as nd_mean, sum as nd_sum
 from qtpy.QtCore import QThread, Signal, Slot
 from vtcav_display import VTCAVDisplay
+from matplotlib import pyplot as plt
 LCLS_XTCAV_PROF_MON_PV = 'OTRS:DMPH:695:Image'
 # ==========================================
 # 1. Background watcherWorker Class
@@ -41,12 +42,13 @@ class ProfMonWatcherWorker(QThread):
                 return
 
             # 2. Reshape and crop
-            syag_image = np.array(syag_data).reshape(-1, self.syag_width).T
+            syag_image = np.array(syag_data).reshape(-1, self.syag_width)
             # 1. Background thresholding on a copy to preserve original image data for the crop
+            #np.flip(syag_image, axis = 0)
+            #np.flip(syag_image, axis = 1)
             temp_image = syag_image.copy()
             median_val = np.median(temp_image)
-            temp_image[temp_image < median_val * 3] = 0
-
+            temp_image[temp_image < median_val * 2] = 0
             # 2. Find clusters of adjacent non-zero pixels
             mask = temp_image > 0
             labeled_array, num_features = label(mask)
@@ -55,9 +57,14 @@ class ProfMonWatcherWorker(QThread):
                 # 3. Find the cluster with the highest mean intensity
                 # nd_mean efficiently calculates the mean of temp_image for each labeled cluster
                 indices = np.arange(1, num_features + 1)
-                cluster_means = nd_mean(temp_image, labels=labeled_array, index=indices)
+                cluster_means = nd_sum(temp_image, labels=labeled_array, index=indices)
                 best_cluster_idx = indices[np.argmax(cluster_means)]
-
+                # Create a mask where only the best cluster is True (1) and others are False (0)
+                mask = (labeled_array == best_cluster_idx)
+                
+                # Apply the mask to the image
+                # This keeps the original values for the cluster and sets everything else to 0
+                #syag_image = syag_image * mask
                 # 4. Compute Center of Mass for the best cluster
                 com_y, com_x = center_of_mass(temp_image, labels=labeled_array, index=best_cluster_idx)
                 com_y, com_x = int(np.round(com_y)), int(np.round(com_x))
@@ -66,7 +73,7 @@ class ProfMonWatcherWorker(QThread):
                 com_y, com_x = syag_image.shape[0] // 2, syag_image.shape[1] // 2
 
             # 5. Define fixed rectangle target dimensions
-            crop_h, crop_w = 400, 150
+            crop_h, crop_w = 800, 150
             half_h, half_w = crop_h // 2, crop_w // 2
 
             # Calculate raw crop boundaries
@@ -94,7 +101,7 @@ class ProfMonWatcherWorker(QThread):
 
             # 4. Thresholding based on median background
             median_bg = np.median(recovered_img)
-            recovered_img[recovered_img < median_bg * 3] = 0
+            recovered_img[recovered_img < median_bg * 2] = 0
 
             # 5. Find peak position (assuming column projection)
             recovered_cp = np.sum(recovered_img, axis=0) 
@@ -109,7 +116,7 @@ class ProfMonWatcherWorker(QThread):
                 energy_spread = 0.0
 
             # 7. Emit results to GUI
-            self.xleap_score_computed.emit(energy_spread)
+            self.xleap_score_computed.emit(energy_spread/100)
             if self.display_images_rt:
                self.image_processed.emit(recovered_img)
                

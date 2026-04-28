@@ -956,6 +956,8 @@ class VTCAVDisplay(Display):
                 if self.worker.manual_SYAG:
                     pred_img = self.worker.apply_manual_SYAG_cut(pred_img, offline_syag_array = self.SYAG_daq_images[i], offline_syag_width = self.SYAG_daq_images[i].shape[1])
             pred_img = np.sum(pred_img, axis = 0)/ xtcalibrationfactor * 1.602e-4 # 1.602e-19 [C]/1e-15 [s]
+            if self.flip_image_time:
+                pred_img = np.flip(pred_img)
             all_pred_imgs.append(pred_img)
         # Convert to numpy arrays for export
         if self.shotIndex_cmp is not None:
