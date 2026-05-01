@@ -614,6 +614,7 @@ class VTCAVDisplay(Display):
         self.SYAG_daq_images= None
         self.compare_truth_data = None # Will hold preprocessed images in the compare function
         self.shotIndex_cmp = None
+        self.daq_dataloc = None
         self.unit = "um"
         self.origin_at_peak = True
         self.flip_image_time = False
@@ -763,7 +764,8 @@ class VTCAVDisplay(Display):
             self.compare_truth_data = data['LPSImage'].transpose(2, 0, 1)
             self.shotIndex_cmp = data['shotIndex']
             self.compare_truth_phase_class = data['phase_class']
-            self.xtcalibrationfactor_cmp_truth = data['xtcalibrationfactor']*1e15
+            # Display will fit image width to 200. If it is larger, we compensate by setting xtcalibrationfactor_cmp_truth larger by the width ratio.
+            self.xtcalibrationfactor_cmp_truth = data['xtcalibrationfactor']*1e15* self.compare_truth_data.shape[2] / 200
             # This is a 1 based index from MATLAB, which directly corresponds to the shot numbers in the DAQ data. We will use this to align the truth images with the correct DAQ rows for prediction.
             self.goodShots_scal_common_idx_cmp = data['scalarCommonIndex']
             self.load_daq_data(data['daqPath'])
@@ -960,19 +962,26 @@ class VTCAVDisplay(Display):
                 pred_img = np.flip(pred_img)
             all_pred_imgs.append(pred_img)
         # Convert to numpy arrays for export
+        model_path = ""
+        if self.worker is not None:
+            model_path = self.worker.model_path
         if self.shotIndex_cmp is not None:
             data_dict = {
                 'current_profile': np.array(all_pred_imgs),
                 'fs_per_px': xtcalibrationfactor,
                 'num_frames': num_frames,
-                'shotIndex': self.shotIndex_cmp
+                'shotIndex': self.shotIndex_cmp,
+                'model_path': model_path,
+                'daq_path':self.daq_dataloc
             }
         else:
             data_dict = {
                 'current_profile': np.array(all_pred_imgs),
                 'fs_per_px': xtcalibrationfactor,
                 'num_frames': num_frames,
-                'shotIndex': np.arange(num_frames)
+                'shotIndex': np.arange(num_frames),
+                'model_path': model_path,
+                'daq_path':self.daq_dataloc
             }
 
         # --- 3. Export to Pickle ---
@@ -1150,6 +1159,7 @@ class VTCAVDisplay(Display):
             self.toggle_acquisition() # This will pause the worker
         self.handle_log(f"DAQ Load requested for: {full_path}")
         dataloc = full_path
+        self.daq_dataloc = dataloc
         try:
             mat = loadmat(dataloc,struct_as_record=False, squeeze_me=True)
             data_struct = mat['data_struct']
@@ -1203,16 +1213,19 @@ class VTCAVDisplay(Display):
         self.ui.shotNumberSlider.setMaximum(len(self.goodShots_scal_common_idx)-1)
         self.ui.shotNumberSlider.setMinimum(0)
         if self.worker is not None:
-            self.updateStatus(f"Loading SYAG Images...")
             # Optional: load SYAG images if available for the SYAG projection feature
             if (self.worker.n_eslice != 0 | self.worker.manual_SYAG):
+                self.updateStatus(f"Loading SYAG Images...")
                 mat = loadmat(dataloc,struct_as_record=False, squeeze_me=True)
                 data_struct = mat['data_struct']
                 file_path_obj = pathlib.Path(dataloc)
-                syagImages_raw, _, _, _ = extract_processed_images(data_struct, '', xrange = None, yrange = None, hotPixThreshold = 1e4, sigma = 1, threshold = 5, step_list = None, roi_xrange = None, roi_yrange = None, do_load_raw=False, directory_path=str(file_path_obj.parent), instrument="SYAG", intermediate_datatype=np.uint8)
-                # Dimensions of syagImages_raw should be (num_shots, width, height), but it is (height, width, num_shots) due to how MATLAB saves arrays. We need to transpose it to align with the shot indexing.
-                syagImages_raw = np.transpose(syagImages_raw, (2, 1, 0))
-                self.SYAG_daq_images = syagImages_raw
+                try:
+                    syagImages_raw, _, _, _ = extract_processed_images(data_struct, '', xrange = None, yrange = None, hotPixThreshold = 1e4, sigma = 1, threshold = 5, step_list = None, roi_xrange = None, roi_yrange = None, do_load_raw=False, directory_path=str(file_path_obj.parent), instrument="SYAG", intermediate_datatype=np.uint8)
+                    # Dimensions of syagImages_raw should be (num_shots, width, height), but it is (height, width, num_shots) due to how MATLAB saves arrays. We need to transpose it to align with the shot indexing.
+                    syagImages_raw = np.transpose(syagImages_raw, (2, 1, 0))
+                    self.SYAG_daq_images = syagImages_raw
+                except Exception as e:
+                    self.handle_log("Cannot load SYAG Images:{e}. You can disable manual SYAG cut to proceed without collimators.")
         self.updateStatus(f"Ready.")
 
     def setup_pv_table(self):
@@ -1756,6 +1769,8 @@ class VTCAVDisplay(Display):
             xtcalibrationfactor = self.xtcalibrationfactor_cmp_truth * 200 / self.compare_truth_data.shape[2] # Scale it by stretch, since image_data is always 200*200.
         elif display_name == "xleap":
             xtcalibrationfactor = self.xtcalibrationfactor_fs_xleap # This is a hardcoded guess for the XLEAP data, since I don't have the metadata to determine it for now. Adjust as needed.
+        elif display_name == "Prep":
+            xtcalibrationfactor = 6.3 # Just rough value for preview
         else:
             xtcalibrationfactor = self.worker.xtcalibrationfactor_fs
         try:
