@@ -973,6 +973,15 @@ class VTCAVDisplay(Display):
                 self.worker.new_prediction_signal.disconnect(capture_prediction)
             except Exception:
                 pass
+            # Reconnect to the previous handler based on mode
+            if mode == "daq":
+                self.worker.new_prediction_signal.connect(
+                    lambda data: self.update_image_display(data, 'DAQ')
+                )
+            elif mode == "cmp":
+                self.worker.new_prediction_signal.connect(
+                    lambda data: self.update_image_display(data, 'cmp_pred')
+                )
         # Convert to numpy arrays for export
         model_path = ""
         if self.worker is not None:
