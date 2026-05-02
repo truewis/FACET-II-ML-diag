@@ -53,11 +53,36 @@ from F2_pytools.controls_jurisdiction import is_SLC
 
 HOME_DIR = pathlib.Path(__file__).parent
 
+# Output EPICS PVs for real-time write-back of ML-computed beam diagnostics
+SEPARATION_PV = 'SIOC:SYS1:ML00:AO542'  # Computed bunch separation [µm]
+BLEN1_PV      = 'SIOC:SYS1:ML00:AO543'  # Computed first bunch length [µm]
+BLEN2_PV      = 'SIOC:SYS1:ML00:AO544'  # Computed second bunch length [µm]
+
+# Physical constants
+C_UM_PER_FS = 0.299792458   # Speed of light in micrometres per femtosecond
+C_M_PER_S   = C_UM_PER_FS*1e9            # Speed of light in metres per second
+
+# Charge conversion factors
+ELEMENTARY_CHARGE_C = 1.602e-19  # Charge of one electron [Coulombs]
+# Pixel-integrated TMIT → current in Amperes:
+#   pixel_sum / calibration_fs_per_pix [fs] × CURRENT_CONVERSION_A = current [A]
+#   Derivation: 1.602e-19 C/electron ÷ 1e-15 s/fs = 1.602e-4 A·fs
+CURRENT_CONVERSION_A = ELEMENTARY_CHARGE_C * 1e15
+# TMIT [electrons] → picocoulombs:
+#   Derivation: 1.602e-19 C/electron × 1e12 pC/C ≈ 1.6e-7 pC/electron
+TMIT_TO_PC = ELEMENTARY_CHARGE_C * 1e12
+
 class InferenceWorker(QThread):
     new_prediction_signal = Signal(np.ndarray)
     new_pv_values = Signal(np.ndarray, np.ndarray, str)
     new_log_signal = Signal(str)
     new_confidence_signal = Signal(float, str)
+
+    # Fallback calibration factor (fs/pixel) when the model file contains none.
+    # This is a known rough value for the FACET-II XTCAV setup.
+    DEFAULT_XT_CALIBRATION_FS_PER_PIX = 6.5
+    # SYAG masking: pixels below this fraction of the projection maximum are zeroed
+    DEFAULT_SYAG_MASKING_THRESHOLD = 0.1   # 10% of peak projection magnitude
     
     def __init__(self, model_path):
         print("Initializing Inference Worker at "+model_path)
@@ -71,7 +96,7 @@ class InferenceWorker(QThread):
         self.alignment_data = None
         self.n_eslice = 0
         self.manual_SYAG = True
-        self.manual_SYAG_masking_threshold = 0.1
+        self.manual_SYAG_masking_threshold = DEFAULT_SYAG_MASKING_THRESHOLD
         try:
             self.syag_width = epics.PV(SYAG_PV+":ArraySize0_RBV").get()
         except:
@@ -105,7 +130,7 @@ class InferenceWorker(QThread):
                 self.xtcalibrationfactor_fs = data['xtcalibrationfactor']*1e15
                 self._log(f"xtcalibrationfactor is {self.xtcalibrationfactor_fs} [fs/pix].")
             except:
-                self.xtcalibrationfactor_fs = 6.5 # known rough value for FACET-II
+                self.xtcalibrationfactor_fs = DEFAULT_XT_CALIBRATION_FS_PER_PIX
                 self._log(f"Warning: No xtcalibrationfactor found in the file. Defaulting to {self.xtcalibrationfactor_fs} [fs/pix].")
             try:
                 self.alignment_data = data['syag_alignment_data']
