@@ -77,6 +77,12 @@ class InferenceWorker(QThread):
     new_pv_values = Signal(np.ndarray, np.ndarray, str)
     new_log_signal = Signal(str)
     new_confidence_signal = Signal(float, str)
+
+    # Fallback calibration factor (fs/pixel) when the model file contains none.
+    # This is a known rough value for the FACET-II XTCAV setup.
+    DEFAULT_XT_CALIBRATION_FS_PER_PIX = 6.5
+    # SYAG masking: pixels below this fraction of the projection maximum are zeroed
+    DEFAULT_SYAG_MASKING_THRESHOLD = 0.1   # 10% of peak projection magnitude
     
     def __init__(self, model_path):
         print("Initializing Inference Worker at "+model_path)
