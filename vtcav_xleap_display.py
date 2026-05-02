@@ -16,16 +16,23 @@ class ProfMonWatcherWorker(QThread):
     image_processed = Signal(np.ndarray)
     new_log_signal = Signal(str)
     display_images_rt = True  # Control flag for real-time image display
+
+    # Default algorithm parameters for PSF and Wiener deconvolution of XTCAV images
+    DEFAULT_SIGMA_X = 3.2    # PSF horizontal sigma in pixels (wide: camera blur dominates in x)
+    DEFAULT_SIGMA_Y = 0.1    # PSF vertical sigma in pixels (narrow: streak is thin vertically)
+    DEFAULT_BALANCE = 0.05   # Wiener filter regularization parameter (larger → more smoothing)
+    DEFAULT_WINDOW_SIZE = 5  # Sliding-window width for weighted energy-spread calculation
+
     def __init__(self, pv_name, width, parent=None):
         super().__init__(parent)
         self.pv_name = pv_name
         self.syag_width = width
         self.running = False
-        # Algorithm parameters
-        self.sigma_x = 3.2
-        self.sigma_y = 0.1
-        self.balance = 0.05
-        self.window_size = 5
+        # Algorithm parameters (use class-level defaults so callers can override them)
+        self.sigma_x = self.DEFAULT_SIGMA_X
+        self.sigma_y = self.DEFAULT_SIGMA_Y
+        self.balance = self.DEFAULT_BALANCE
+        self.window_size = self.DEFAULT_WINDOW_SIZE
     def _log(self, message):
         #print(f"[Watcher] {message}")
         self.new_log_signal.emit(f"[Watcher] {message}")
@@ -33,6 +40,18 @@ class ProfMonWatcherWorker(QThread):
         """
         This method executes in the background when self.start() is called.
         """
+        # Background suppression: zero pixels below this multiple of the median
+        BG_THRESHOLD_FACTOR = 2
+        # Crop region dimensions centred on the beam spot (pixels)
+        CROP_HEIGHT = 800   # Vertical extent — covers the full bunch length in the streak
+        CROP_WIDTH = 150    # Horizontal extent — covers the XTCAV streak width
+        # Target update rate: 5 Hz; sleep for the remainder of each cycle
+        UPDATE_PERIOD_S = 0.2   # Seconds per update cycle (1 / 5 Hz)
+        MIN_SLEEP_S = 0.01      # Minimum sleep duration to prevent CPU busy-waiting
+        # Missing-shot detection: skip if the peak column carries less than
+        # SHOT_DETECT_THRESHOLD / n_cols of the total column-projection sum
+        SHOT_DETECT_THRESHOLD = 3
+
         self.running = True
         while self.running:
             start_time = time.time()
@@ -48,7 +67,7 @@ class ProfMonWatcherWorker(QThread):
             syag_image = np.flip(syag_image, axis = 1)
             temp_image = syag_image.copy()
             median_val = np.median(temp_image)
-            temp_image[temp_image < median_val * 2] = 0
+            temp_image[temp_image < median_val * BG_THRESHOLD_FACTOR] = 0
             # 2. Find clusters of adjacent non-zero pixels
             mask = temp_image > 0
             labeled_array, num_features = label(mask)
@@ -73,7 +92,7 @@ class ProfMonWatcherWorker(QThread):
                 com_y, com_x = syag_image.shape[0] // 2, syag_image.shape[1] // 2
 
             # 5. Define fixed rectangle target dimensions
-            crop_h, crop_w = 800, 150
+            crop_h, crop_w = CROP_HEIGHT, CROP_WIDTH
             half_h, half_w = crop_h // 2, crop_w // 2
 
             # Calculate raw crop boundaries
@@ -101,14 +120,14 @@ class ProfMonWatcherWorker(QThread):
 
             # 4. Thresholding based on median background
             median_bg = np.median(recovered_img)
-            recovered_img[recovered_img < median_bg * 2] = 0
+            recovered_img[recovered_img < median_bg * BG_THRESHOLD_FACTOR] = 0
 
             # 5. Find peak position (assuming column projection)
             recovered_cp = np.sum(recovered_img, axis=0) 
             peak_pos = np.argmax(recovered_cp)
 
             # If normalized peak current is too low, we are missing shot, so skip analysis
-            if recovered_cp[peak_pos] / np.sum(recovered_cp) < 3/recovered_cp.shape[0]:
+            if recovered_cp[peak_pos] / np.sum(recovered_cp) < SHOT_DETECT_THRESHOLD/recovered_cp.shape[0]:
                 self._log("Warning: Cannot find beam spot.")
                 continue
             
@@ -127,9 +146,9 @@ class ProfMonWatcherWorker(QThread):
                
             # Maintain requested update rate (5Hz)
             elapsed = time.time() - start_time
-            if elapsed > 0.2:
+            if elapsed > UPDATE_PERIOD_S:
                 self._log(f"Warning: Prediction Thread Cannot Catch up at 5 Hz. Time took for prediction: {elapsed}.")
-            time.sleep(max(0.01, 0.2 - elapsed))
+            time.sleep(max(MIN_SLEEP_S, UPDATE_PERIOD_S - elapsed))
 
     # --- Processing Methods ---
     def generate_anisotropic_psf(self, shape, sigma_x, sigma_y):
@@ -152,6 +171,9 @@ class ProfMonWatcherWorker(QThread):
         return np.real(ifft2(recovered_fft))
 
     def compute_weighted_y_variance_window(self, image, window_size):
+        # Small epsilon to prevent division by zero when the total weight (M0) is near zero
+        VARIANCE_EPSILON = 1e-10
+
         rows, cols = image.shape
         y_coords = np.arange(rows).reshape(-1, 1)
         
@@ -164,7 +186,7 @@ class ProfMonWatcherWorker(QThread):
         M1 = np.convolve(S1, sliding_window, mode='valid')
         M2 = np.convolve(S2, sliding_window, mode='valid')
         
-        M0_safe = M0 + 1e-10
+        M0_safe = M0 + VARIANCE_EPSILON
         expected_y = M1 / M0_safe
         expected_y2 = M2 / M0_safe
         weighted_variance = expected_y2 - (expected_y ** 2)
