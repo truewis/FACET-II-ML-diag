@@ -206,8 +206,12 @@ class ProfMonWatcherWorker(QThread):
 # 2. Main PyDM Display Class
 # ==========================================
 class VTCAVDisplay_XLEAP(VTCAVDisplay):
+    # Approximate calibration factor for the XLEAP XTCAV camera: femtoseconds per pixel.
+    # This is a reasonable starting estimate; the precise value depends on the XTCAV RF settings.
+    XLEAP_XT_CALIBRATION_FS_PER_PIX = 12
+
     def __init__(self, parent=None, args=None):
-        self.xtcalibrationfactor_fs_xleap = 12
+        self.xtcalibrationfactor_fs_xleap = self.XLEAP_XT_CALIBRATION_FS_PER_PIX
         self.display_mapping = {
                 'RT':   ('imageContainer_1', 'currentProfile_1', 'energyProfile_1'),
                 'DAQ':  ('imageContainer_2', 'currentProfile_2', 'energyProfile_2'),
@@ -263,8 +267,12 @@ class VTCAVDisplay_XLEAP(VTCAVDisplay):
             self.watcherWorker.start()
 
     def update_xleap_score(self, data):
-        color_style = "color:#ff0000;" if data < 50 else ""
-        html = f'<html><head/><body><p><span style="font-size:48pt; font-weight:600; {color_style}">{int(data)} %</span></p></body></html>'
+        # Display style constants for the XLEAP quality-score label
+        LOW_SCORE_THRESHOLD = 50          # Scores below this percentage are shown in red
+        SCORE_FONT_SIZE_PT = 48           # HTML font size (pt) for the score label
+        LOW_SCORE_COLOR_HEX = "#ff0000"   # Red colour for low-score indication
+        color_style = f"color:{LOW_SCORE_COLOR_HEX};" if data < LOW_SCORE_THRESHOLD else ""
+        html = f'<html><head/><body><p><span style="font-size:{SCORE_FONT_SIZE_PT}pt; font-weight:600; {color_style}">{int(data)} %</span></p></body></html>'
         self.ui.scoreLabel_xleap.setText(html)
 
     @Slot(int)
