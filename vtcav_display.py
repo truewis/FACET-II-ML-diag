@@ -924,6 +924,17 @@ class VTCAVDisplay(Display):
         if hasattr(self, 'updateStatus'):
             self.updateStatus(f"Exporting {num_frames} shots...")
 
+        # For daq/cmp modes, capture images emitted by worker.emit_prediction
+        if mode != "cmp_truth":
+            captured_image = [None]
+            def capture_prediction(image_data):
+                captured_image[0] = image_data
+            try:
+                self.worker.new_prediction_signal.disconnect()
+            except Exception:
+                pass
+            self.worker.new_prediction_signal.connect(capture_prediction)
+
         for i in range(num_frames):
             # --- 2. Process Prediction Image ---
             daq_idx = scal_common_idx[i] - 1
@@ -944,23 +955,33 @@ class VTCAVDisplay(Display):
             else:
                 xtcalibrationfactor = self.worker.xtcalibrationfactor_fs
                 scaled_predictor, filtered_predictor = self.get_scaled_predictor(daq_idx)
-                X_test = torch.tensor(scaled_predictor, dtype=torch.float32)
-                
-                if hasattr(self.worker.model, 'eval'): 
-                    self.worker.model.eval()
-                    
-                with torch.no_grad():
-                    z_pred_full = self.worker.model.predict(X_test)
-                    
-                pred_full = self.worker.iz_scaler.inverse_transform(z_pred_full)
-                pred_params = pred_full.flatten()
-                pred_img = self.worker.image_model.params_to_image(pred_params, total_charge)
-                if self.worker.manual_SYAG:
-                    pred_img = self.worker.apply_manual_SYAG_cut(pred_img, offline_syag_array = self.SYAG_daq_images[i], offline_syag_width = self.SYAG_daq_images[i].shape[1])
+                captured_image[0] = None
+                if(self.worker.n_eslice != 0 or self.worker.manual_SYAG):
+                    offline_syag_array = self.SYAG_daq_images[i]
+                    offline_syag_width = self.SYAG_daq_images[i].shape[1]
+                    self.worker.emit_prediction(scaled_predictor, total_charge, real_time=False, offline_syag_array=offline_syag_array, offline_syag_width=offline_syag_width)
+                else:
+                    self.worker.emit_prediction(scaled_predictor, total_charge)
+                pred_img = captured_image[0]
             pred_img = np.sum(pred_img, axis = 0)/ xtcalibrationfactor * 1.602e-4 # 1.602e-19 [C]/1e-15 [s]
             if self.flip_image_time:
                 pred_img = np.flip(pred_img)
             all_pred_imgs.append(pred_img)
+
+        if mode != "cmp_truth":
+            try:
+                self.worker.new_prediction_signal.disconnect(capture_prediction)
+            except Exception:
+                pass
+            # Reconnect to the previous handler based on mode
+            if mode == "daq":
+                self.worker.new_prediction_signal.connect(
+                    lambda data: self.update_image_display(data, 'DAQ')
+                )
+            elif mode == "cmp":
+                self.worker.new_prediction_signal.connect(
+                    lambda data: self.update_image_display(data, 'cmp_pred')
+                )
         # Convert to numpy arrays for export
         model_path = ""
         if self.worker is not None:
