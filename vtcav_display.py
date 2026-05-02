@@ -731,7 +731,7 @@ class VTCAVDisplay(Display):
         
     def export_compare(self):
         if self.worker is not None:
-            self.export_current_profile(mode="cmp")
+            self.export_current_profile(mode="cmp_pred")
         self.export_current_profile(mode="cmp_truth")
         
     def set_manual_SYAG(self, checked):
@@ -907,7 +907,7 @@ class VTCAVDisplay(Display):
         base_path = file_path.rsplit('.', 1)[0]
         if(mode == "daq"):
             scal_common_idx = self.goodShots_scal_common_idx
-        elif (mode == "cmp"):
+        elif (mode == "cmp_pred"):
             scal_common_idx = self.goodShots_scal_common_idx_cmp
         elif (mode == "cmp_truth"):
             scal_common_idx = self.goodShots_scal_common_idx_cmp
@@ -978,7 +978,7 @@ class VTCAVDisplay(Display):
                 self.worker.new_prediction_signal.connect(
                     lambda data: self.update_image_display(data, 'DAQ')
                 )
-            elif mode == "cmp":
+            elif mode == "cmp_pred":
                 self.worker.new_prediction_signal.connect(
                     lambda data: self.update_image_display(data, 'cmp_pred')
                 )
