@@ -53,6 +53,25 @@ from F2_pytools.controls_jurisdiction import is_SLC
 
 HOME_DIR = pathlib.Path(__file__).parent
 
+# Output EPICS PVs for real-time write-back of ML-computed beam diagnostics
+SEPARATION_PV = 'SIOC:SYS1:ML00:AO542'  # Computed bunch separation [µm]
+BLEN1_PV      = 'SIOC:SYS1:ML00:AO543'  # Computed first bunch length [µm]
+BLEN2_PV      = 'SIOC:SYS1:ML00:AO544'  # Computed second bunch length [µm]
+
+# Physical constants
+C_UM_PER_FS = 0.299792458   # Speed of light in micrometres per femtosecond
+C_M_PER_S   = 3e8            # Speed of light in metres per second
+
+# Charge conversion factors
+ELEMENTARY_CHARGE_C = 1.602e-19  # Charge of one electron [Coulombs]
+# Pixel-integrated TMIT → current in Amperes:
+#   pixel_sum / calibration_fs_per_pix [fs] × CURRENT_CONVERSION_A = current [A]
+#   Derivation: 1.602e-19 C/electron ÷ 1e-15 s/fs = 1.602e-4 A·fs
+CURRENT_CONVERSION_A = 1.602e-4
+# TMIT [electrons] → picocoulombs:
+#   Derivation: 1.602e-19 C/electron × 1e12 pC/C ≈ 1.6e-7 pC/electron
+TMIT_TO_PC = 1.6e-7
+
 class InferenceWorker(QThread):
     new_prediction_signal = Signal(np.ndarray)
     new_pv_values = Signal(np.ndarray, np.ndarray, str)
