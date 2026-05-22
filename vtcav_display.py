@@ -22,6 +22,7 @@ import torch
 from scipy.io import loadmat, savemat
 from scipy.optimize import curve_fit
 from scipy.ndimage import center_of_mass, shift, zoom
+from scipy.signal import find_peaks
 
 from Python_Functions.functions import cropProfmonImg, find_2d_mask_intervals, map_xtcav_to_syag, matstruct_to_dict, extractDAQBSAScalars, extractDAQNonBSAScalars, segment_centroids_and_com, apply_tcav_zeroing_filter, apply_centroid_correction, extract_processed_images, sanitize_FACET_input
 from Python_Functions.cvae import CVAE, vae_loss, smooth_cvae_output
@@ -36,6 +37,9 @@ from pydm import Display
 import pyqtgraph as pg
 
 
+import matplotlib.pyplot as plt
+from datetime import datetime
+
 # Constants for FACET-II/BSA Timing
 PID_MASK = 0x1FFFF  
 PID_MODULUS = 0x20000 
@@ -43,6 +47,8 @@ BSA_BUFFER_LENGTH = 2800
 EMPTY_BUFFER = np.zeros(BSA_BUFFER_LENGTH)
 CHARGE_PV_C = 'TORO:LI20:2452:TMIT'
 CHARGE_PV_U = 'TORO_LI20_2452_TMIT'
+BLEN1_PV = 'BLEN:LI11:359:BRAW'
+BLEN2_PV = 'BLEN:LI14:888:BRAW'
 SYAG_PV = 'CAMR:LI20:100:Image'
         
 # DAQ Constants
@@ -411,9 +417,11 @@ class InferenceWorker(QThread):
                 self.new_prediction_signal.emit(image_data)
             separation_um, blen1_um, blen2_um = self.fit_sep_um(image_data)
             if real_time:
-                epics.caput("SIOC:SYS1:ML00:AO542", separation_um)
-                epics.caput("SIOC:SYS1:ML00:AO543", blen1_um)
-                epics.caput("SIOC:SYS1:ML00:AO544", blen2_um)
+                # Convert any NaNs to 0.0
+                l_sep, l_b1, l_b2 = np.nan_to_num([separation_um, blen1_um, blen2_um], nan=0.0)
+                epics.caput("SIOC:SYS1:ML00:AO542", l_sep)
+                epics.caput("SIOC:SYS1:ML00:AO543", l_b1)
+                epics.caput("SIOC:SYS1:ML00:AO544", l_b2)
             self._log(f"New Prediction Emitted. Charge: {total_charge*1.6e-7} pC, Separation: {separation_um} um.")
         except Exception as e:
             raise e
@@ -499,65 +507,85 @@ class InferenceWorker(QThread):
             return x_proj
         return None
     
-        
     def fit_sep_um(self, image_data):
         """
-        Calculates the horizontal projection of the image, fits a double Gaussian,
-        and returns the peak separation in micrometers (um).
+        Calculates the horizontal projection of the image, identifies 1 or 2 distinct 
+        clusters using peak finding, and computes separation and bunch lengths 
+        based on the Center of Mass (CoM) and variance.
         """
         # 1. Get the horizontal projection (1D array)
-        # Summing across rows (axis=0) to get the profile along the x-axis
         x_proj = np.sum(image_data, axis=0)
-        x_indices = np.arange(len(x_proj))
         
-        # 2. Define the Double Gaussian function
-        def double_gaussian(x, a1, mu1, sigma1, a2, mu2, sigma2, c):
-            return (a1 * np.exp(-((x - mu1)**2) / (2 * sigma1**2)) +
-                    a2 * np.exp(-((x - mu2)**2) / (2 * sigma2**2)) + c)
-        
-        # 3. Formulate initial guesses [a1, mu1, sigma1, a2, mu2, sigma2, c]
-        # Providing a decent starting point (p0) prevents curve_fit from failing.
-        # We guess the two peaks are roughly at 1/3 and 2/3 of the window width.
+        # Subtract baseline to ensure background noise doesn't artificially inflate the sigma (bunch length)
+        x_proj = x_proj - np.min(x_proj)
         max_val = np.max(x_proj)
-        min_val = np.min(x_proj)
-        length = len(x_indices)
         
-        p0 = [
-            max_val, length * 0.33, length * 0.1,  # Peak 1: Amp, Center, Width
-            max_val, length * 0.66, length * 0.1,  # Peak 2: Amp, Center, Width
-            min_val                                # Baseline offset
-        ]
+        if max_val <= 0:
+            return np.nan, np.nan, np.nan
+    
+        # 2. Find peaks. 
+        # prominence=0.15*max_val ensures we only find major clusters, ignoring noise bumps.
+        # distance=10 ensures a single ragged peak isn't counted twice.
+        peaks, _ = find_peaks(x_proj, prominence=max_val * 0.06, distance=10)
+        # Helper to compute Center of Mass and Sigma for a slice of the projection
+        def calc_com_sigma(y_arr, start_idx):
+            mass = np.sum(y_arr)
+            if mass <= 0:
+                return 0.0, 0.0
+                
+            # Reconstruct true pixel indices for this slice
+            indices = np.arange(start_idx, start_idx + len(y_arr))
+            
+            # Center of mass (mean)
+            com = np.sum(indices * y_arr) / mass
+            
+            # Variance and Sigma
+            variance = np.sum(y_arr * (indices - com)**2) / mass
+            sigma = np.sqrt(variance) if variance > 0 else 0.0
+            
+            return com, sigma
+    
+        # 3. Process based on the number of clusters identified
+        if len(peaks) == 1:
+            # Single Cluster
+            com, sigma = calc_com_sigma(x_proj, 0)
+            pixel_separation = np.nan
+            blen1_px = 2 * sigma
+            blen2_px = np.nan
+    
+        elif len(peaks) == 2:
+            # Two Clusters
+            p1, p2 = sorted(peaks) # Ensure left-to-right ordering
+            
+            # Find the valley (minimum) between the two peaks
+            valley_local_idx = np.argmin(x_proj[p1:p2])
+            valley_idx = p1 + valley_local_idx
+            
+            # Split into Cluster 1 (Left) and Cluster 2 (Right)
+            y1 = x_proj[:valley_idx]
+            y2 = x_proj[valley_idx:]
+            
+            com1, sig1 = calc_com_sigma(y1, 0)
+            com2, sig2 = calc_com_sigma(y2, valley_idx)
+            
+            pixel_separation = abs(com2 - com1)
+            blen1_px = 2 * sig1
+            blen2_px = 2 * sig2
+    
+        else:
+            # 0 or >2 distinct clusters found
+            return np.nan, np.nan, np.nan
+    
+        # 4. Convert pixels to time (fs) then to distance (um)
+        c_um_per_fs = 0.299792458
         
-        # 4. Fit the curve
-        try:
-            popt, _ = curve_fit(double_gaussian, x_indices, x_proj, p0=p0)
-            
-            # Extract the fitted centers (means) of the two peaks
-            mu1 = popt[1]
-            sigma1 = popt[2]
-            mu2 = popt[4]
-            sigma2 = popt[5]
-            
-            # Calculate the absolute separation in pixels
-            pixel_separation = abs(mu1 - mu2)
-            blen1 = abs(2*sigma1)
-            blen2 = abs(2*sigma2)
-            # 5. Convert to micrometers (um)
-            # Convert pixels to time (fs) using the calibration factor
-            time_separation_fs = pixel_separation * self.xtcalibrationfactor_fs
-            blen1_fs = blen1 * self.xtcalibrationfactor_fs
-            blen2_fs = blen2 * self.xtcalibrationfactor_fs
-            # Convert time (fs) to distance (um) using the speed of light
-            # c = 299,792,458 m/s ≈ 0.29979 um/fs
-            separation_um = time_separation_fs * 0.299792458
-            blen1_um = blen1_fs * 0.299792458
-            blen2_um = blen2_fs * 0.299792458
-            
-            return separation_um, blen1_um, blen2_um
-            
-        except RuntimeError:
-            self._log("Warning: Double Gaussian curve fit failed to converge.")
-            return 0.0, 0.0, 0.0  # Return 0 or None if the fit fails to find peaks
+        # Note: Math operations with np.nan safely propagate the NaN
+        separation_um = (pixel_separation * self.xtcalibrationfactor_fs) * c_um_per_fs
+        blen1_um = (blen1_px * self.xtcalibrationfactor_fs) * c_um_per_fs
+        blen2_um = (blen2_px * self.xtcalibrationfactor_fs) * c_um_per_fs
+    
+        return separation_um, blen1_um, blen2_um
+
 
     def _setup_distance_metrics(self):
         """
@@ -648,7 +676,7 @@ class VTCAVDisplay(Display):
         self.cvae_proj_log_strength = 0
 
     def ui_filename(self):
-        return "vtcav_display.ui"
+        return "vtcav_xleap_display.ui"
 
     def setup_model_ui(self):
         """Populate modelName combobox with files from ./models/"""
@@ -697,7 +725,8 @@ class VTCAVDisplay(Display):
         # Tab 6: Preprocess XTCAV Image - Write Processed File
         # This handler would likely read the ROI/Range inputs (xroiMin, xroiMax, etc.)
         self.ui.preprocessWriteButton.clicked.connect(self.handle_preprocess_write)
-
+        self.ui.oneClickButton.clicked.connect(self.handle_one_click_pipeline)
+        
         # Tab 5: Train New Model - Load Preprocessed Data
         self.ui.preprocessLoadButton.clicked.connect(self.handle_preprocess_load)
 
@@ -801,6 +830,8 @@ class VTCAVDisplay(Display):
         Iterates through all loaded compare shots, generates silent predictions,
         and computes the correlation between the truth and predicted image 
         separations, blen1, and blen2.
+        Additionally, computes feature correlations, generates scatter/2D plots,
+        and saves all results to a localized directory.
         """
         
         if not hasattr(self, 'compare_truth_data') or self.predictors is None:
@@ -818,18 +849,53 @@ class VTCAVDisplay(Display):
             self.handle_log("Error: Worker or var_names not initialized.")
             return
         
+        # --- Create Output Directory ---
+        model_path = getattr(self.worker, 'model_path', 'UnknownModel')
+        # .stem automatically gets the final path component without its suffix
+        model_name =  pathlib.Path(model_path).stem
+
+
+        daq_path = getattr(self, 'daq_dataloc', 'UnknownDAQ')
+        daq_name = os.path.basename(str(daq_path)).split('.')[0]
+        
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        save_dir = f"{model_name}_{daq_name}_eval_{timestamp}"
+        os.makedirs(save_dir, exist_ok=True)
+        
+        log_file_path = os.path.join(save_dir, "evaluation_log.txt")
+        
+        def custom_log(msg):
+            """Logs to UI and saves to the output text file simultaneously."""
+            self.handle_log(msg)
+            with open(log_file_path, "a") as f:
+                f.write(msg + "\n")
+
+        custom_log(f"Output directory created: {save_dir}")
+
         # Show a status message if it takes a moment
         if hasattr(self, 'updateStatus'):
             self.updateStatus(f"Computing correlations across {num_frames} shots...")
+        # --- NEW: Helper function to check fit validity ---
+        def is_valid_fit(sep, b1, b2):
+            if sep is None or b1 is None or b2 is None: 
+                return False
+            if np.isnan(sep) or np.isnan(b1) or np.isnan(b2): 
+                return False
+            # Optional: Add physical constraints if needed (e.g., if sep <= 0)
+            return True
+
+        valid_daq_indices = [] # Keep track of daq indices that survived the fit
 
         for i in range(num_frames):
             # --- 1. Process Truth Image ---
             truth_img = self.compare_truth_data[i]
+            if (self.compare_truth_phase_class[i]==90):
+                truth_img = self.compare_truth_data[i]
+            elif (self.compare_truth_phase_class[i]==-90):
+                truth_img = np.flip(self.compare_truth_data[i], axis = 1) # Flip the image to match streaking direction
+            else:
+                truth_img = np.zeros_like(self.compare_truth_data[i]) # No streaking image, zero it to avoid confusion.
             t_sep, t_b1, t_b2 = self.worker.fit_sep_um(truth_img)
-            
-            truth_seps.append(t_sep)
-            truth_b1s.append(t_b1)
-            truth_b2s.append(t_b2)
 
             # --- 2. Process Prediction Image ---
             # Get the exact DAQ index corresponding to this truth shot
@@ -837,12 +903,13 @@ class VTCAVDisplay(Display):
             
             # Extract total charge
             total_charge = None
-            if CHARGE_PV_C in self.predictor_vars:
-                charge_idx = self.predictor_vars.index(CHARGE_PV_C)
+            if hasattr(self, 'predictor_vars') and 'CHARGE_PV_C' in self.predictor_vars:
+                charge_idx = self.predictor_vars.index('CHARGE_PV_C')
                 total_charge = self.predictors[daq_idx, charge_idx]
 
             # Extract and scale DAQ predictor data
             scaled_predictor, filtered_predictor = self.get_scaled_predictor(daq_idx)
+            
             # Run the model silently (no UI signals)
             X_test = torch.tensor(scaled_predictor, dtype=torch.float32)
             
@@ -859,36 +926,240 @@ class VTCAVDisplay(Display):
             # Fit the predicted image
             p_sep, p_b1, p_b2 = self.worker.fit_sep_um(pred_img)
             
+            # --- 3. Validate Both Fits ---
+            if not is_valid_fit(t_sep, t_b1, t_b2) or not is_valid_fit(p_sep, p_b1, p_b2):
+                self.handle_log(f"Shot {i} excluded: Fit failed on truth or prediction.")
+                continue # Skip appending and move to the next shot
+
+            # --- 4. Append Data (Only for successful fits) ---
+            truth_seps.append(t_sep)
+            truth_b1s.append(t_b1)
+            truth_b2s.append(t_b2)
+            
             pred_seps.append(p_sep)
             pred_b1s.append(p_b1)
             pred_b2s.append(p_b2)
+            
+            valid_daq_indices.append(daq_idx) # Save the synced predictor index
 
-        # --- 3. Compute Correlations ---
-        # np.corrcoef returns a 2x2 matrix; [0, 1] is the correlation coefficient
-        # We use a helper to handle cases where standard deviation might be 0
-        def safe_correlation(x, y):
-            if np.std(x) == 0 or np.std(y) == 0:
-                return 0.0
-            return np.corrcoef(x, y)[0, 1]
+        # Convert to numpy arrays for easier plotting and analysis
+        truth_seps, pred_seps = np.array(truth_seps), np.array(pred_seps)
+        truth_b1s, pred_b1s = np.array(truth_b1s), np.array(pred_b1s)
+        truth_b2s, pred_b2s = np.array(truth_b2s), np.array(pred_b2s)
 
-        corr_sep = safe_correlation(truth_seps, pred_seps)
-        corr_b1 = safe_correlation(truth_b1s, pred_b1s)
-        corr_b2 = safe_correlation(truth_b2s, pred_b2s)
+        # Retrieve matched predictors block using ONLY the indices that had valid fits
+        matched_predictors = self.predictors[valid_daq_indices]
+        
+        valid_count = len(valid_daq_indices)
+        custom_log(f"Successfully fit {valid_count} out of {num_frames} shots.")
+        
+        if valid_count == 0:
+            custom_log("Error: No valid fits found across all shots. Aborting correlation.")
+            return 0.0, 0.0, 0.0
 
-        # Output the results
-        self.handle_log(f"\n--- Correlation Results ({num_frames} shots) ---")
-        self.handle_log(f"Separation (um) Correlation: {corr_sep:.4f}")
-        self.handle_log(f"Separation average of truth: {np.mean(truth_seps):.2f} um, average of prediction: {np.mean(pred_seps):.2f} um")
-        self.handle_log(f"Bunch Length 1 Correlation:  {corr_b1:.4f}")
-        self.handle_log(f"Bunch Length 1 average of truth: {np.mean(truth_b1s):.2f} um, average of prediction: {np.mean(pred_b1s):.2f} um")
-        self.handle_log(f"Bunch Length 2 Correlation:  {corr_b2:.4f}")
-        self.handle_log(f"Bunch Length 2 average of truth: {np.mean(truth_b2s):.2f} um, average of prediction: {np.mean(pred_b2s):.2f} um")
-        self.handle_log("------------------------------------------\n")
+
+        # --- 3. Compute General Correlations ---
+        def safe_correlation(target_y, predictor_x):
+            """Returns (correlation, slope)"""
+            std_y = np.std(target_y)
+            std_x = np.std(predictor_x)
+            
+            if std_x == 0 or std_y == 0:
+                return 0.0, 0.0
+                
+            r = np.corrcoef(predictor_x, target_y)[0, 1]
+            slope = r * (std_y / std_x)
+            return r, slope
+
+        corr_sep, _ = safe_correlation(truth_seps, pred_seps)
+        corr_b1, _ = safe_correlation(truth_b1s, pred_b1s)
+        corr_b2, _ = safe_correlation(truth_b2s, pred_b2s)
+
+        custom_log(f"\n--- Correlation Results ({num_frames} shots) ---")
+        custom_log(f"Separation (um) Correlation: {corr_sep:.4f}")
+        custom_log(f"Separation avg truth: {np.mean(truth_seps):.2f} um | pred: {np.mean(pred_seps):.2f} um")
+        custom_log(f"Bunch Length 1 Correlation:  {corr_b1:.4f}")
+        custom_log(f"Bunch Length 1 avg truth: {np.mean(truth_b1s):.2f} um | pred: {np.mean(pred_b1s):.2f} um")
+        custom_log(f"Bunch Length 2 Correlation:  {corr_b2:.4f}")
+        custom_log(f"Bunch Length 2 avg truth: {np.mean(truth_b2s):.2f} um | pred: {np.mean(pred_b2s):.2f} um")
+        custom_log("------------------------------------------\n")
+
+        # --- 4. Input-to-Output Correlation Analysis (Top 10) ---
+        def get_top_correlations(target_array, name):
+            corrs = []
+            for i in range(matched_predictors.shape[1]):
+                predictor_arr = matched_predictors[:, i]
+                c, slope = safe_correlation(target_array, predictor_arr)
+                
+                # Calculate the total effect: slope * (90th percentile - 10th percentile)
+                p90 = np.percentile(predictor_arr, 90)
+                p10 = np.percentile(predictor_arr, 10)
+                total_effect = slope * (p90 - p10)
+                
+                # Store as a 3-element tuple
+                corrs.append((self.predictor_vars[i], c, total_effect))
+            
+            # Sort descending by absolute correlation
+            corrs.sort(key=lambda x: abs(x[1]), reverse=True)
+            top_10 = corrs[:10]
+            
+            custom_log(f"\nTop 10 predictor correlations with {name}:")
+            for var_name, c, effect in top_10:
+                custom_log(f"  {var_name}: Corr = {c:+.4f} | Total Effect = {abs(effect):+.4f} um")
+                
+            return top_10
+
+
+        top_vars_sep = get_top_correlations(truth_seps, "Truth Separation")
+        top_vars_b1 = get_top_correlations(truth_b1s, "Truth Bunch Length 1")
+        top_vars_b2 = get_top_correlations(truth_b2s, "Truth Bunch Length 2")
+
+        # --- 5. Generate Scatter Plots (Truth vs Pred) ---
+        def plot_scatter(truth, pred, name, filename):
+            plt.figure(figsize=(6, 6))
+            plt.scatter(truth, pred, alpha=0.6, edgecolors='k')
+            
+            # Add identity line y=x
+            min_val = min(np.min(truth), np.min(pred))
+            max_val = max(np.max(truth), np.max(pred))
+            plt.plot([min_val, max_val], [min_val, max_val], 'r--', label='y=x')
+            
+            plt.title(f"{name}: Truth vs Prediction")
+            plt.xlabel(f"Truth {name} (um)")
+            plt.ylabel(f"Predicted {name} (um)")
+            plt.legend()
+            plt.grid(True, linestyle=':', alpha=0.7)
+            plt.tight_layout()
+            plt.savefig(os.path.join(save_dir, filename))
+            plt.close()
+
+        plot_scatter(truth_seps, pred_seps, "Separation", "scatter_sep.png")
+        plot_scatter(truth_b1s, pred_b1s, "Bunch Length 1", "scatter_b1.png")
+        plot_scatter(truth_b2s, pred_b2s, "Bunch Length 2", "scatter_b2.png")
+
+        # --- 6. Generate 2D Color Plots ---
+        def plot_2d_color(truth, pred, top_vars, name, filename_prefix):
+            if len(top_vars) < 2: return
+            
+            var1_name = top_vars[0][0]
+            var1_idx = self.predictor_vars.index(var1_name)
+            var1_data = matched_predictors[:, var1_idx]
+
+            # Default to the 2nd best if no independent variable is found
+            var2_name = top_vars[1][0] 
+            var2_idx = self.predictor_vars.index(var2_name)
+
+            # Iterate through the rest of top_vars to find a minimally correlated var2.
+            # We'd like to avoid degeneracy in color plots.
+            for i in range(1, len(top_vars)):
+                candidate_name = top_vars[i][0]
+                candidate_idx = self.predictor_vars.index(candidate_name)
+                candidate_data = matched_predictors[:, candidate_idx]
+                
+                # Check standard deviation to prevent numpy warnings/NaNs on constant arrays
+                if np.std(var1_data) > 0 and np.std(candidate_data) > 0:
+                    r_val = np.corrcoef(var1_data, candidate_data)[0, 1]
+                    r_squared = r_val ** 2
+                    
+                    if r_squared < 0.3:
+                        var2_name = candidate_name
+                        var2_idx = candidate_idx
+                        break
+
+            
+            x_data = matched_predictors[:, var1_idx]
+            y_data = matched_predictors[:, var2_idx]
+            
+            fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 6))
+            
+            # Common colorbar limits to guarantee identical visual scales
+            vmin = min(np.min(truth), np.min(pred))
+            vmax = max(np.max(truth), np.max(pred))
+            
+            # Truth Plot
+            sc1 = ax1.scatter(x_data, y_data, c=truth, cmap='plasma', vmin=vmin, vmax=vmax, alpha=0.8, edgecolors='k', linewidth=0.5)
+            ax1.set_title(f"Truth: {name}")
+            ax1.set_xlabel(var1_name)
+            ax1.set_ylabel(var2_name)
+            fig.colorbar(sc1, ax=ax1, label=f"{name} (um)")
+            ax1.grid(True, linestyle=':', alpha=0.5)
+            
+            # Prediction Plot
+            sc2 = ax2.scatter(x_data, y_data, c=pred, cmap='plasma', vmin=vmin, vmax=vmax, alpha=0.8, edgecolors='k', linewidth=0.5)
+            ax2.set_title(f"Prediction: {name}")
+            ax2.set_xlabel(var1_name)
+            ax2.set_ylabel(var2_name)
+            fig.colorbar(sc2, ax=ax2, label=f"{name} (um)")
+            ax2.grid(True, linestyle=':', alpha=0.5)
+            
+            plt.tight_layout()
+            plt.savefig(os.path.join(save_dir, f"{filename_prefix}_2d.png"))
+            plt.close()
+
+        plot_2d_color(truth_seps, pred_seps, top_vars_sep, "Separation", "color_sep")
+        plot_2d_color(truth_seps, pred_seps, [[BLEN1_PV],[BLEN2_PV]], "Separation", "color_sep_L1L2")
+        plot_2d_color(truth_b1s, pred_b1s, top_vars_b1, "Bunch Length 1", "color_b1")
+        plot_2d_color(truth_b2s, pred_b2s, top_vars_b2, "Bunch Length 2", "color_b2")
+        
+        # --- 7. Generate Predictor Correlation Matrix Plot ---
+        def plot_correlation_matrix():
+            # 1. Take the union of the variable names from all three top 10 lists
+            # top_vars are lists of tuples: (var_name, correlation_value)
+            set_sep = {item[0] for item in top_vars_sep}
+            set_b1 = {item[0] for item in top_vars_b1}
+            set_b2 = {item[0] for item in top_vars_b2}
+            
+            # Combine into a single unique list and sort alphabetically for a clean matrix
+            unique_vars = sorted(list(set_sep | set_b1 | set_b2))
+            n_vars = len(unique_vars)
+            
+            if n_vars == 0:
+                custom_log("No significant predictors found to plot correlation matrix.")
+                return
+
+            # 2. Extract the indices and corresponding data
+            var_indices = [self.predictor_vars.index(name) for name in unique_vars]
+            selected_data = matched_predictors[:, var_indices]
+            
+            # 3. Compute the n x n correlation matrix
+            # np.corrcoef expects variables as rows and observations as columns, so we transpose (.T)
+            corr_matrix = np.corrcoef(selected_data.T)
+            
+            # 4. Plot the heatmap
+            # Use a diverging colormap (coolwarm or RdBu) bounded from -1 to 1
+            plt.figure(figsize=(max(8, n_vars * 0.4), max(7, n_vars * 0.4)))
+            plt.imshow(corr_matrix, cmap='coolwarm', vmin=-1, vmax=1, aspect='auto')
+            cbar = plt.colorbar()
+            cbar.set_label("Correlation Coefficient", rotation=270, labelpad=15)
+            
+            # Set up axes ticks and labels
+            plt.xticks(np.arange(n_vars), unique_vars, rotation=45, ha='right', fontsize=8)
+            plt.yticks(np.arange(n_vars), unique_vars, fontsize=8)
+            
+            plt.title(f"Predictor Correlation Matrix ({n_vars} variables)")
+            
+            # Add gridlines to separate cells clearly
+            ax = plt.gca()
+            ax.set_xticks(np.arange(-.5, n_vars, 1), minor=True)
+            ax.set_yticks(np.arange(-.5, n_vars, 1), minor=True)
+            ax.grid(which="minor", color="w", linestyle='-', linewidth=1)
+            ax.tick_params(which="minor", bottom=False, left=False)
+            
+            plt.tight_layout()
+            plt.savefig(os.path.join(save_dir, "predictor_correlation_matrix.png"), dpi=150)
+            plt.close()
+            
+            custom_log(f"Saved correlation matrix plot for {n_vars} unique variables.")
+
+        # Call the matrix plotting function
+        plot_correlation_matrix()
 
         if hasattr(self, 'updateStatus'):
             self.updateStatus("Ready")
-
+            
+        self.last_save_dir = save_dir
         return corr_sep, corr_b1, corr_b2
+
     
     def export_current_profile(self, mode):
         """
@@ -1341,6 +1612,229 @@ class VTCAVDisplay(Display):
         except Exception as e:
             self.handle_log(f"Error initializing data from {file_path}: {e}")
 
+    def handle_one_click_pipeline(self):
+        """
+        Executes the entire workflow in one click:
+        1. Preprocesses DAQ data.
+        2. Trains a CVAE16+WRF model.
+        3. Loads the newly trained model.
+        4. Loads the preprocessed data as compare truth.
+        5. Computes correlations.
+        """
+        
+        # --- Step 0: Extract Inputs and Generate Auto-Paths ---
+        thedaq_file_path = self.ui.tcavDaqFilePath.text()
+        if not thedaq_file_path:
+            self.handle_log("Pipeline Error: No DAQ file selected.")
+            return
+
+        try:
+            x_min = int(self.ui.xroiMin.toPlainText())
+            x_max = int(self.ui.xroiMax.toPlainText())
+            y_min = int(self.ui.yroiMin.toPlainText())
+            y_max = int(self.ui.yroiMax.toPlainText())
+            
+            x_range_val = int(self.ui.xrangeTimesTwo.toPlainText()) // 2
+            y_range_val = int(self.ui.yrangeTimesTwo.toPlainText()) // 2
+        except ValueError:
+            self.handle_log("Pipeline Error: Please ensure all ROI and Range fields contain valid integers.")
+            return
+
+        # Auto-generate paths to bypass UI dialogs
+        daq_path_obj = pathlib.Path(thedaq_file_path)
+        prep_filename = daq_path_obj.name.replace(".mat", "_preprocessed.pkl")
+        prep_file_path = str(HOME_DIR / prep_filename)
+        
+        model_filename = prep_filename.replace('.pkl', '_CVAE16+WRF_data.pkl')
+        model_file_path = str(HOME_DIR / "models" / model_filename)
+
+        self.handle_log("\n=== STARTING AUTOMATED PIPELINE ===")
+
+        # --- Step 1: Preprocess and Save ---
+        self.updateStatus("Step 1: Preprocessing...")
+        self.handle_log(f"Preprocessing {daq_path_obj.name} -> {prep_filename}")
+        self.ui.preprocessWritePath.setText(prep_file_path)
+        
+        try:
+            self.preprocess_and_save_lps(
+                daq_file_path=thedaq_file_path,
+                x_roi=(x_min, x_max),
+                y_roi=(y_min, y_max),
+                xrange=x_range_val,
+                yrange=y_range_val,
+                output_file_path=prep_file_path
+            )
+        except Exception as e:
+            self.handle_log(f"Pipeline Failed during preprocessing: {e}")
+            return
+
+        # --- Step 2: Train Model (CVAE16+WRF) ---
+        self.updateStatus("Step 2: Training Model...")
+        self.handle_log(f"Training CVAE16+WRF -> {model_filename}")
+        self.ui.modelWritePath.setText(model_file_path)
+        
+        try:
+            self.train_model_cvae_wrf(
+                run_pairs=[prep_file_path], 
+                n_comp=16, 
+                output_file_path=model_file_path
+            )
+            self.setup_model_ui() # Refresh the UI dropdown
+        except Exception as e:
+            self.handle_log(f"Pipeline Failed during model training: {e}")
+            return
+
+        # --- Step 3: Load the Freshly Trained Model ---
+        self.updateStatus("Step 3: Loading Model...")
+        self.handle_log("Loading new model and initializing worker...")
+        
+        # Clean up existing worker
+        if self.worker is not None:
+            self.worker.stop()
+            try:
+                self.worker.new_prediction_signal.disconnect()
+                self.worker.new_confidence_signal.disconnect()
+            except Exception:
+                pass
+            try:
+                self.worker.new_pv_values.disconnect()
+            except Exception:
+                pass
+            self.ui.startPauseButton.setText("Start")
+
+        self.current_model_path = model_file_path
+        
+        try:
+            self.worker = InferenceWorker(self.current_model_path)
+            self.worker.new_pv_values.connect(self.update_pv_values)
+            self.setup_pv_table()
+            self.ui.doManualSYAG.setChecked(self.worker.manual_SYAG)
+            
+            # Sync the UI ComboBox to show the newly trained model
+            index = self.ui.modelName.findText(model_filename)
+            if index >= 0:
+                self.ui.modelName.setCurrentIndex(index)
+        except Exception as e:
+            self.handle_log(f"Pipeline Failed during model loading: {e}")
+            self.worker = None
+            return
+
+        # Make sure Manual SYAG Cut is disabled.
+        self.ui.doManualSYAG.setChecked(False)
+        
+        # --- Step 4: Load Compare Data ---
+        self.updateStatus("Step 4: Loading Compare Data...")
+        self.handle_log(f"Loading {prep_filename} for comparison...")
+        if hasattr(self.ui, 'preprocessFilePath_cmp'):
+            self.ui.preprocessFilePath_cmp.setText(prep_file_path)
+        
+        try:
+            self.load_compare_data(prep_file_path)
+        except Exception as e:
+            self.handle_log(f"Pipeline Failed during compare data loading: {e}")
+            return
+
+        # --- Step 5: Compute Correlations ---
+        self.updateStatus("Step 5: Computing Correlations...")
+        self.handle_log("Computing compare correlations...")
+        try:
+            self.compute_compare_correlations()
+        except Exception as e:
+            self.handle_log(f"Pipeline Failed during correlation computation: {e}")
+            return
+
+        # --- Step 6: Read Outputs and Post to Elog ---
+        self.updateStatus("Step 6: Posting to Elog...")
+        self.handle_log("Reading correlation summary and posting to elog...")
+        
+        try:
+            import physicselog
+            import glob
+            
+            output_dir = getattr(self, 'last_save_dir', None)
+            
+            if not output_dir or not os.path.exists(output_dir):
+                self.handle_log("Warning: Could not locate correlation output directory. Skipping elog.")
+            else:
+                # 1. Build the ASCII-only message
+                msg_lines = [
+                    "Virtual TCAV Longitudinal Diagnosis Summary",
+                    f"DAQ File: {daq_path_obj.name}",
+                    f"Model: CVAE16+WRF",
+                    "-" * 40,
+                    ""
+                ]
+                
+                # Find the primary summary text file in the output directory
+                txt_files = glob.glob(os.path.join(output_dir, "*.txt"))
+                if txt_files:
+                    with open(txt_files[0], 'r', encoding='utf-8') as f:
+                        raw_text = f.read()
+                        # Force strict ASCII: ignores unicode characters like µ, ±, ², ° 
+                        ascii_text = raw_text.encode('ascii', 'ignore').decode('ascii')
+                        msg_lines.append(ascii_text)
+                else:
+                    msg_lines.append("No summary text file found in the output directory.")
+                
+                msg = "\n".join(msg_lines)
+
+                # 2. Merge the images to attach
+                from PIL import Image
+
+                # 2. Find all available PNG images to attach
+                img_paths = glob.glob(os.path.join(output_dir, "*.png"))
+                
+                if img_paths:
+                    # Load all images using Pillow
+                    images = [Image.open(p) for p in img_paths]
+                    
+                    # Calculate final dimensions
+                    max_width = max(img.width for img in images)
+                    total_height = sum(img.height for img in images)
+                    
+                    # Create a blank canvas
+                    merged_image = Image.new("RGBA", (max_width, total_height))
+                    
+                    # Paste each image vertically
+                    current_y = 0
+                    for img in images:
+                        merged_image.paste(img, (0, current_y))
+                        current_y += img.height
+                    
+                    # Save the new merged image
+                    output_path = os.path.join(output_dir, "merged_output.png")
+                    merged_image.save(output_path)
+                    
+                    # Set your path variable for the posting logic
+                    img_path = output_path
+                else:
+                    img_path = None  # Fallback if no PNGs exist
+
+                # 3. Post an entry to the elog
+                title = f"Virtual TCAV Longitudinal Diagnosis Summary: {daq_path_obj.name}"
+                category = "Virtual TCAV"
+                
+                physicselog.submit_entry(
+                    'facet', 
+                    category, 
+                    title, 
+                    msg, 
+                    img_path, 
+                    thumbnailSize=800
+                )
+                self.handle_log(f"Successfully posted to elog: {title}")
+
+        except ImportError:
+            self.handle_log("Warning: physicselog module not found. Skipping elog post.")
+        except Exception as e:
+            self.handle_log(f"Pipeline Error during elog posting: {e}")
+
+        # --- Final Cleanup ---
+        self.updateStatus("Ready")
+        self.handle_log("=== AUTOMATED PIPELINE COMPLETE ===\n")
+
+
+        
     def handle_preprocess_write(self):
         """
         Reads ROI/Range parameters from UI, asks for save location, 
@@ -1481,8 +1975,15 @@ class VTCAVDisplay(Display):
         # 3. Train Model
         # Pass the list of paths directly to run_pairs
         self.updateStatus("Training Model...")
-        if(arch == "CVAE16+WRF"):
+        if (arch == "CVAE16+WRF"):
             NCOMP = 16 # Example default
+            self.train_model_cvae_wrf(
+                run_pairs=preprocess_paths,
+                n_comp=NCOMP,
+                output_file_path=output_file_path
+            )
+        elif (arch == "CVAE8+WRF"):
+            NCOMP = 8
             self.train_model_cvae_wrf(
                 run_pairs=preprocess_paths,
                 n_comp=NCOMP,
@@ -2372,9 +2873,15 @@ class VTCAVDisplay(Display):
         images_flipped[near_minus_90_idx, :, :] = np.flip(images_tmp[near_minus_90_idx, :, :], axis=2)
 
         from Python_Functions.functions import exclude_bsa_vars
-        excluded_var_idx = exclude_bsa_vars(sorted_common_features)
+
+        # Pass the predictor array into the function
+        excluded_var_idx = exclude_bsa_vars(sorted_common_features, predictor_tmp)
+        
         bsaVarNames_cleaned = [var for i, var in enumerate(sorted_common_features) if i not in excluded_var_idx]
+        
+        # Delete the excluded indices from the array
         predictor_tmp_cleaned = np.delete(predictor_tmp, excluded_var_idx, axis=1)[lps_idx, :]
+
         self.handle_log(f"Predictor shape after excluding variables: {predictor_tmp_cleaned.shape}")
         predictor_tmp_cleaned = sanitize_FACET_input(predictor_tmp_cleaned, bsaVarNames_cleaned)
         LPSimg_prezoom = images_flipped[lps_idx]

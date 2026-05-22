@@ -1019,56 +1019,83 @@ def extractDAQNonBSAScalars(data_struct, step_list=None, filter_index=True, debu
 
     return nonBsaScalarData, nonBsaVarPVNames
 
-def exclude_bsa_vars(bsaVars):
-        """
-        Identify indices of BSA variables to exclude based on predefined names and numeric patterns.
-        This removes dependence on variables that are affected by the XTCAV settings.
-        Args:
-                bsaVars: List of BSA variable names.
-        Returns:
-                excluded_var_idx: List of indices of variables to exclude."""
-                # List of BSA variable names to exclude
-        exclude_bsa_vars = [
-                'TCAV_LI20_2400_A',  # XTCAV Amplitude
-                'TCAV_LI20_2400_P',  # XTCAV Phase
-        'TCAV_LI20_2400_ADES',  # XTCAV
-                'TCAV_LI20_2400_PDES',  # XTCAV
-        'TCAV_LI20_2400_C_1_TCTL',  # XTCAV
-                'TCAV_LI20_2400_S_AV',  # XTCAV
-        'TCAV_LI20_2400_S_PV',  # XTCAV
-        'PMT_LI20_3070_QDCRAW', # Unknown position PMT, exclude it for now.
-                'SIOC_SYS1_ML00_AO542',
-                'SIOC_SYS1_ML00_AO543',
-                'SIOC_SYS1_ML00_AO544', #Outputs of this program
-                
-        ]
-        # Search for variable names that contain four digit number larger than 3100, this is after the XTCAV.
-        for var in bsaVars:
-                match = re.search(r'(\d{4})', var)
-                if match:
-                        number = int(match.group(1))
-                        if number >= 3100:
-                                exclude_bsa_vars.append(var)
-                
-                # skip variables starting with 'SIOC', as they are unphysical
-                if var.startswith('SIOC'):
-                        exclude_bsa_vars.append(var)
-        # skip variables ending with 'BDES', as they are accompanied with BACT
-                if var.endswith('BDES'):
-                        exclude_bsa_vars.append(var)
-                if var.endswith('PDES'):
-                        exclude_bsa_vars.append(var)
-                if var.endswith('ADES'):
-                        exclude_bsa_vars.append(var)
-                if var.endswith('BCON'):
-                        exclude_bsa_vars.append(var)
+def exclude_bsa_vars(bsaVars, predictor_array=None):
+    """
+    Identify indices of BSA variables to exclude based on predefined names, 
+    numeric patterns, and highly correlated redundant variables.
+    
+    Args:
+        bsaVars: List of BSA variable names.
+        predictor_array: 2D numpy array (samples x features) to compute correlation matrix.
+                         If provided, excludes variables with R^2 > 0.9.
+    Returns:
+        excluded_var_idx: List of indices of variables to exclude.
+    """
+    # 1. Variables to NEVER exclude under any circumstances
+    never_exclude = {
+        'TORO:LI20:2452:TMIT',
+        'BLEN:LI11:359:BRAW',
+        'BLEN:LI14:888:BRAW'
+    }
 
-        #print("Excluding BSA Variables:", exclude_bsa_vars)
-        excluded_var_idx = [i for i, var in enumerate(bsaVars) if var in exclude_bsa_vars]
-        #print("Excluded variable indices:", excluded_var_idx)
-        return excluded_var_idx
+    # 2. Text-based exclusions
+    exclude_bsa_names = {
+        'TCAV_LI20_2400_A', 'TCAV_LI20_2400_P', 'TCAV_LI20_2400_ADES',
+        'TCAV_LI20_2400_PDES', 'TCAV_LI20_2400_C_1_TCTL', 'TCAV_LI20_2400_S_AV',
+        'TCAV_LI20_2400_S_PV', 'PMT_LI20_3070_QDCRAW',
+        'SIOC_SYS1_ML00_AO542', 'SIOC_SYS1_ML00_AO543', 'SIOC_SYS1_ML00_AO544'
+    }
 
-import numpy as np
+    for var in bsaVars:
+        match = re.search(r'(\d{4})', var)
+        if match and int(match.group(1)) >= 3100:
+            exclude_bsa_names.add(var)
+        elif var.startswith('SIOC'):
+            exclude_bsa_names.add(var)
+        elif var.endswith(('BDES', 'PDES', 'ADES', 'BCON')):
+            exclude_bsa_names.add(var)
+
+    # Protect the "never exclude" variables from text-based rules
+    exclude_bsa_names -= never_exclude
+
+    # Get initial exclusion indices based on text rules
+    excluded_idx_set = {i for i, var in enumerate(bsaVars) if var in exclude_bsa_names}
+
+    # 3. Correlation-based exclusions
+    if predictor_array is not None:
+        # Calculate correlation matrix (variables as rows, so we transpose)
+        # Suppress warnings for zero-variance arrays, which result in NaNs
+        with np.errstate(divide='ignore', invalid='ignore'):
+            corr_matrix = np.corrcoef(predictor_array.T)
+            corr_matrix = np.nan_to_num(corr_matrix, nan=0.0)
+            
+        n_vars = len(bsaVars)
+        
+        for i in range(n_vars):
+            if i in excluded_idx_set:
+                continue  # Already excluded, skip
+                
+            for j in range(i + 1, n_vars): # j is always the 'later' variable
+                if j in excluded_idx_set:
+                    continue
+                
+                r_squared = corr_matrix[i, j] ** 2
+                
+                if r_squared > 0.9:
+                    var_j = bsaVars[j]
+                    var_i = bsaVars[i]
+                    
+                    if var_j not in never_exclude:
+                        # Exclude the later variable if it's not protected
+                        excluded_idx_set.add(j)
+                    elif var_i not in never_exclude:
+                        # If the later variable IS protected but the earlier one is NOT, 
+                        # we must exclude the earlier one to break the correlation
+                        excluded_idx_set.add(i)
+                        break # Variable i is gone, move to the next i
+
+    return sorted(list(excluded_idx_set))
+
 
 def sanitize_FACET_input(predictor, var_names):
     """
