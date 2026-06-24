@@ -143,6 +143,94 @@ class CVAE(nn.Module):
         # xrange and yrange are fixed to 100 for the CVAE, since it has convolutional layers that expect a fixed input size of 200x200.
         return smooth_cvae_output(pred_im, total_charge=total_charge).cpu().detach().numpy().reshape(200, 200)
 
+
+class CVAE1D(nn.Module):
+    """
+    1-D sibling of CVAE for single-channel waveforms (e.g. UVVis spectra).
+    Encodes inputs of shape (N, 1, L) into a latent_dim vector.
+
+    The encoder/decoder mirror the 2-D CVAE: 5 stride-2 stages with
+    channels 1->32->64->128->256->512. Spatial length goes L -> L/32.
+    Caller is responsible for ensuring L is a multiple of 32; otherwise
+    the decoder will not reconstruct back to the original length.
+    """
+    def __init__(self, latent_dim, input_length=512):
+        super().__init__()
+        if input_length % 32 != 0:
+            raise ValueError(
+                f"input_length must be a multiple of 32, got {input_length}"
+            )
+        self.latent_dim = latent_dim
+        self.input_length = input_length
+        self.final_length = input_length // 32
+        self.FLATTEN_SIZE = 512 * self.final_length
+
+        self.encoder = nn.Sequential(
+            nn.Conv1d(INPUT_CHANNELS, 32, kernel_size=4, stride=2, padding=1),
+            nn.BatchNorm1d(32),
+            nn.ReLU(),
+            nn.Conv1d(32, 64, kernel_size=4, stride=2, padding=1),
+            nn.BatchNorm1d(64),
+            nn.ReLU(),
+            nn.Conv1d(64, 128, kernel_size=4, stride=2, padding=1),
+            nn.BatchNorm1d(128),
+            nn.ReLU(),
+            nn.Conv1d(128, 256, kernel_size=4, stride=2, padding=1),
+            nn.BatchNorm1d(256),
+            nn.ReLU(),
+            nn.Conv1d(256, 512, kernel_size=4, stride=2, padding=1),
+            nn.ReLU(),
+        )
+
+        self.fc_mu = nn.Linear(self.FLATTEN_SIZE, latent_dim)
+        self.fc_logvar = nn.Linear(self.FLATTEN_SIZE, latent_dim)
+        self.fc_decode = nn.Linear(latent_dim, self.FLATTEN_SIZE)
+
+        self.decoder = nn.Sequential(
+            nn.ConvTranspose1d(512, 256, kernel_size=4, stride=2, padding=1),
+            nn.BatchNorm1d(256),
+            nn.ReLU(),
+            nn.ConvTranspose1d(256, 128, kernel_size=4, stride=2, padding=1),
+            nn.BatchNorm1d(128),
+            nn.ReLU(),
+            nn.ConvTranspose1d(128, 64, kernel_size=4, stride=2, padding=1),
+            nn.BatchNorm1d(64),
+            nn.ReLU(),
+            nn.ConvTranspose1d(64, 32, kernel_size=4, stride=2, padding=1),
+            nn.BatchNorm1d(32),
+            nn.ReLU(),
+            nn.ConvTranspose1d(32, INPUT_CHANNELS, kernel_size=4, stride=2, padding=1),
+            nn.Sigmoid(),
+        )
+
+    def reparameterize(self, mu, logvar):
+        std = torch.exp(0.5 * logvar)
+        eps = torch.randn_like(std)
+        return mu + eps * std
+
+    def forward(self, x):
+        encoded = self.encoder(x)
+        encoded_flat = encoded.view(-1, self.FLATTEN_SIZE)
+        mu = self.fc_mu(encoded_flat)
+        logvar = self.fc_logvar(encoded_flat)
+        z = self.reparameterize(mu, logvar)
+        decoded_flat = self.fc_decode(z)
+        decoded_reshaped = decoded_flat.view(-1, 512, self.final_length)
+        reconstruction = self.decoder(decoded_reshaped)
+        return reconstruction, mu, logvar
+
+    def generate_latent_mu(self, x):
+        encoded = self.encoder(x)
+        encoded_flat = encoded.view(-1, self.FLATTEN_SIZE)
+        mu = self.fc_mu(encoded_flat)
+        return mu
+
+    def decode_latent_mu(self, mu):
+        decoded_flat = self.fc_decode(mu)
+        decoded_reshaped = decoded_flat.view(-1, 512, self.final_length)
+        return self.decoder(decoded_reshaped)
+
+
 def vae_loss(reconstruction, x, mu, logvar):
     """
     The VAE loss function: Reconstruction Loss (Binary Cross-Entropy) + KL Divergence.

@@ -27,6 +27,7 @@ from scipy.signal import find_peaks
 from Python_Functions.functions import cropProfmonImg, find_2d_mask_intervals, map_xtcav_to_syag, matstruct_to_dict, extractDAQBSAScalars, extractDAQNonBSAScalars, segment_centroids_and_com, apply_tcav_zeroing_filter, apply_centroid_correction, extract_processed_images, sanitize_FACET_input
 from Python_Functions.cvae import CVAE, vae_loss, smooth_cvae_output
 from Python_Functions.gmm_slice import GeometricSliceScaler, SliceGMM, SliceRegressorWrapper, gaussian_1d
+from Python_Functions.training import encode_with_cvae, train_random_forest_predictor
 
 from qtpy.QtGui import QColor
 from qtpy.QtCore import QThread, Signal, Slot, Qt
@@ -2932,211 +2933,43 @@ class VTCAVDisplay(Display):
         # Too high, the prediction task becomes too difficult.
         NCOMP = n_comp
 
-        INPUT_CHANNELS = 1 # Assuming LPSimg is grayscale/single-channel data
-        # 1. Setup Device
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.handle_log(f"Using device: {device}")
-        # 2. Initialize Model and Optimizer
-        model_cvae = CVAE(latent_dim=NCOMP).to(device)
-        optimizer = torch.optim.Adam(model_cvae.parameters(), lr=1e-3)
+        # CVAE encoding (delegated to Python_Functions.training)
+        model_cvae, latent_z_array = encode_with_cvae(
+            LPSimg,
+            latent_dim=NCOMP,
+            n_epochs=8,
+            batch_size=16,
+            lr=1e-3,
+            proj_loss_strength=self.cvae_loss_strength,
+            proj_log_strength=self.cvae_proj_log_strength,
+            log=self.handle_log,
+        )
 
-        # LPSimg is a numpy array of shape [n_samples, 200, 200].
-        BATCH_SIZE = 16
-        # ---------------------------------------------------
+        self.handle_log(
+            f"Predictors {predictor_tmp_cleaned.shape}, latent codes {latent_z_array.shape}"
+        )
 
-        # Convert numpy data to PyTorch Tensor, add the Channel dimension (C=1)
-        LPSimg_tensor = torch.from_numpy(LPSimg).unsqueeze(1).float()
-        LPSimg_tensor /= LPSimg_tensor.max()
-        # Create a simple DataLoader for the data
-        from torch.utils.data import TensorDataset, DataLoader
-
-        from Python_Functions.cvae import proj_vae_loss
-        dataset = TensorDataset(LPSimg_tensor)
-        data_loader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True)
-
-        # 4. Training Loop
-        N_EPOCHS = 8
-        self.handle_log("\nStarting training loop ({} epochs)...".format(N_EPOCHS))
-
-        for epoch in range(1, N_EPOCHS + 1):
-            total_loss = 0
-            for batch_idx, (data,) in enumerate(data_loader):
-                data = data.to(device)
-                
-                # Forward pass
-                reconstruction, mu, logvar = model_cvae(data)
-                # reconstruction /= reconstruction.max()
-                data = data.clamp(min = 0)
-                # Calculate loss
-                # Like normal loss, vae_loss is not great for predicting LPS with small isolated features.
-                # Using projection loss to improve reconstruction of small features, which are enhanced logarithmically in the projection.
-                loss = proj_vae_loss(reconstruction, data, mu, logvar, strength=self.cvae_loss_strength, log_strength = self.cvae_proj_log_strength)
-                
-                # Backpropagation
-                optimizer.zero_grad()
-                loss.backward()
-                optimizer.step()
-                
-                total_loss += loss.item()
-
-            avg_loss = total_loss / len(dataset)
-            self.handle_log(f"Epoch {epoch}/{N_EPOCHS}, Average VAE Loss: {avg_loss:.4f}")
-
-        # Encode all LPS images to latent z parameters.
-        latent_z_array = np.zeros((LPSimg.shape[0], NCOMP )) 
-        for i in range(LPSimg.shape[0]):
-            mu_tensor = model_cvae.generate_latent_mu(torch.from_numpy(LPSimg[i]/LPSimg[i].max()).unsqueeze(0).unsqueeze(0).float().to(device))
-            latent_z_array[i] = mu_tensor.cpu().detach().numpy()
-
-        # Random Forest Regression to predict each latent parameter from the predictor variables
-
-        # All rows are valid in this mock example
-        valid_rows = [True for i in range(latent_z_array.shape[0])]
-        predictor_filtered = predictor_tmp_cleaned[valid_rows]
-        biGaussian_params_array_filtered = latent_z_array[valid_rows]
-        self.handle_log(f"After removing invalid rows, dataset shape: Predictors {predictor_filtered.shape}, Bi-Gaussian Params {biGaussian_params_array_filtered.shape}")
-
-        # --- Original scaling and splitting logic follows ---
-
-        x_scaler = MinMaxScaler()
-        iz_scaler = MinMaxScaler()
-        x_scaled = x_scaler.fit_transform(predictor_filtered)
-        Iz_scaled = iz_scaler.fit_transform(biGaussian_params_array_filtered)
-
-
-
-        # 80/20 train-test split
-        x_train_scaled, x_test_scaled, Iz_train_scaled, Iz_test_scaled, ntrain, ntest = train_test_split(
-            x_scaled, Iz_scaled, np.arange(Iz_scaled.shape[0]), test_size=0.2, random_state = 42)
-
-        # Convert to PyTorch tensors
-        X_train = torch.tensor(x_train_scaled, dtype=torch.float32)
-        X_test = torch.tensor(x_test_scaled, dtype=torch.float32)
-        Y_train = torch.tensor(Iz_train_scaled, dtype=torch.float32)
-        Y_test = torch.tensor(Iz_test_scaled, dtype=torch.float32)
-
-        train_ds = TensorDataset(X_train, Y_train)
-        train_dl = DataLoader(train_ds, batch_size=24, shuffle=True)
-
-        self.handle_log(f"X_train shape: {X_train.shape}")
-        self.handle_log(f"Y_train shape: {Y_train.shape}")
-        # --- 2. Determining Sample Weights ---
-        
-        # Strategy Selection: Set to 'density' or 'importance_weighted'
-        weight_strategy = 'importance_weighted' 
-        
-        if weight_strategy == 'density':
-            self.handle_log("Calculating weights using naive local density estimation...")
-            x_train_weighted = x_train_scaled
-            kde = KernelDensity(kernel='gaussian', bandwidth=0.1).fit(x_train_weighted)
-
-            # 1. Calculate log densities
-            log_densities = kde.score_samples(x_train_weighted)
-
-            # 2. Offset by the maximum log density to prevent overflow
-            # (The largest exponentiated value will now be np.exp(0) = 1.0)
-            log_densities_shifted = log_densities - np.max(log_densities)
-
-            # 3. Calculate relative density
-            density = np.exp(log_densities_shifted)
-
-            # 4. Calculate sample weights
-            sample_weights = 1.0 / (density + 1e-6)
-            
-            self.handle_log(f"Max sample weight: {np.max(sample_weights)}")
-            self.handle_log(f"Min sample weight: {np.min(sample_weights)}")
-        elif weight_strategy == 'importance_weighted':
-            self.handle_log("Calculating weights using a first-pass feature importance...")
-            # Step 1: Run a first-pass RF to determine feature importance
-            first_pass_model = RandomForestRegressor(n_estimators=100, random_state=42, n_jobs=-1)
-            first_pass_model.fit(x_train_scaled, Iz_train_scaled)
-            importances = first_pass_model.feature_importances_
-            
-            # Step 2: Weight the feature space by importance and then calculate density
-            # This ensures density is calculated based on dimensions that actually drive the target
-            x_train_weighted = x_train_scaled * importances
-            kde = KernelDensity(kernel='gaussian', bandwidth=0.1).fit(x_train_weighted)
-
-            # 1. Calculate log densities
-            log_densities = kde.score_samples(x_train_weighted)
-
-            # 2. Offset by the maximum log density to prevent overflow
-            # (The largest exponentiated value will now be np.exp(0) = 1.0)
-            log_densities_shifted = log_densities - np.max(log_densities)
-
-            # 3. Calculate relative density
-            density = np.exp(log_densities_shifted)
-
-            # 4. Calculate sample weights
-            sample_weights = 1.0 / (density + 1e-6)
-            
-            self.handle_log(f"Max sample weight: {np.max(sample_weights)}")
-            self.handle_log(f"Min sample weight: {np.min(sample_weights)}")
-            
-        # Normalize weights so they average to 1.0
-        sample_weights = sample_weights / np.mean(sample_weights)
-        
-        # --- 3. Model Setup and Training ---
-        
-        self.handle_log("\n--- Initializing Weighted Random Forest Model ---")
-        model = RandomForestRegressor(
+        # Weighted Random Forest fit (delegated to Python_Functions.training)
+        rf_result = train_random_forest_predictor(
+            predictor_tmp_cleaned,
+            latent_z_array,
             n_estimators=500,
             max_depth=15,
             min_samples_leaf=2,
+            test_size=0.2,
+            weight_strategy='importance_weighted',
+            kde_bandwidth=0.1,
             random_state=42,
-            n_jobs=-1
+            log=self.handle_log,
         )
-        
-        t0 = time.time()
-        self.handle_log("\n--- Starting Model Fitting (Weighted) ---")
-        
-        # Fit the model using the calculated sample_weights
-        # In sklearn, sample_weight adjusts the impurity decrease calculation at each split
-        model.fit(x_train_scaled, Iz_train_scaled, sample_weight=sample_weights)
-        
-        t1 = time.time()
+        model = rf_result['model']
+        x_scaler = rf_result['x_scaler']
+        iz_scaler = rf_result['iz_scaler']
 
-        # --- Evaluation ---
+        self.handle_log("\n--- Feature Importance (named) ---")
+        for name, importance in zip(bsaVarNames_cleaned, model.feature_importances_):
+            self.handle_log(f"{name} importance: {importance:.4f}")
 
-        # 1. Training Set Evaluation
-        Y_train_pred = model.predict(X_train)
-        train_mse = mean_squared_error(Y_train, Y_train_pred)
-
-        # 2. Validation Set Evaluation
-        Y_test_pred = model.predict(X_test)
-        test_mse = mean_squared_error(Y_test, Y_test_pred)
-
-        # To see the importance of the input features:
-        self.handle_log("\n--- Feature Importance ---")
-        for i, importance in enumerate(model.feature_importances_):
-            self.handle_log(f"{bsaVarNames_cleaned[i]} importance: {importance:.4f}")
-
-        self.handle_log("\n--- Training Results ---")
-        self.handle_log(f"Total Fitting Time: {t1 - t0:.2f} seconds")
-        self.handle_log(f"Final Train MSE: {train_mse:.6f}")
-        self.handle_log(f"Final Test MSE: {test_mse:.6f}")
-
-        # Evaluate model
-        pred_train_scaled = model.predict(X_train)
-        pred_test_scaled = model.predict(X_test)
-
-        # Inverse transform predictions
-        pred_train_full = iz_scaler.inverse_transform(pred_train_scaled)
-        pred_test_full = iz_scaler.inverse_transform(pred_test_scaled)
-        Iz_train_true = iz_scaler.inverse_transform(Iz_train_scaled)
-        Iz_test_true = iz_scaler.inverse_transform(Iz_test_scaled)
-        elapsed = time.time() - t0
-        self.handle_log("Elapsed time [mins] = {:.1f} ".format(elapsed/60))
-
-        # Compute R² score
-        def r2_score(true, pred):
-            RSS = np.sum((true - pred)**2)
-            TSS = np.sum((true - np.mean(true))**2)
-            return 1 - RSS / TSS if TSS != 0 else 0
-
-        # Compute R² on scaled data, instead of the actual bi-Gaussian parameters, to avoid distortion from different scales
-        self.handle_log("Train R²: {:.2f} %".format(r2_score(Iz_train_scaled.ravel(), pred_train_scaled.ravel()) * 100))
-        self.handle_log("Test R²: {:.2f} %".format(r2_score(Iz_test_scaled.ravel(), pred_test_scaled.ravel()) * 100))
         time_stamp = time.strftime("%Y%m%d_%H%M%S")
         syag_alignment_data = {
             'scale': 8,
@@ -3145,7 +2978,7 @@ class VTCAVDisplay(Display):
         }
         data_to_save = {
             'varNames': bsaVarNames_cleaned,
-            'raw_training_set': predictor_filtered,
+            'raw_training_set': predictor_tmp_cleaned,
             'var_importance': model.feature_importances_,
             'bsaVarNames': bsaVars,
             'nonBsaVarNames': nonBsaVars,
