@@ -131,12 +131,18 @@ def encode_with_cvae(
         avg_loss = total_loss / len(dataset)
         log(f"Epoch {epoch}/{n_epochs}, Average VAE Loss: {avg_loss:.4f}")
 
+    model.eval()
     latent_z_array = np.zeros((arr.shape[0], latent_dim))
-    for i in range(arr.shape[0]):
-        sample = arr[i] / arr[i].max() if arr[i].max() > 0 else arr[i]
-        sample_tensor = torch.from_numpy(sample).unsqueeze(0).unsqueeze(0).float().to(device)
-        mu_tensor = model.generate_latent_mu(sample_tensor)
-        latent_z_array[i] = mu_tensor.cpu().detach().numpy()
+    with torch.no_grad():
+        for start in range(0, arr.shape[0], batch_size):
+            stop = min(start + batch_size, arr.shape[0])
+            chunk = arr[start:stop].astype(np.float32, copy=False)
+            row_max = chunk.reshape(chunk.shape[0], -1).max(axis=1)
+            scale = np.where(row_max > 0, row_max, 1.0)
+            chunk = chunk / scale.reshape((-1,) + (1,) * (chunk.ndim - 1))
+            chunk_tensor = torch.from_numpy(chunk).unsqueeze(1).to(device)
+            mu_tensor = model.generate_latent_mu(chunk_tensor)
+            latent_z_array[start:stop] = mu_tensor.cpu().numpy()
 
     return model, latent_z_array
 
