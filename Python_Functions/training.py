@@ -20,6 +20,7 @@ from sklearn.neighbors import KernelDensity
 from sklearn.preprocessing import MinMaxScaler
 
 from Python_Functions.cvae import CVAE, CVAE1D, proj_vae_loss, vae_loss
+from Python_Functions.vae import VAE1D
 
 
 def encode_with_cvae(
@@ -33,6 +34,8 @@ def encode_with_cvae(
     proj_log_strength=0.0,
     device=None,
     model_class=None,
+    model_kwargs=None,
+    model_kind=None,
     log=print,
 ):
     """
@@ -47,7 +50,14 @@ def encode_with_cvae(
         Dimensionality of the latent space.
     model_class:
         Optional explicit subclass to instantiate. If None, picked by
-        target_data.ndim: 3-D -> CVAE, 2-D -> CVAE1D(input_length=L).
+        target_data.ndim and `model_kind`.
+    model_kwargs:
+        Optional dict of extra kwargs forwarded to the model constructor
+        (e.g. `hidden_dims`, `dropout` for VAE1D).
+    model_kind:
+        Selects which 1-D model to use when target_data is 2-D. Accepts
+        "cvae" (default, convolutional) or "vae" (plain MLP VAE1D).
+        Ignored when target_data is 3-D or when `model_class` is given.
 
     Returns:
         (model, latent_z_array) where latent_z_array has shape (N, latent_dim).
@@ -57,19 +67,37 @@ def encode_with_cvae(
     log(f"Using device: {device}")
 
     arr = np.asarray(target_data)
+    model_kwargs = dict(model_kwargs) if model_kwargs else {}
+
     if model_class is None:
         if arr.ndim == 3:
-            model = CVAE(latent_dim=latent_dim).to(device)
+            model = CVAE(latent_dim=latent_dim, **model_kwargs).to(device)
             use_proj_loss = True
         elif arr.ndim == 2:
-            model = CVAE1D(latent_dim=latent_dim, input_length=arr.shape[1]).to(device)
+            kind = (model_kind or "cvae").lower()
+            if kind == "cvae":
+                model = CVAE1D(
+                    latent_dim=latent_dim,
+                    input_length=arr.shape[1],
+                    **model_kwargs,
+                ).to(device)
+            elif kind == "vae":
+                model = VAE1D(
+                    latent_dim=latent_dim,
+                    input_length=arr.shape[1],
+                    **model_kwargs,
+                ).to(device)
+            else:
+                raise ValueError(
+                    f"model_kind must be 'cvae' or 'vae'; got {model_kind!r}"
+                )
             use_proj_loss = False
         else:
             raise ValueError(
                 f"target_data must be (N,H,W) or (N,L); got shape {arr.shape}"
             )
     else:
-        model = model_class(latent_dim=latent_dim).to(device)
+        model = model_class(latent_dim=latent_dim, **model_kwargs).to(device)
         use_proj_loss = arr.ndim == 3
 
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
