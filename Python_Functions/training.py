@@ -125,6 +125,7 @@ def train_random_forest_predictor(
     kde_bandwidth=0.1,
     random_state=42,
     log=print,
+    predictor_names=None
 ):
     """
     Fit a weighted RandomForestRegressor mapping `predictors` -> `targets`.
@@ -211,7 +212,10 @@ def train_random_forest_predictor(
 
     log("\n--- Feature Importance ---")
     for i, importance in enumerate(model.feature_importances_):
-        log(f"feature[{i}] importance: {importance:.4f}")
+        if predictor_names is None:
+            log(f"feature[{i}] importance: {importance:.4f}")
+        else:
+            log(f"{predictor_names[i]} importance: {importance:.4f}")
 
     log("\n--- Training Results ---")
     log(f"Total Fitting Time: {t1 - t0:.2f} seconds")
