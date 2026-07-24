@@ -245,7 +245,7 @@ class InferenceWorker(QThread):
                             val = non_bsa_pvs[name].get()
 
                     # Check for Validity
-                    if val is None or np.isnan(val):
+                    if val is None or not np.isfinite(val):
                         # Only auto-bypass non bsa pvs. BSA pvs does not timeout, so no need to bypass to run Real Time Prediction.
                         if not self.is_pv_bypassed[i] and name not in self.bsa_names:
                             self._log(f"Recommend Bypassing PV: {name} (Value: {val})")
@@ -384,9 +384,12 @@ class InferenceWorker(QThread):
             if self.n_eslice !=0 :
                 self._log(f"Using n_eslice={self.n_eslice} for SYAG projection.")
                 syag_projection = self.get_SYAG_projection(n_eslice=self.n_eslice, offline_syag_array=offline_syag_array, offline_syag_width=offline_syag_width)
+                proj_sum = float(np.sum(syag_projection)) if syag_projection is not None else 0.0
+                if syag_projection is None or not np.isfinite(proj_sum) or proj_sum <= 0:
+                    self._log("Warning: SYAG projection empty/invalid — skipping prediction this cycle.")
+                    return
                 # Normalize it so that the sum is 1.
-                syag_projection = syag_projection / np.sum(syag_projection)
-                #print(syag_projection)
+                syag_projection = syag_projection / proj_sum
                 # Append the syag_projection to the end of the pred_params as additional features for the image model.
                 X_test = np.concatenate([X_test, syag_projection[np.newaxis, :]], axis = 1)
             if hasattr(self.model, 'eval'): self.model.eval()
