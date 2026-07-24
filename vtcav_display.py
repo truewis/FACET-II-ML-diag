@@ -380,7 +380,7 @@ class InferenceWorker(QThread):
 
     def emit_prediction(self, input_params, total_charge, real_time=False, offline_syag_array=None, offline_syag_width=None):
         try:
-            X_test = torch.tensor(input_params, dtype=torch.float32)
+            X_test = np.asarray(input_params, dtype=np.float64)
             if self.n_eslice !=0 :
                 self._log(f"Using n_eslice={self.n_eslice} for SYAG projection.")
                 syag_projection = self.get_SYAG_projection(n_eslice=self.n_eslice, offline_syag_array=offline_syag_array, offline_syag_width=offline_syag_width)
@@ -391,7 +391,13 @@ class InferenceWorker(QThread):
                 # Normalize it so that the sum is 1.
                 syag_projection = syag_projection / proj_sum
                 # Append the syag_projection to the end of the pred_params as additional features for the image model.
-                X_test = np.concatenate([X_test, syag_projection[np.newaxis, :]], axis = 1)
+                X_test = np.concatenate([X_test, syag_projection[np.newaxis, :].astype(np.float64)], axis=1)
+            # Clamp to a safe float32 range: replace NaN/+-inf and clip magnitude so the
+            # sklearn finite-check (and any downstream float32 cast) doesn't overflow.
+            # Out-of-distribution PVs scaled by StandardScaler can produce values > 3.4e38.
+            X_test = np.nan_to_num(X_test, nan=0.0, posinf=1e30, neginf=-1e30)
+            np.clip(X_test, -1e30, 1e30, out=X_test)
+            X_test = X_test.astype(np.float32)
             if hasattr(self.model, 'eval'): self.model.eval()
             with torch.no_grad():
                 z_pred_full = self.model.predict(X_test)
