@@ -113,15 +113,28 @@ def get_min_max_daq(date_path, experiment):
     print(f"  [DEBUG] get_min_max_daq: Found {len(daq_nums)} items. Min DAQ = {min_val}, Max DAQ = {max_val}")
     return min_val, max_val
 
+SDF_NFS_MIRROR = '/sdf/data/ad/fs/transition/nfs/slac/g/facet/matlab/data_prod/nas-li20-pm00'
+
+
 def facet_daq_path(experiment, daq_num, base_path='/nas/nas-li20-pm00/'):
     """
     Finds the path for a specific experiment and daq_num.
     Searches the 4 most recent dates first, then uses binary search.
     Expects structure: {base_path}/{experiment}/YYYY/YYYYMMDD/
+
+    If the SDF NFS mirror is mounted, that path is tried first and
+    `base_path` is used as a fallback.
     """
+    if base_path != SDF_NFS_MIRROR and os.path.isdir(os.path.join(SDF_NFS_MIRROR, experiment)):
+        print(f"[DEBUG] Trying SDF NFS mirror first: {SDF_NFS_MIRROR}")
+        found = facet_daq_path(experiment, daq_num, base_path=SDF_NFS_MIRROR)
+        if found is not None:
+            return found
+        print(f"[DEBUG] Not found on SDF mirror. Falling back to base_path='{base_path}'.")
+
     print(f"\n[DEBUG] --- Starting path_fun ---")
     print(f"[DEBUG] Inputs: base_path='{base_path}', experiment='{experiment}', daq_num='{daq_num}'")
-    
+
     exp_path = os.path.join(base_path, experiment)
     if not os.path.exists(exp_path):
         print(f"[DEBUG] Experiment path '{exp_path}' does not exist. Returning None.")
