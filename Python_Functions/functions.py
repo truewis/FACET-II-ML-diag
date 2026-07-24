@@ -920,8 +920,13 @@ def extractDAQBSAScalars(data_struct, step_list=None, filter_index= True):
                                 continue
                         if varData.ndim != 1:
                                 continue
-                        if filter_index:
-                                varData = varData[idx]  # apply common index. If this fails, this variable is not recorded in some of the steps.
+                        try:
+                                varData_tmp = varData[idx]  # apply common index. If this fails, this variable is not recorded in some of the steps.
+                                # Sometimes you will see varData size being equal to step size. I don't know what variable that is, but must be skipped.
+                                if filter_index:
+                                        varData = varData_tmp
+                        except Exception as e:
+                                continue
                         varData = np.nan_to_num(varData)  # replace NaN with 0
                         # Dither by a small random value to avoid overfitting.
                         # Suppose by 0.1% of the average value of the variable.
@@ -930,10 +935,8 @@ def extractDAQBSAScalars(data_struct, step_list=None, filter_index= True):
                                 dither_amplitude = 0.001 * abs(avg_val)
                                 varData = varData + np.random.uniform(-dither_amplitude, dither_amplitude, size=varData.shape)
                         bsaListData.append(varData)
-
-                # Add to output arrays
-                bsaVarPVNames.extend([vn for vn in varNames if hasattr(bsaList[vn], "__len__") and len(bsaList[vn]) > 0])
-                if bsaListData:
+                        bsaVarPVNames.append(varName)
+                if len(bsaListData)!=0:
                         bsaScalarData.extend(bsaListData)
 
         bsaScalarData = np.array(bsaScalarData)
