@@ -30,7 +30,7 @@ from Python_Functions.gmm_slice import GeometricSliceScaler, SliceGMM, SliceRegr
 from Python_Functions.training import encode_with_cvae, train_random_forest_predictor
 
 from qtpy.QtGui import QColor
-from qtpy.QtCore import QThread, Signal, Slot, Qt
+from qtpy.QtCore import QThread, Signal, Slot, Qt, QEventLoop
 from qtpy.QtWidgets import QMessageBox, QFileDialog, QTableWidgetItem
 from qtpy.QtWidgets import QApplication
 
@@ -637,7 +637,70 @@ class InferenceWorker(QThread):
         self.running = False
         self.wait()
 
-        
+
+class ProgressWorker(QThread):
+    """
+    Generic background worker that runs a callable off the UI thread.
+
+    The callable receives two keyword arguments injected by the worker:
+      - `progress_callback(current, total, desc)` — call from inside the work to
+        report progress. Signals are emitted with Qt.QueuedConnection so they
+        marshal safely back to the UI thread.
+      - `abort_check()` — return True if the user requested abort. Long-running
+        loops should check this periodically and bail out (raise, or just break).
+
+    Signals:
+      progress(int percent, str description)
+      finished_ok(object result)
+      failed(str error_message)
+      aborted()
+    """
+    progress = Signal(int, str)
+    finished_ok = Signal(object)
+    failed = Signal(str)
+    aborted = Signal()
+
+    def __init__(self, fn, *args, **kwargs):
+        super().__init__()
+        self._fn = fn
+        self._args = args
+        self._kwargs = kwargs
+        self._abort = False
+
+    def request_abort(self):
+        self._abort = True
+
+    def _progress_callback(self, current, total, desc=""):
+        if total <= 0:
+            pct = 0
+        else:
+            pct = int(100 * (current + 1) / total)
+            if pct < 0:
+                pct = 0
+            elif pct > 100:
+                pct = 100
+        self.progress.emit(pct, desc)
+
+    def _abort_check(self):
+        return self._abort
+
+    def run(self):
+        try:
+            kwargs = dict(self._kwargs)
+            kwargs['progress_callback'] = self._progress_callback
+            kwargs['abort_check'] = self._abort_check
+            result = self._fn(*self._args, **kwargs)
+            if self._abort:
+                self.aborted.emit()
+            else:
+                self.finished_ok.emit(result)
+        except InterruptedError:
+            self.aborted.emit()
+        except Exception as e:
+            traceback.print_exc()
+            self.failed.emit(f"{type(e).__name__}: {e}")
+
+
 class VTCAVDisplay(Display):
     def __init__(self, parent=None, args=None):
         super().__init__(parent=parent, args=args)
@@ -647,6 +710,7 @@ class VTCAVDisplay(Display):
         
         # Initialize state variables
         self.worker = None
+        self.progress_worker = None   # background worker for long tqdm-heavy tasks
         self.predictors = None
         self.predictor_vars = None
         self.SYAG_daq_images= None
@@ -757,6 +821,14 @@ class VTCAVDisplay(Display):
 
         # Scripting
         self.ui.scriptRunButton.clicked.connect(self.execute_live_script)
+
+        # Progress bar / Abort button
+        if hasattr(self.ui, 'progressBar'):
+            self.ui.progressBar.setRange(0, 100)
+            self.ui.progressBar.setValue(0)
+        if hasattr(self.ui, 'abortButton'):
+            self.ui.abortButton.setEnabled(False)
+            self.ui.abortButton.clicked.connect(self.abort_progress_worker)
 
         # Options
         self.ui.doManualSYAG.toggled.connect(self.set_manual_SYAG)
@@ -919,13 +991,18 @@ class VTCAVDisplay(Display):
 
             # Extract and scale DAQ predictor data
             scaled_predictor, filtered_predictor = self.get_scaled_predictor(daq_idx)
-            
-            # Run the model silently (no UI signals)
-            X_test = torch.tensor(scaled_predictor, dtype=torch.float32)
-            
-            if hasattr(self.worker.model, 'eval'): 
+
+            # Clamp to a safe float32 range: replace NaN/+-inf and clip magnitude so the
+            # sklearn finite-check (and any downstream float32 cast) doesn't overflow.
+            # Same guard as InferenceWorker.emit_prediction.
+            X_test = np.asarray(scaled_predictor, dtype=np.float64)
+            X_test = np.nan_to_num(X_test, nan=0.0, posinf=1e30, neginf=-1e30)
+            np.clip(X_test, -1e30, 1e30, out=X_test)
+            X_test = X_test.astype(np.float32)
+
+            if hasattr(self.worker.model, 'eval'):
                 self.worker.model.eval()
-                
+
             with torch.no_grad():
                 z_pred_full = self.worker.model.predict(X_test)
 
@@ -1517,17 +1594,22 @@ class VTCAVDisplay(Display):
         if self.worker is not None:
             # Optional: load SYAG images if available for the SYAG projection feature
             if (self.worker.n_eslice != 0 | self.worker.manual_SYAG):
-                self.updateStatus(f"Loading SYAG Images...")
                 mat = loadmat(dataloc,struct_as_record=False, squeeze_me=True)
-                data_struct = mat['data_struct']
+                data_struct_syag = mat['data_struct']
                 file_path_obj = pathlib.Path(dataloc)
                 try:
-                    syagImages_raw, _, _, _ = extract_processed_images(data_struct, '', xrange = None, yrange = None, hotPixThreshold = 1e4, sigma = 1, threshold = 5, step_list = None, roi_xrange = None, roi_yrange = None, do_load_raw=False, directory_path=str(file_path_obj.parent), instrument="SYAG", intermediate_datatype=np.uint8)
-                    # Dimensions of syagImages_raw should be (num_shots, width, height), but it is (height, width, num_shots) due to how MATLAB saves arrays. We need to transpose it to align with the shot indexing.
-                    syagImages_raw = np.transpose(syagImages_raw, (2, 1, 0))
-                    self.SYAG_daq_images = syagImages_raw
+                    syagImages_raw, _, _, _ = self.run_extract_sync(
+                        data_struct_syag, '',
+                        xrange=None, yrange=None, hotPixThreshold=1e4, sigma=1, threshold=5,
+                        step_list=None, roi_xrange=None, roi_yrange=None,
+                        do_load_raw=False, directory_path=str(file_path_obj.parent),
+                        instrument="SYAG", intermediate_datatype=np.uint8,
+                        status_msg="Loading SYAG Images...",
+                    )
+                    # (height, width, num_shots) -> (num_shots, width, height)
+                    self.SYAG_daq_images = np.transpose(syagImages_raw, (2, 1, 0))
                 except Exception as e:
-                    self.handle_log("Cannot load SYAG Images:{e}. You can disable manual SYAG cut to proceed without collimators.")
+                    self.handle_log(f"Cannot load SYAG Images: {e}. You can disable manual SYAG cut to proceed without collimators.")
         self.updateStatus(f"Ready.")
 
     def setup_pv_table(self):
@@ -1629,17 +1711,19 @@ class VTCAVDisplay(Display):
             sigma = 1
             threshold = 5
             file_path_obj = pathlib.Path(file_path)
-            self.updateStatus(f"Loading Sample Images...")
-            xtcavImages_centroid_uncorrected, xtcavImages_raw, horz_proj, LPSImage = extract_processed_images(data_struct, '', 100, 100, hotPixThreshold, sigma, threshold, [1], None, None, do_load_raw=True, directory_path=str(file_path_obj.parent))# do_load_raw = False by default.
-            # Populate UI elements
+            _, xtcavImages_raw, _, _ = self.run_extract_sync(
+                data_struct, '', 100, 100, hotPixThreshold, sigma, threshold, [1], None, None,
+                do_load_raw=True, directory_path=str(file_path_obj.parent),
+                status_msg="Loading Sample Images...",
+            )
             dims = xtcavImages_raw.shape
             self.ui.xroiMin.setPlainText(str(0))
             self.ui.xroiMax.setPlainText(str(dims[1]))
-            self.updateStatus(f"Ready")
             self.ui.yroiMin.setPlainText(str(0))
             self.ui.yroiMax.setPlainText(str(dims[0]))
-            self.update_image_display(np.average(xtcavImages_raw, axis = 2), display_name='Prep')
-            
+            self.update_image_display(np.average(xtcavImages_raw, axis=2), display_name='Prep')
+            self.updateStatus("Ready")
+
         except Exception as e:
             self.handle_log(f"Error initializing data from {file_path}: {e}")
 
@@ -2515,12 +2599,16 @@ class VTCAVDisplay(Display):
         
         all_idx = np.append(minus_90_idx, plus_90_idx)
 
-        # Extract current profiles and 2D LPS images 
+        # Extract current profiles and 2D LPS images
         xtcavImages_list = []
         xtcavImages_list_raw = []
         horz_proj_list = []
-        LPSImage = [] 
-        xtcavImages_centroid_uncorrected, _, _, _ = extract_processed_images(data_struct, '', xrange, yrange, hotPixThreshold, sigma, threshold, step_list, roi_xrange, roi_yrange, do_load_raw=False, directory_path=directory_path)# do_load_raw = False by default.
+        LPSImage = []
+        xtcavImages_centroid_uncorrected, _, _, _ = self.run_extract_sync(
+            data_struct, '', xrange, yrange, hotPixThreshold, sigma, threshold, step_list, roi_xrange, roi_yrange,
+            do_load_raw=False, directory_path=directory_path,
+            status_msg="Preprocessing: extracting LPS images...",
+        )
         # 1. Identify NaN values
         # np.isnan returns a boolean mask of the same shape as your stack
         nan_mask = np.isnan(xtcavImages_centroid_uncorrected)
@@ -3016,7 +3104,13 @@ class VTCAVDisplay(Display):
         sigma = 1
         threshold = 5
         # Do not specify xrange and yrange for SYAG, we don't need to zoom it, and we want the full image for alignment.
-        SYAGImages_raw, _, _, _ = extract_processed_images(data_struct, '', None, None, hotPixThreshold, sigma, threshold, step_list=None, roi_xrange=None, roi_yrange=None, do_load_raw=False, directory_path=str(pathlib.Path(dataloc).parent), instrument = 'SYAG', intermediate_datatype = np.uint8)# do_load_raw = False by default.
+        SYAGImages_raw, _, _, _ = self.run_extract_sync(
+            data_struct, '', None, None, hotPixThreshold, sigma, threshold,
+            step_list=None, roi_xrange=None, roi_yrange=None,
+            do_load_raw=False, directory_path=str(pathlib.Path(dataloc).parent),
+            instrument='SYAG', intermediate_datatype=np.uint8,
+            status_msg="Alignment: loading SYAG images...",
+        )
         # Crop to the top quadrant and compute projection. this is due to SYAG camera geometry.
         self.handle_log(f"SYAG Raw Loaded:{SYAGImages_raw.shape}")
         SYAGImages_cropped = SYAGImages_raw[:, (3*SYAGImages_raw.shape[1]//4):, lps_idx]
@@ -3026,24 +3120,178 @@ class VTCAVDisplay(Display):
         return map_xtcav_to_syag(SYAG_horz_proj, LPSimg_vert_proj)
 
     
+    def run_extract_sync(self, *args, status_msg="Extracting Images...", **kwargs):
+        """
+        Run `extract_processed_images(*args, **kwargs)` on a ProgressWorker and
+        block the current call chain until it finishes, but keep the Qt event
+        loop pumping (nested QEventLoop) so the progress bar updates and the
+        abort button remains responsive.
+
+        Returns the extractor's result on success. Raises `RuntimeError('aborted')`
+        if the user aborted, or re-raises the underlying error message.
+        """
+        if self.progress_worker is not None and self.progress_worker.isRunning():
+            raise RuntimeError("Another background task is already running.")
+
+        self.updateStatus(status_msg)
+        if hasattr(self.ui, 'progressBar'):
+            self.ui.progressBar.setValue(0)
+        if hasattr(self.ui, 'abortButton'):
+            self.ui.abortButton.setEnabled(True)
+
+        w = ProgressWorker(extract_processed_images, *args, **kwargs)
+        self.progress_worker = w
+
+        loop = QEventLoop()
+        state = {"result": None, "error": None, "aborted": False}
+
+        def _on_progress(pct, desc):
+            if hasattr(self.ui, 'progressBar'):
+                self.ui.progressBar.setValue(pct)
+            if desc:
+                self.updateStatus(desc)
+
+        def _on_ok(res):
+            state["result"] = res
+            loop.quit()
+
+        def _on_fail(msg):
+            state["error"] = msg
+            loop.quit()
+
+        def _on_abort():
+            state["aborted"] = True
+            loop.quit()
+
+        w.progress.connect(_on_progress, Qt.QueuedConnection)
+        w.finished_ok.connect(_on_ok, Qt.QueuedConnection)
+        w.failed.connect(_on_fail, Qt.QueuedConnection)
+        w.aborted.connect(_on_abort, Qt.QueuedConnection)
+
+        w.start()
+        loop.exec_()
+        w.wait()
+
+        self._clear_progress_worker_ui()
+        self.progress_worker = None
+
+        if state["aborted"]:
+            self.updateStatus("Aborted.")
+            raise RuntimeError("aborted")
+        if state["error"] is not None:
+            self.updateStatus("Error.")
+            raise RuntimeError(state["error"])
+        return state["result"]
+
+    def run_in_progress_worker(self, fn, on_success, *args, status_msg="Working...", **kwargs):
+        """
+        Run `fn(*args, **kwargs)` on a ProgressWorker, wire signals to the
+        progress bar + abort button, and call `on_success(result)` on the UI
+        thread when it completes.
+
+        `fn` MUST accept `progress_callback` and `abort_check` kwargs (the worker
+        injects them). Returns the ProgressWorker instance.
+        """
+        if self.progress_worker is not None and self.progress_worker.isRunning():
+            self.handle_log("A background task is already running; ignoring new request.")
+            return None
+
+        self.updateStatus(status_msg)
+        if hasattr(self.ui, 'progressBar'):
+            self.ui.progressBar.setValue(0)
+        if hasattr(self.ui, 'abortButton'):
+            self.ui.abortButton.setEnabled(True)
+
+        w = ProgressWorker(fn, *args, **kwargs)
+        self.progress_worker = w
+
+        w.progress.connect(self._on_progress_worker_progress, Qt.QueuedConnection)
+        w.finished_ok.connect(lambda result, cb=on_success: self._on_progress_worker_done(result, cb),
+                              Qt.QueuedConnection)
+        w.failed.connect(self._on_progress_worker_failed, Qt.QueuedConnection)
+        w.aborted.connect(self._on_progress_worker_aborted, Qt.QueuedConnection)
+
+        w.start()
+        return w
+
+    def abort_progress_worker(self):
+        if self.progress_worker is not None and self.progress_worker.isRunning():
+            self.handle_log("Abort requested.")
+            self.progress_worker.request_abort()
+
+    @Slot(int, str)
+    def _on_progress_worker_progress(self, pct, desc):
+        if hasattr(self.ui, 'progressBar'):
+            self.ui.progressBar.setValue(pct)
+        if desc:
+            self.updateStatus(desc)
+
+    def _clear_progress_worker_ui(self):
+        if hasattr(self.ui, 'abortButton'):
+            self.ui.abortButton.setEnabled(False)
+        if hasattr(self.ui, 'progressBar'):
+            self.ui.progressBar.setValue(0)
+
+    def _on_progress_worker_done(self, result, on_success):
+        self._clear_progress_worker_ui()
+        self.progress_worker = None
+        try:
+            on_success(result)
+        except Exception as e:
+            self.handle_log(f"Post-processing error: {e}")
+            traceback.print_exc()
+
+    @Slot(str)
+    def _on_progress_worker_failed(self, msg):
+        self._clear_progress_worker_ui()
+        self.progress_worker = None
+        self.updateStatus("Error.")
+        self.handle_log(f"Background task failed: {msg}")
+
+    @Slot()
+    def _on_progress_worker_aborted(self):
+        self._clear_progress_worker_ui()
+        self.progress_worker = None
+        self.updateStatus("Aborted.")
+        self.handle_log("Background task aborted.")
+
     def updateStatus(self, status_text):
         """Updates the UI status label and forces a visual refresh."""
         if hasattr(self.ui, 'statusLabel'):
             self.ui.statusLabel.setText(status_text)
-            
+
             # Force Qt to update the GUI immediately
             QApplication.processEvents()
     @Slot(str)
     def handle_log(self, message):
-        """Appends log messages to the PyDMLogDisplay"""
+        """Appends log messages to the PyDMLogDisplay. If the message reads like
+        an error, also mirror the first line into the status label so the user
+        sees the failure without hunting through the log window."""
         self.ui.PyDMLogDisplay.write(message)
         QApplication.processEvents()
         print(message)
+        if self._looks_like_error(message):
+            first_line = str(message).strip().splitlines()[0] if str(message).strip() else str(message)
+            # Cap length so the status bar doesn't blow up on tracebacks pasted through log.
+            if len(first_line) > 200:
+                first_line = first_line[:197] + "..."
+            self.updateStatus(first_line)
+
+    @staticmethod
+    def _looks_like_error(message):
+        if message is None:
+            return False
+        text = str(message).lstrip()
+        low = text.lower()
+        return low.startswith(("error", "warning", "failed", "pipeline failed", "cannot", "traceback"))
 
     def closeEvent(self, event):
         # Clean up thread on close
         if self.worker:
             self.worker.stop()
+        if self.progress_worker is not None and self.progress_worker.isRunning():
+            self.progress_worker.request_abort()
+            self.progress_worker.wait(2000)
         super().closeEvent(event)
 
     def execute_live_script(self):

@@ -1396,7 +1396,8 @@ def plot2DbunchseparationVsCollimatorAndBLEN(bc14BLEN, step_vals, bunchSeparatio
         plt.colorbar(im, label='Bunch Separation [μm]')
   
 
-def extract_UVVisSpec(data_struct, step_list=None, directory_path = '/nas/nas-li20-pm00/'
+def extract_UVVisSpec(data_struct, step_list=None, directory_path = '/nas/nas-li20-pm00/',
+                                                         progress_callback=None, abort_check=None
                                                          ):
         """
         Processes UVVisSpec images from HDF5 files, applying module-defined cropping, 
@@ -1456,21 +1457,28 @@ def extract_UVVisSpec(data_struct, step_list=None, directory_path = '/nas/nas-li
                                 xtcavImages_step = UVdata_step
                         step_size = UVdata_step.shape[2]
                         # --- Process Individual Shots ---
-                        for idx in tqdm(range(step_size), desc="Processing Shots Step {}, {} samples".format(a, step_size)):
+                        _iter = range(step_size)
+                        _desc = "Processing Shots Step {}, {} samples".format(a, step_size)
+                        _loop = _iter if progress_callback is not None else tqdm(_iter, desc=_desc)
+                        for idx in _loop:
+                                if abort_check is not None and abort_check():
+                                        raise InterruptedError("Aborted by user")
+                                if progress_callback is not None:
+                                        progress_callback(idx, step_size, _desc)
                                 if idx is None:
                                         continue
-                                        
+
                                 image = xtcavImages_step[:,:,idx] # Single shot (H, W)
                                 raw_width = image.shape[1]
                                 raw_height = image.shape[0]
-                                
+
                                 # Calculate current profiles (Horizontal Projection)
-                                
+
                                 # Prepare for collection
                                 processed_image = image[:,:,np.newaxis]
                                 image_ravel = processed_image.ravel()
                                 xtcavImages_list.append(processed_image)
-                                LPSImage.append([image_ravel]) 
+                                LPSImage.append([image_ravel])
                         images_each_step.append(xtcavImages_list)
                         pid_list_each_step.append(pid_list)
                 else:
@@ -1493,7 +1501,8 @@ def extract_UVVisSpec(data_struct, step_list=None, directory_path = '/nas/nas-li
         return np.array(xtcavImages)[:,:,:,0]
 
 def extract_processed_images(data_struct, experiment, xrange=100, yrange=100, hotPixThreshold=1e3, sigma=1, threshold=5, step_list=None,
-                                                         roi_xrange=None, roi_yrange=None, do_load_raw = False, directory_path = '/nas/nas-li20-pm00/', instrument = 'DTOTR2', intermediate_datatype = np.uint16
+                                                         roi_xrange=None, roi_yrange=None, do_load_raw = False, directory_path = '/nas/nas-li20-pm00/', instrument = 'DTOTR2', intermediate_datatype = np.uint16,
+                                                         progress_callback=None, abort_check=None
                                                          ):
         """
         Processes DTOTR2 images from HDF5 files, applying module-defined cropping, 
@@ -1554,7 +1563,14 @@ def extract_processed_images(data_struct, experiment, xrange=100, yrange=100, ho
                                 xtcavImages_step = DTOTR2data_step
                         step_size = DTOTR2data_step.shape[2]
                         # --- Process Individual Shots ---
-                        for idx in tqdm(range(step_size), desc="Processing Shots Step {}, {} samples".format(a, step_size)):
+                        _iter = range(step_size)
+                        _desc = "Processing Shots Step {}, {} samples".format(a, step_size)
+                        _loop = _iter if progress_callback is not None else tqdm(_iter, desc=_desc)
+                        for idx in _loop:
+                                if abort_check is not None and abort_check():
+                                        raise InterruptedError("Aborted by user")
+                                if progress_callback is not None:
+                                        progress_callback(idx, step_size, _desc)
                                 if idx is None:
                                         continue
                                         
